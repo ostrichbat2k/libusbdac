@@ -38,9 +38,11 @@ import java.util.Locale
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withTimeoutOrNull
 import timber.log.Timber as L
 
 /**
@@ -297,6 +299,16 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
 
     @Volatile private var activeSession: UsbAudioSession? = null
     @Volatile private var activeFormat: UacStreamFormat? = null
+    // Completed (regardless of success/failure) when the most recently started activateDac()
+    // call returns. Lets a caller about to start playback (see awaitActivation) give it a bounded
+    // chance to finish first, rather than racing it on its own background thread and permanently
+    // committing that track to the fallback sink -- RoutingAudioSink.resolveForConfigure only
+    // re-checks createAudioSink() on the *next* configure() call (next track), not this one, so
+    // losing this race once means that whole track plays on fallback with no recovery short of
+    // the user manually changing tracks. Confirmed, reproduced on real hardware: autoplay-resume
+    // on a cold app launch calling configure() before a freshly-granted permission's activateDac()
+    // thread had finished.
+    @Volatile private var activationSettled: CompletableDeferred<Unit>? = null
     // Only reflects SUPPORTED_SAMPLE_RATE_HZ (UAC 2.0/3.0) or whatever activateDac negotiated for
     // UAC 1.0 until the first track actually plays -- after that, ensureFormatActive keeps this
     // in sync with whatever rate each track genuinely streams at, since different tracks can (and
@@ -413,7 +425,15 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
                 L.i("Permission newly granted for ${audioDevice.displayName}, activating DAC session")
                 // Session activation blocks on several control transfers; keep it off whatever
                 // thread refresh() was called on (the broadcast receiver's, normally main).
-                Thread { activateDac(audioDevice.device) }
+                val deferred = CompletableDeferred<Unit>()
+                activationSettled = deferred
+                Thread {
+                        try {
+                            activateDac(audioDevice.device)
+                        } finally {
+                            deferred.complete(Unit)
+                        }
+                    }
                     .apply {
                         isDaemon = true
                         start()
@@ -441,6 +461,20 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
     // Caching a single instance per session, shared across both RoutingAudioSinks, means
     // whichever one actually gets used reports real progress to *both* callers.
     @Volatile private var activeSink: AudioSink? = null
+
+    /**
+     * Waits, bounded by [timeoutMs], for the most recently started [activateDac] to finish --
+     * see [activationSettled]'s doc comment for why a caller about to start playback would want
+     * this. A no-op (returns immediately) if nothing's currently activating, so this costs
+     * nothing on every other play() call, only the one race window right after a permission
+     * grant. Deliberately doesn't report success/failure -- the caller should just proceed with
+     * playback either way; [createAudioSink] returning null (e.g. activation genuinely failed, or
+     * there's no DAC at all) falls back exactly as if this had never been called.
+     */
+    suspend fun awaitActivation(timeoutMs: Long = 4000L) {
+        val deferred = activationSettled ?: return
+        withTimeoutOrNull(timeoutMs) { deferred.await() }
+    }
 
     /**
      * Returns an [AudioSink] wired to the active DAC session, or null if none is ready -- or if

@@ -79,6 +79,17 @@ class UsbAudioOutput(
         // forever on a device that simply doesn't implement this control, which getClockValid
         // already treats as a read failure, same as "invalid").
         const val CLOCK_VALID_MAX_RETRIES = 3
+        // SET_CUR clock frequency is a single control transfer right after claiming the
+        // interface/selecting the alt-setting -- confirmed, reproduced on real hardware: it can
+        // fail outright (result=-1, not just a readback mismatch) if the device isn't quite
+        // ready yet immediately after that claim, with no way to tell apart from a genuine
+        // failure except trying again shortly after. Unlike CLOCK_VALID_MAX_RETRIES (which
+        // retries reading back a clock that's already been successfully set), this retries the
+        // SET_CUR itself. Confirmed, reproduced: the very first track of a cold DAC session can
+        // hit this and throw out of activateAndStream() with no retry at all, which ExoPlayer
+        // surfaces as a playback error and nothing substitutes audible output for -- the user
+        // has to force a reconfigure (e.g. switching tracks) before it's retried at all.
+        const val CLOCK_SET_MAX_RETRIES = 3
         // isStalled() fires if the native streaming thread hasn't managed to submit a single URB
         // in this long -- i.e. our own write-side infrastructure has stopped entirely (crashed
         // thread, native-level hang), not just normal ring-buffer backpressure, which resolves on
@@ -185,15 +196,24 @@ class UsbAudioOutput(
         // setClockFrequency unconditionally here was the actual cause of a real, reproduced
         // infinite playback-error loop against a UAC 1.0 device: every reconfigure failed this
         // control transfer (wrong addressing entirely -- clockSourceId is always -1).
-        val clockOk =
+        fun trySetClock() =
             if (session.topology.uacVersion == 1) {
                 UsbAudioController.setUac1EndpointSampleRate(session, format.endpointAddress, sampleRateHz)
             } else {
                 UsbAudioController.setClockFrequency(session, sampleRateHz)
             }
+        var clockOk = trySetClock()
+        var clockSetAttempt = 0
+        while (!clockOk && clockSetAttempt < CLOCK_SET_MAX_RETRIES) {
+            Thread.sleep(DAC_SETTLE_DELAY_MS)
+            clockOk = trySetClock()
+            clockSetAttempt++
+        }
         if (!clockOk) {
-            L.w("UsbAudioOutput: failed to set DAC clock to $sampleRateHz Hz")
+            L.w("UsbAudioOutput: failed to set DAC clock to $sampleRateHz Hz after $clockSetAttempt retry(s)")
             return false
+        } else if (clockSetAttempt > 0) {
+            L.i("UsbAudioOutput: set DAC clock to $sampleRateHz Hz after $clockSetAttempt retry(s)")
         }
 
         // See UsbAudioManager.activateDac's comment on wakePowerDomain for why: a clean,

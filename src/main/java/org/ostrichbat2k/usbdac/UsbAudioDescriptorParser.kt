@@ -1,6 +1,6 @@
 /*
- * Copyright (c) 2026 Auxio Project
- * UsbAudioDescriptorParser.kt is part of Auxio.
+ * Copyright (c) 2026 libusbdac Project
+ * UsbAudioDescriptorParser.kt is part of libusbdac.
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by

@@ -1,6 +1,6 @@
 /*
- * Copyright (c) 2026 libusbdac Project
- * UsbAudioManager.kt is part of libusbdac.
+ * Copyright (c) 2026 Auxio Project
+ * UsbAudioManager.kt is part of Auxio.
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -602,7 +602,7 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
             connection.close()
         }
 
-        val found = topology
+        var found = topology
         if (found == null) {
             logEvent("No UAC1/UAC2/UAC3 playback topology found on ${device.deviceName}")
             return
@@ -644,6 +644,35 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
             val ranges = UsbAudioController.getClockFrequencyRanges(session) ?: emptyList()
             session = session.copy(clockSupportedRates = ranges)
             logEvent("Clock ${found.clockSourceId} supported rate ranges: $ranges")
+        }
+
+        // UAC 3.0 pushes the real channel count into a separate Cluster Descriptor fetch that
+        // UsbAudioDescriptorParser can't do during pure descriptor parsing -- there's no live
+        // session yet at that point (see UacPlaybackTopology.channelCount's doc comment). Do it
+        // now that we have one, before anything below reads found.channelCount (the volume/mixer
+        // loops) or publishes it (Capabilities screen, UsbAudioOutputProvider.channels via
+        // session.topology). Confirmed on real hardware: this device's cluster declares 2
+        // channels, same as its EarPods form factor implies.
+        if (found.uacVersion == 3 && found.channelCount < 0 && format.clusterDescriptorId >= 0) {
+            // clusterDescriptorId lives on UacStreamFormat (per-format), not UacPlaybackTopology
+            // -- use the format already selected above, not found itself.
+            //
+            // Not a .let{} on the nullable result -- reassigning found/session from inside a
+            // lambda would make the compiler drop its smart-cast of both to non-null for the
+            // rest of this function (a lambda could, in principle, outlive this call), breaking
+            // every later found./session. use below despite this being called synchronously.
+            val channels = UsbAudioController.getClusterChannelCount(session, format.clusterDescriptorId)
+            if (channels != null) {
+                found = found.copy(channelCount = channels)
+                session = session.copy(topology = found)
+                logEvent("Cluster ${format.clusterDescriptorId} declares $channels channel(s)")
+                _capabilities.value =
+                    UsbDeviceCapabilities(
+                        deviceName = deviceName,
+                        vendorId = device.vendorId,
+                        productId = device.productId,
+                        topology = found)
+            }
         }
 
         // Do this before anything else: its recovery wait (up to 300ms for a D2->D0 wake, per

@@ -1,6 +1,6 @@
 /*
- * Copyright (c) 2026 libusbdac Project
- * UacPlaybackTopology.kt is part of libusbdac.
+ * Copyright (c) 2026 Auxio Project
+ * UacPlaybackTopology.kt is part of Auxio.
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -79,8 +79,10 @@ data class UacPlaybackTopology(
     /**
      * The channel count declared on the USB Streaming Input Terminal (e.g. 2 for stereo), or -1
      * if unknown. UAC 1.0/2.0 carry this directly on the Input Terminal; UAC 3.0 pushes it into a
-     * separate Cluster Descriptor fetch this parser doesn't do, so it's always -1 there -- callers
-     * should fall back to assuming stereo rather than treat -1 as "mono" or similar.
+     * separate Cluster Descriptor fetch this parser can't do during pure descriptor parsing (no
+     * live session yet) -- [UsbAudioManager.activateDac] patches this in afterward via
+     * [UsbAudioController.getClusterChannelCount] once a session exists, falling back to -1 (and
+     * callers assuming stereo, not "mono" or similar) only if that also fails.
      */
     val channelCount: Int,
     val formats: List<UacStreamFormat>,

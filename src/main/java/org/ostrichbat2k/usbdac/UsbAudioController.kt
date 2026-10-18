@@ -1,6 +1,6 @@
 /*
- * Copyright (c) 2026 libusbdac Project
- * UsbAudioController.kt is part of libusbdac.
+ * Copyright (c) 2026 Auxio Project
+ * UsbAudioController.kt is part of Auxio.
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -298,11 +298,11 @@ object UsbAudioController {
     }
 
     /**
-     * DIAGNOSTIC, not used by any real code path: fetches the real channel count from a UAC3
-     * device's Cluster Descriptor by ID, answering "does this device actually support more than
-     * stereo" directly from the device instead of the hardcoded-stereo assumption
-     * [UacPlaybackTopology.channelCount] falls back to for UAC3 (that fallback exists specifically
-     * because this fetch was never wired in -- see that field's doc comment).
+     * Fetches the real channel count from a UAC3 device's Cluster Descriptor by ID, answering
+     * "does this device actually support more than stereo" directly from the device instead of
+     * the hardcoded-stereo assumption [UacPlaybackTopology.channelCount] falls back to when this
+     * returns null (no live session yet during pure descriptor parsing, or the fetch itself
+     * failing) -- called by [UsbAudioManager.activateDac] once a session exists.
      *
      * Request parameters confirmed against the Linux kernel's own `get_cluster_channels_v3()` in
      * `sound/usb/mixer.c`: bRequest=UAC3_CS_REQ_HIGH_CAPABILITY_DESCRIPTOR (0x06), wValue is the

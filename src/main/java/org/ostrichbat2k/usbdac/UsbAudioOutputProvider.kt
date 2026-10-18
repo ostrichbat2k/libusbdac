@@ -28,7 +28,7 @@ import timber.log.Timber as L
  * An [AudioOutputProvider] that reports direct-PCM support for a UAC1/2/3 device's own declared
  * capabilities (bit depth, channel count, and sample rate(s)) and hands out [UsbAudioOutput]
  * instances that stream to it -- plugged into a plain `DefaultAudioSink` (see
- * [UsbAudioManager.createAudioSink]) rather than Auxio rolling its own full `AudioSink`, so all of
+ * [UsbAudioManager.createAudioSink]) rather than rolling our own full `AudioSink`, so all of
  * `DefaultAudioSink`'s buffering/retry/stall-recovery logic applies to USB output the same way it
  * already does for normal AudioTrack output.
  *
@@ -118,11 +118,6 @@ class UsbAudioOutputProvider(
         }
 
     /**
-     * Finds whichever of this device's declared formats actually matches what ExoPlayer wants to
-     * hand us for this specific track -- its real decoded bit depth (via subslotSize), channel
-     * count, and sample rate -- instead of requiring one bit depth fixed for the whole session.
-     */
-    /**
      * Was hardcoded to mono-or-else-stereo, silently misrepresenting any device with more than 2
      * channels -- this project's channel count was never actually hardcoded (it's always read
      * from the device's own Input Terminal descriptor, see [channels]), only the *mask* built
@@ -155,6 +150,11 @@ class UsbAudioOutputProvider(
             else -> "encoding=$encoding"
         }
 
+    /**
+     * Finds whichever of this device's declared formats actually matches what ExoPlayer wants to
+     * hand us for this specific track -- its real decoded bit depth (via subslotSize), channel
+     * count, and sample rate -- instead of requiring one bit depth fixed for the whole session.
+     */
     private fun matchingFormat(f: androidx.media3.common.Format): UacStreamFormat? =
         allFormats.firstOrNull { candidate ->
             encodingFor(candidate.subslotSize) == f.pcmEncoding &&

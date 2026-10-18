@@ -366,12 +366,11 @@ class UsbAudioOutput(
 
     override fun setVolume(volume: Float) {
         // Intentionally a no-op. This is DefaultAudioSink re-applying ExoPlayer's own internal
-        // Player.volume on essentially every reconfigure (track change, clock change, etc.) --
-        // Auxio never actually changes that from its default of 1.0 (unity), so this used to fire
-        // on every single reconfigure with the same fixed value, silently overriding whatever
-        // hardware volume the user had actually set via the physical volume keys or the Settings
-        // screen slider (both go through UsbAudioController.setVolume directly, via
-        // UsbAudioManager.setVolume -- see UsbAudioOutput's constructor for the activation-time
+        // Player.volume on essentially every reconfigure (track change, clock change, etc.) -- a
+        // host app that never actually changes that from its default of 1.0 (unity) used to see
+        // this fire on every single reconfigure with the same fixed value, silently overriding
+        // whatever hardware volume the user had actually set via UsbAudioController.setVolume /
+        // UsbAudioManager.setVolume (see UsbAudioOutput's constructor for the activation-time
         // equivalent of this same problem). Now that real hardware volume control exists, this
         // call has no remaining purpose and would only still exist to fight with it.
         L.i("UsbAudioOutput: setVolume($volume) ignored -- hardware volume is user-controlled")
@@ -460,9 +459,10 @@ class UsbAudioOutput(
                 6 -> "super+"
                 else -> "unknown"
             }
-        val packetsPerSecond = if (usbSpeed == 3) 8000 else 1000
-        val packetDurationNs = 1_000_000_000L / packetsPerSecond
-        val packetsPerUrb = BASE_PACKETS_PER_URB * (packetsPerSecond / 1000)
+        val pacing = IsoPacing.forSpeed(usbSpeed, BASE_PACKETS_PER_URB)
+        val packetsPerSecond = pacing.packetsPerSecond
+        val packetDurationNs = pacing.packetDurationNs
+        val packetsPerUrb = pacing.packetsPerUrb
 
         val handle =
             UsbNative.openIsoStream(fd, format.endpointAddress, format.maxPacketSize, packetsPerUrb, NUM_URBS)

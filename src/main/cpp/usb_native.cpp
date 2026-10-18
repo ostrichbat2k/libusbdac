@@ -1,4 +1,5 @@
-// Copyright (c) 2026 Auxio Project
+// Copyright (c) 2026 libusbdac Project
+// usb_native.cpp is part of libusbdac.
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -241,6 +242,15 @@ Java_org_ostrichbat2k_usbdac_UsbNative_reapIso(JNIEnv* /*env*/, jobject /*thiz*/
     return (jint) (intptr_t) reaped->usercontext;
 }
 
+// Shared by cancelIso() and closeIsoStream() -- both need every outstanding URB discarded
+// (closeIsoStream's own discard pass is otherwise just cancelIso's loop retyped a dozen lines
+// later in this same file).
+static void discardAllUrbs(IsoStream* stream) {
+    for (int i = 0; i < stream->numUrbs; i++) {
+        ioctl(stream->fd, USBDEVFS_DISCARDURB, stream->urbs[i]);
+    }
+}
+
 // Cancels all outstanding URBs, unblocking any reapIso() call in flight on another thread (the
 // streaming loop's reapIso() returns -1 for a cancelled urb). Does NOT touch memory -- it's safe
 // to call concurrently with reapIso()/submitIso() on another thread, unlike closeIsoStream.
@@ -248,9 +258,7 @@ extern "C" JNIEXPORT void JNICALL
 Java_org_ostrichbat2k_usbdac_UsbNative_cancelIso(JNIEnv* /*env*/, jobject /*thiz*/, jlong handle) {
     auto* stream = (IsoStream*) (intptr_t) handle;
     if (!stream) return;
-    for (int i = 0; i < stream->numUrbs; i++) {
-        ioctl(stream->fd, USBDEVFS_DISCARDURB, stream->urbs[i]);
-    }
+    discardAllUrbs(stream);
 }
 
 // Drains any remaining completions and frees everything. Only safe once the caller has confirmed
@@ -261,9 +269,10 @@ Java_org_ostrichbat2k_usbdac_UsbNative_closeIsoStream(JNIEnv* /*env*/, jobject /
     auto* stream = (IsoStream*) (intptr_t) handle;
     if (!stream) return;
 
-    for (int i = 0; i < stream->numUrbs; i++) {
-        ioctl(stream->fd, USBDEVFS_DISCARDURB, stream->urbs[i]);
-    }
+    // Callers are required to have already called cancelIso() + joined before this (see this
+    // function's own doc comment) -- discarding again here is a harmless no-op safety net, not
+    // load-bearing, same as the original duplicated loop was.
+    discardAllUrbs(stream);
     struct usbdevfs_urb* reaped = nullptr;
     while (ioctl(stream->fd, USBDEVFS_REAPURBNDELAY, &reaped) == 0) {
         // Drain whatever the kernel still has queued so it can free its own bookkeeping.

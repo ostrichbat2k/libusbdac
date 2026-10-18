@@ -1,6 +1,6 @@
 /*
- * Copyright (c) 2026 Auxio Project
- * UacPlaybackTopology.kt is part of Auxio.
+ * Copyright (c) 2026 libusbdac Project
+ * UacPlaybackTopology.kt is part of libusbdac.
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -90,9 +90,10 @@ data class UacPlaybackTopology(
 
 /**
  * Everything [UsbAudioDescriptorParser] found on a device's descriptors, bundled for read-only
- * display on the USB settings screen -- published as soon as a topology is parsed, independent of
+ * display in a host app's UI -- published as soon as a topology is parsed, independent of
  * whether the control-transfer setup that follows (clock, mute, volume, mixer gain) ends up
- * succeeding, since it describes what the device *declares*, not what Auxio managed to configure.
+ * succeeding, since it describes what the device *declares*, not what the host managed to
+ * configure.
  */
 data class UsbDeviceCapabilities(
     val deviceName: String,

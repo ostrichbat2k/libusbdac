@@ -62,9 +62,10 @@ object IsoToneTest {
         // shared the bug too. See UsbAudioOutput.startStreamingThread's doc comment for the full
         // explanation.
         val usbSpeed = UsbNative.getUsbSpeed(fd)
-        val packetsPerSecond = if (usbSpeed == 3) 8000 else 1000
-        val packetDurationNs = 1_000_000_000L / packetsPerSecond
-        val packetsPerUrb = BASE_PACKETS_PER_URB * (packetsPerSecond / 1000)
+        val pacing = IsoPacing.forSpeed(usbSpeed, BASE_PACKETS_PER_URB)
+        val packetsPerSecond = pacing.packetsPerSecond
+        val packetDurationNs = pacing.packetDurationNs
+        val packetsPerUrb = pacing.packetsPerUrb
 
         val handle =
             UsbNative.openIsoStream(fd, format.endpointAddress, format.maxPacketSize, packetsPerUrb, NUM_URBS)
@@ -78,26 +79,35 @@ object IsoToneTest {
         val peak = maxAmplitudeFor(bytesPerSample)
         val scheduler = IsoPacketScheduler(sampleRateHz, packetsPerSecond)
 
-        fun buildUrb(): Pair<ByteArray, IntArray> {
-            val packetLengths = IntArray(packetsPerUrb)
+        // Pre-allocated and reused across every call below instead of a fresh ByteArray/IntArray
+        // per URB -- the same per-URB-allocation/GC-pause bug UsbAudioOutput's real playback path
+        // was fixed for (see its buildUrb() doc comment); this tool shares the same real-time
+        // submit/reap loop and would hit it just as audibly. Sized for the largest a packet can
+        // ever be for this sampleRateHz (IsoPacketScheduler's Bresenham remainder adds at most one
+        // extra sample) -- a call using less than the max just leaves the buffer's tail untouched,
+        // same as UsbAudioOutput does; packetLengths alone governs how much of it is actually sent.
+        val maxBytesPerPacket = (sampleRateHz / packetsPerSecond + 1) * bytesPerFrame
+        val urbBuffer = ByteArray(packetsPerUrb * maxBytesPerPacket)
+        val packetLengths = IntArray(packetsPerUrb)
+
+        /** Fills [urbBuffer]/[packetLengths] in place; return value is unused by callers here. */
+        fun buildUrb() {
             var total = 0
             for (p in 0 until packetsPerUrb) {
                 val bytes = scheduler.nextPacketSampleCount() * bytesPerFrame
                 packetLengths[p] = bytes
                 total += bytes
             }
-            val buf = ByteArray(total)
             var offset = 0
             while (offset < total) {
                 val value = (sin(phase) * AMPLITUDE * peak).toInt()
                 phase += phaseStep
                 if (phase > 2.0 * PI) phase -= 2.0 * PI
                 repeat(channels) {
-                    writeSample(buf, offset, value, bytesPerSample)
+                    writeSample(urbBuffer, offset, value, bytesPerSample)
                     offset += bytesPerSample
                 }
             }
-            return buf to packetLengths
         }
 
         L.i(
@@ -105,8 +115,8 @@ object IsoToneTest {
                 "usbSpeed=$usbSpeed ($packetsPerSecond packets/sec, $packetsPerUrb packets/urb)")
         try {
             for (slot in 0 until NUM_URBS) {
-                val (chunk, lengths) = buildUrb()
-                UsbNative.submitIso(handle, slot, chunk, lengths)
+                buildUrb()
+                UsbNative.submitIso(handle, slot, urbBuffer, packetLengths)
             }
 
             // Explicit wall-clock pacing, not just reapIso()'s own timing -- confirmed, on real
@@ -135,13 +145,13 @@ object IsoToneTest {
                 if (waitNs > 0) {
                     Thread.sleep(waitNs / 1_000_000L, (waitNs % 1_000_000L).toInt())
                 }
-                val (chunk, lengths) = buildUrb()
-                // The return value here was previously ignored, which let URBs silently fail to
-                // resubmit (SUBMITURB can fail with ENODEV/EBUSY/ESHUTDOWN even when reapIso()
-                // keeps succeeding for other in-flight URBs) while "0 reap errors" made it look
-                // like a perfectly clean transfer -- exactly the gap that was hiding a real,
-                // intermittent submission failure during silent-but-"clean" runs.
-                if (UsbNative.submitIso(handle, slot, chunk, lengths)) {
+                buildUrb()
+                // submitIso's own return value here was previously ignored, which let URBs
+                // silently fail to resubmit (SUBMITURB can fail with ENODEV/EBUSY/ESHUTDOWN even
+                // when reapIso() keeps succeeding for other in-flight URBs) while "0 reap errors"
+                // made it look like a perfectly clean transfer -- exactly the gap that was hiding
+                // a real, intermittent submission failure during silent-but-"clean" runs.
+                if (UsbNative.submitIso(handle, slot, urbBuffer, packetLengths)) {
                     submitted++
                 } else {
                     submitFailures++

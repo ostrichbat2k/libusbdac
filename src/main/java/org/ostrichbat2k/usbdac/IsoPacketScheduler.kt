@@ -31,10 +31,9 @@ package org.ostrichbat2k.usbdac
  * essential, not cosmetic: assuming 1000 unconditionally on a high-speed device packs 8x too many
  * samples into each packet slot relative to how much real bus time it actually occupies).
  */
-class IsoPacketScheduler(sampleRateHz: Int, packetsPerSecond: Int = 1000) {
+class IsoPacketScheduler(sampleRateHz: Int, private val packetsPerSecond: Int = 1000) {
     private val baseSamplesPerPacket = sampleRateHz / packetsPerSecond
     private val remainderPerPacket = sampleRateHz % packetsPerSecond
-    private val packetsPerSecond = packetsPerSecond
     private var accumulator = 0
 
     /** Returns the number of samples the next packet should carry. */
@@ -50,5 +49,26 @@ class IsoPacketScheduler(sampleRateHz: Int, packetsPerSecond: Int = 1000) {
 
     fun reset() {
         accumulator = 0
+    }
+}
+
+/**
+ * Pacing parameters derived from a device's negotiated USB speed -- shared by every isochronous
+ * streaming loop in this library (both [UsbAudioOutput]'s real playback path and
+ * [IsoToneTest]'s diagnostic one share the native iso-streaming plumbing, and used to each
+ * independently re-derive this same math) so the high-speed-vs-full-speed distinction can't
+ * drift out of sync between them. See [UsbNative.getUsbSpeed]'s doc comment for why 125us
+ * microframes vs. 1ms frames matters here, not just cosmetically.
+ */
+data class IsoPacing(val packetsPerSecond: Int, val packetDurationNs: Long, val packetsPerUrb: Int) {
+    companion object {
+        /** [basePacketsPerUrb] is the caller's full-speed (1 packet == 1ms) target; scaled up here. */
+        fun forSpeed(usbSpeed: Int, basePacketsPerUrb: Int): IsoPacing {
+            val packetsPerSecond = if (usbSpeed == 3) 8000 else 1000
+            return IsoPacing(
+                packetsPerSecond = packetsPerSecond,
+                packetDurationNs = 1_000_000_000L / packetsPerSecond,
+                packetsPerUrb = basePacketsPerUrb * (packetsPerSecond / 1000))
+        }
     }
 }

@@ -1,6 +1,6 @@
 /*
- * Copyright (c) 2026 Auxio Project
- * UsbAudioController.kt is part of Auxio.
+ * Copyright (c) 2026 libusbdac Project
+ * UsbAudioController.kt is part of libusbdac.
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -38,7 +38,7 @@ data class UsbAudioSession(
      * discrete rate is one where min == max), read once via [UsbAudioController.getClockFrequencyRanges]
      * right after activation. Empty for UAC 1.0 (no Clock Source) or if the device didn't answer
      * the query -- callers should fall back to a hardcoded guess in that case, not treat empty as
-     * "nothing supported." Declaring a rate here is no guarantee Auxio can actually request it
+     * "nothing supported." Declaring a rate here is no guarantee we can actually request it
      * (unrelated failures still possible), but NOT declaring one here and still requesting it
      * anyway was confirmed, on a real device, to silently keep the hardware clock at its previous
      * rate while the SET_CUR/GET_CUR control-register readback still reported the requested value
@@ -103,6 +103,23 @@ object UsbAudioController {
     /** The CUR request's bRequest byte for [topology]'s UAC version and GET/SET direction. */
     private fun curRequest(topology: UacPlaybackTopology, get: Boolean): Int =
         if (topology.uacVersion == 1 && get) UAC1_REQUEST_GET_CUR else UAC_REQUEST_CUR
+
+    /**
+     * Decodes a little-endian unsigned integer from [len] bytes (1-4) starting at [offset] --
+     * every multi-byte UAC CUR/RANGE value in this file (clock frequency, UAC1 endpoint sample
+     * rate) is one of these, previously hand-rolled with the same bit-shift arithmetic at each
+     * call site instead of sharing this.
+     */
+    private fun ByteArray.leUInt(offset: Int, len: Int): Int {
+        var value = 0
+        for (i in 0 until len) {
+            value = value or ((this[offset + i].toInt() and 0xFF) shl (8 * i))
+        }
+        return value
+    }
+
+    /** Encodes [value] as [len] little-endian bytes (1-4) -- the write-side counterpart of [leUInt]. */
+    private fun leBytes(value: Int, len: Int): ByteArray = ByteArray(len) { i -> ((value shr (8 * i)) and 0xFF).toByte() }
 
     const val PD_STATE_D0 = 0
     const val PD_STATE_D1 = 1
@@ -288,11 +305,7 @@ object UsbAudioController {
             L.w("GET_CUR clock frequency failed: result=$result (wValue=$wValue wIndex=$wIndex)")
             return null
         }
-        val hz =
-            (buffer[0].toInt() and 0xFF) or
-                ((buffer[1].toInt() and 0xFF) shl 8) or
-                ((buffer[2].toInt() and 0xFF) shl 16) or
-                ((buffer[3].toInt() and 0xFF) shl 24)
+        val hz = buffer.leUInt(0, 4)
         L.i("Clock ${session.topology.clockSourceId} current frequency: $hz Hz")
         return hz
     }
@@ -352,17 +365,12 @@ object UsbAudioController {
             L.w("GET_RANGE clock frequency failed: result=$result (wValue=$wValue wIndex=$wIndex)")
             return null
         }
-        val numSubRanges = (buffer[0].toInt() and 0xFF) or ((buffer[1].toInt() and 0xFF) shl 8)
-        fun u32(offset: Int) =
-            (buffer[offset].toInt() and 0xFF) or
-                ((buffer[offset + 1].toInt() and 0xFF) shl 8) or
-                ((buffer[offset + 2].toInt() and 0xFF) shl 16) or
-                ((buffer[offset + 3].toInt() and 0xFF) shl 24)
+        val numSubRanges = buffer.leUInt(0, 2)
         val ranges = mutableListOf<Pair<Int, Int>>()
         for (i in 0 until numSubRanges) {
             val base = 2 + i * 12
             if (base + 12 > result) break // device declared more sub-ranges than it sent back
-            ranges.add(u32(base) to u32(base + 4))
+            ranges.add(buffer.leUInt(base, 4) to buffer.leUInt(base + 4, 4))
         }
         L.i("Clock ${session.topology.clockSourceId} supported rate ranges: $ranges")
         return ranges
@@ -395,12 +403,7 @@ object UsbAudioController {
     fun setClockFrequency(session: UsbAudioSession, hz: Int): Boolean {
         val wValue = CS_SAM_FREQ_CONTROL shl 8
         val wIndex = (session.topology.clockSourceId shl 8) or session.controlInterface.id
-        val buffer =
-            byteArrayOf(
-                (hz and 0xFF).toByte(),
-                ((hz shr 8) and 0xFF).toByte(),
-                ((hz shr 16) and 0xFF).toByte(),
-                ((hz shr 24) and 0xFF).toByte())
+        val buffer = leBytes(hz, 4)
         val result =
             session.connection.controlTransfer(
                 REQ_TYPE_CLASS_INTERFACE_SET, UAC_REQUEST_CUR, wValue, wIndex, buffer, buffer.size, 1000)
@@ -436,7 +439,7 @@ object UsbAudioController {
             L.w("GET_CUR UAC1 endpoint sample rate (ep=0x${"%02x".format(endpointAddress)}) failed: result=$result")
             return null
         }
-        val hz = (buffer[0].toInt() and 0xFF) or ((buffer[1].toInt() and 0xFF) shl 8) or ((buffer[2].toInt() and 0xFF) shl 16)
+        val hz = buffer.leUInt(0, 3)
         L.i("UAC1 endpoint 0x${"%02x".format(endpointAddress)} current sample rate: $hz Hz")
         return hz
     }
@@ -450,8 +453,7 @@ object UsbAudioController {
      */
     fun setUac1EndpointSampleRate(session: UsbAudioSession, endpointAddress: Int, hz: Int): Boolean {
         val wValue = CS_SAM_FREQ_CONTROL shl 8
-        val buffer =
-            byteArrayOf((hz and 0xFF).toByte(), ((hz shr 8) and 0xFF).toByte(), ((hz shr 16) and 0xFF).toByte())
+        val buffer = leBytes(hz, 3)
         val result =
             session.connection.controlTransfer(
                 REQ_TYPE_CLASS_ENDPOINT_SET,

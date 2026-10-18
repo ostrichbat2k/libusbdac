@@ -1,6 +1,6 @@
 /*
- * Copyright (c) 2026 Auxio Project
- * UsbAudioManager.kt is part of Auxio.
+ * Copyright (c) 2026 libusbdac Project
+ * UsbAudioManager.kt is part of libusbdac.
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -449,10 +449,11 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
     private fun UsbDevice.isAudioDevice(): Boolean =
         (0 until interfaceCount).any { getInterface(it).interfaceClass == UsbConstants.USB_CLASS_AUDIO }
 
-    // Auxio builds two renderers (FFmpeg-preferred, MediaCodec-fallback), each wrapping its own
-    // RoutingAudioSink -- and both get queried (supportsFormat/getFormatSupport, and apparently
-    // position) by ExoPlayer's renderer machinery, not just whichever one actually ends up
-    // streaming. createAudioSink() returning a *fresh* UsbAudioSink per call meant each
+    // A host app building more than one audio renderer (e.g. a preferred decoder plus a
+    // fallback), each wrapping its own RoutingAudioSink -- both get queried
+    // (supportsFormat/getFormatSupport, and apparently position) by ExoPlayer's renderer
+    // machinery, not just whichever one actually ends up streaming. createAudioSink() returning
+    // a *fresh* UsbAudioSink per call meant each
     // RoutingAudioSink got its own, separate instance: one got genuinely configured and streamed
     // correctly, but the other sat forever unconfigured (sampleRateHz=0), and its
     // getCurrentPositionUs() dutifully reporting AudioSink.CURRENT_POSITION_NOT_SET
@@ -544,7 +545,7 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
 
     /**
      * Whether the active device is bit-perfect capable: its output Feature Unit was found *and*
-     * its volume range was successfully read back (confirming Auxio actually knows where unity
+     * its volume range was successfully read back (confirming we actually know where unity
      * gain is, rather than just assuming it) -- see [UsbControlState.volumeRange]. This is what
      * gates whether the "Bit-perfect mode" toggle is interactable at all; false if nothing is
      * active right now.
@@ -826,7 +827,7 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
         // UsbAudioController.activate() (and selectFormat above) claimed the interface to do
         // this one-time discovery/setup, but nothing's actually playing yet -- holding onto that
         // claim here would mean Android's own USB-audio HAL (and every other app) stays locked
-        // out of a device Auxio has merely *plugged in*, not even pressed play on. Hand it
+        // out of a device the host app has merely *plugged in*, not even pressed play on. Hand it
         // straight back; requestClaim() re-evicts and re-claims it the moment real playback
         // actually starts.
         interfaceClaimed = true
@@ -1031,7 +1032,7 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
     /**
      * The inverse of [mirrorDbToStreamMusic]: called when [AudioManager.VOLUME_CHANGED_ACTION]
      * reports a real (not self-caused) STREAM_MUSIC change while a fallback track -- the only
-     * time STREAM_MUSIC is actually what's audible for Auxio -- is the current route. Persists
+     * time STREAM_MUSIC is actually what's audible -- is the current route. Persists
      * the dB equivalent to [UsbDacPreferences.volumeDb] so the *next* bit-perfect track picks up from
      * roughly the same perceived loudness, but deliberately does not touch the hardware live --
      * it's intentionally sitting at unity gain for the whole time a fallback track is playing
@@ -1105,7 +1106,7 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
     fun setPreferredBitResolution(bitResolution: Int) {
         preferredBitResolution = bitResolution
         logEvent("Preferred format set to ${bitResolution}-bit, re-activating")
-        debugRetryActivation()
+        retryActivation()
     }
 
     private fun deactivateDac() {
@@ -1120,29 +1121,30 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
     }
 
     /**
-     * Testing hook: re-runs DAC activation (including the diagnostic tone test) for whatever USB
-     * audio device is currently attached. Requests permission if needed, or re-activates
-     * directly if already permitted -- Android only re-fires the permission-granted broadcast on
-     * an actual grant, not on a request for a permission [knownPermissions] already has recorded
-     * as granted, so without this there's no way to re-trigger activation short of unplugging the
-     * device or restarting the app.
+     * Re-runs DAC activation for whatever USB audio device is currently attached. Requests
+     * permission if needed, or re-activates directly if already permitted -- Android only
+     * re-fires the permission-granted broadcast on an actual grant, not on a request for a
+     * permission [knownPermissions] already has recorded as granted, so without this there's no
+     * way to re-trigger activation short of unplugging the device or restarting the app. Not
+     * debug-only despite the name this used to have -- called from real user-facing paths
+     * ([setPreferredBitResolution], [onUsbEnabledChanged]), not just testing.
      */
-    fun debugRetryActivation() {
+    fun retryActivation() {
         if (!usbSettings.enabled) {
-            L.i("debugRetryActivation: USB DAC output is disabled in settings")
+            L.i("retryActivation: USB DAC output is disabled in settings")
             return
         }
         val device = _devices.value.firstOrNull()
         if (device == null) {
-            L.w("debugRetryActivation: no USB audio device attached")
+            L.w("retryActivation: no USB audio device attached")
             return
         }
         if (!device.hasPermission) {
-            L.i("debugRetryActivation: requesting permission for ${device.displayName}")
+            L.i("retryActivation: requesting permission for ${device.displayName}")
             requestPermission(device.device)
             return
         }
-        L.i("debugRetryActivation: re-activating DAC session for ${device.displayName}")
+        L.i("retryActivation: re-activating DAC session for ${device.displayName}")
         deactivateDac()
         Thread { activateDac(device.device) }
             .apply {
@@ -1160,7 +1162,7 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
     override fun onUsbEnabledChanged() {
         if (usbSettings.enabled) {
             L.i("USB DAC output enabled by user, attempting activation")
-            debugRetryActivation()
+            retryActivation()
         } else {
             L.i("USB DAC output disabled by user, releasing any active session")
             deactivateDac()
@@ -1179,7 +1181,7 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
         // How long to keep the raw interface claim after releaseClaim() is called before
         // actually handing it back to the kernel -- long enough that a quick pause/resume (or a
         // brief Settings screen tweak) never pays the real hand-off cost, short enough that
-        // genuinely leaving Auxio paused or idle frees the device for every other app promptly.
+        // genuinely leaving playback paused or idle frees the device for every other app promptly.
         const val RELEASE_GRACE_MS = 3000L
         // How long awaitAndroidOutputTakeover() will poll before giving up -- confirmed via
         // logcat the real kernel-driver-rebind-to-ALSA-node latency is ~100-300ms on the one

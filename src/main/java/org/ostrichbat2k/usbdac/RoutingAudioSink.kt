@@ -61,10 +61,11 @@ import java.nio.ByteBuffer
  * mid-stream (or swapping it for a different one) makes [UsbAudioManager.createAudioSink] start
  * returning null or a new instance, and without this check every subsequent [configure] kept
  * reusing the old, now-dead session's sink forever: every call failed identically (a closed
- * [android.hardware.usb.UsbDeviceConnection] can't issue control transfers), which fed into
- * [org.oxycblt.auxio.playback.service.ExoPlaybackStateHolder.onPlayerError]'s unconditional
- * retry-next-track loop with no backoff -- a real, reproduced infinite error loop, not a
- * hypothetical. [reset] still clears the delegate outright for other cases (e.g. a hard seek).
+ * [android.hardware.usb.UsbDeviceConnection] can't issue control transfers), which fed into a
+ * host app's own unconditional retry-next-track error-recovery loop (observed in Auxio's
+ * `ExoPlaybackStateHolder.onPlayerError`, which has no backoff) -- a real, reproduced infinite
+ * error loop, not a hypothetical. [reset] still clears the delegate outright for other cases
+ * (e.g. a hard seek).
  */
 class RoutingAudioSink(private val usbAudioManager: UsbAudioManager, private val fallback: AudioSink) :
     AudioSink {

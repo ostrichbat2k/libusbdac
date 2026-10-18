@@ -42,6 +42,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
 import timber.log.Timber as L
 
@@ -467,10 +468,17 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
      * Waits, bounded by [timeoutMs], for the most recently started [activateDac] to finish --
      * see [activationSettled]'s doc comment for why a caller about to start playback would want
      * this. A no-op (returns immediately) if nothing's currently activating, so this costs
-     * nothing on every other play() call, only the one race window right after a permission
-     * grant. Deliberately doesn't report success/failure -- the caller should just proceed with
-     * playback either way; [createAudioSink] returning null (e.g. activation genuinely failed, or
-     * there's no DAC at all) falls back exactly as if this had never been called.
+     * nothing outside the actual race window (right after a permission grant, a device
+     * reattachment, or anything else that re-triggers [activateDac]). Deliberately doesn't
+     * report success/failure -- the caller should just proceed with playback either way;
+     * [createAudioSink] returning null (e.g. activation genuinely failed, or there's no DAC at
+     * all) falls back exactly as if this had never been called.
+     *
+     * [createAudioSink] already calls this internally, so most callers don't need to -- this
+     * stays public for a caller that specifically wants to wait *before* doing anything else
+     * (e.g. [ExoPlaybackStateHolder][org.oxycblt.auxio.playback.service.ExoPlaybackStateHolder]'s
+     * cold-launch restore path awaits once up front rather than letting the first per-track
+     * [createAudioSink] call absorb the wait on its own).
      */
     suspend fun awaitActivation(timeoutMs: Long = 4000L) {
         val deferred = activationSettled ?: return
@@ -486,12 +494,24 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
      * re-checks this on every track (see its own liveness re-validation), so toggling bit-perfect
      * mode takes effect on the very next [RoutingAudioSink.configure] call.
      *
+     * Blocks (bounded, via [awaitActivation]) on an in-flight [activateDac] *before* checking
+     * capability/session state, not after -- otherwise this would race any caller, not just the
+     * one that happens to remember to await first. Confirmed, reproduced on real hardware: a
+     * device reattachment's background [activateDac] has no caller-side await covering it at
+     * all (unlike the one call site that was patched for the original cold-launch version of
+     * this race), so a track change or play press landing in that window lost the race every
+     * time, with zero recovery short of a manual track change -- this closes the gap for every
+     * trigger at once instead of patching each one individually. Only blocks the one call that
+     * actually hits the race window: [activeSink] (the common case) is still a zero-cost return
+     * above the await, and the await itself is already a no-op when nothing's activating.
+     *
      * Returns a plain [DefaultAudioSink] built with a [UsbAudioOutputProvider] rather than a
      * hand-rolled `AudioSink` -- see [UsbAudioOutput]'s doc comment for why.
      */
     fun createAudioSink(): AudioSink? {
-        if (!usbSettings.bitPerfectMode || !isBitPerfectCapable()) return null
         activeSink?.let { return it }
+        runBlocking { awaitActivation() }
+        if (!usbSettings.bitPerfectMode || !isBitPerfectCapable()) return null
         val session = activeSession ?: return null
         return DefaultAudioSink.Builder(context)
             .setAudioOutputProvider(UsbAudioOutputProvider(this, session, usbSettings))
@@ -590,13 +610,17 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
         try {
             for (i in 0 until device.configurationCount.coerceAtLeast(1)) {
                 val bytes = UsbAudioDescriptorParser.fetchConfigurationDescriptor(connection, i) ?: continue
-                UsbAudioDescriptorParser.dumpAcTopology(bytes)
-                UsbAudioDescriptorParser.parseUac3Playback(bytes)?.let { topology = it }
+                // Walk once, reuse the result across all four calls below -- each independently
+                // re-walking the same bytes was a real, pointless 4x linear pass per
+                // configuration index (see UsbAudioDescriptorParser.walk's doc comment).
+                val entries = UsbAudioDescriptorParser.walk(bytes)
+                UsbAudioDescriptorParser.dumpAcTopology(entries)
+                UsbAudioDescriptorParser.parseUac3Playback(entries)?.let { topology = it }
                 if (topology == null) {
-                    UsbAudioDescriptorParser.parseUac2Playback(bytes)?.let { topology = it }
+                    UsbAudioDescriptorParser.parseUac2Playback(entries)?.let { topology = it }
                 }
                 if (topology == null) {
-                    UsbAudioDescriptorParser.parseUac1Playback(bytes)?.let { topology = it }
+                    UsbAudioDescriptorParser.parseUac1Playback(entries)?.let { topology = it }
                 }
             }
         } finally {
@@ -676,6 +700,21 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
             }
         }
 
+        // Normalized to a floor of 2 exactly once, here, instead of every downstream reader
+        // independently doing `.coerceAtLeast(2)` (previously duplicated across this file's own
+        // volume/mixer loops, UsbAudioOutputProvider.channels, and refreshControlState). This
+        // covers both "unknown" (-1: the cluster fetch above failed or didn't apply, or a UAC1/2
+        // device's Input Terminal channel count itself couldn't be parsed -- see
+        // UacPlaybackTopology.channelCount's doc comment) and a genuinely-parsed mono (1)
+        // device -- the floor of 2 was a deliberate safety margin applied to both cases
+        // previously, not just the unknown one, and this keeps that behavior rather than only
+        // fixing up -1 specifically.
+        if (found.channelCount < 2) {
+            logEvent("Channel count ${found.channelCount} below floor, coercing to 2")
+            found = found.copy(channelCount = 2)
+            session = session.copy(topology = found)
+        }
+
         // Do this before anything else: its recovery wait (up to 300ms for a D2->D0 wake, per
         // this device's own declared waRecoveryTime2) should overlap with -- not follow -- the
         // rest of setup below, and nothing else here is safe to skip past a domain that might
@@ -714,7 +753,7 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
         // master *volume* -- if this Feature Unit has an independent master gain stage
         // separate from the per-channel ones below, it being low/attenuated would silence
         // everything regardless of what the per-channel ones are set to.
-        for (channel in 0..found.channelCount.coerceAtLeast(2)) {
+        for (channel in 0..found.channelCount) {
             val volume = UsbAudioController.getVolume(session, channel)
             // Deliberately the midpoint of the device's own reported range, not its max (unity
             // gain) -- a freshly (re)activated DAC shouldn't jump straight to its loudest
@@ -735,8 +774,9 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
         val mixerUnitId = found.mixerUnitId
         val mixerBase = found.mixerInputChannelBase
         // Was hardcoded to a stereo-in/stereo-out cross-point grid; both sides scale with the
-        // device's own real channel count instead (not assumed).
-        val mixerChannelCount = found.channelCount.coerceAtLeast(2)
+        // device's own real channel count instead (not assumed). found.channelCount is already
+        // normalized to never be -1/unknown by this point (see the channel-count fallback above).
+        val mixerChannelCount = found.channelCount
         if (mixerUnitId >= 0 && mixerBase >= 0) {
             for (inCh in mixerBase until mixerBase + mixerChannelCount) {
                 for (outCh in 1..mixerChannelCount) {
@@ -839,8 +879,10 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
         val mixerUnitId = session.topology.mixerUnitId
         val mixerBase = session.topology.mixerInputChannelBase
         // Was hardcoded to a stereo-in/stereo-out grid -- see activateDac's identical fix for why
-        // this scales with the device's own real channel count instead.
-        val mixerChannelCount = session.topology.channelCount.coerceAtLeast(2)
+        // this scales with the device's own real channel count instead. Every session here is
+        // always one activateDac already normalized (see its channel-count fallback), so no
+        // coerce is needed on this read.
+        val mixerChannelCount = session.topology.channelCount
         val mixerChannels =
             if (mixerUnitId >= 0 && mixerBase >= 0) {
                 (mixerBase until mixerBase + mixerChannelCount).flatMap { inCh ->
@@ -1069,8 +1111,9 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
                 volumeWriteInFlight = false
                 return@execute
             }
-            // Was hardcoded 0..2 (master + stereo) -- see activateDac's identical fix.
-            for (channel in 0..session.topology.channelCount.coerceAtLeast(2)) {
+            // Was hardcoded 0..2 (master + stereo) -- see activateDac's identical fix. No coerce
+            // needed: activateDac already normalizes channelCount before this session exists.
+            for (channel in 0..session.topology.channelCount) {
                 UsbAudioController.setVolume(session, target, channel)
             }
             logEvent("User set volume=$target")

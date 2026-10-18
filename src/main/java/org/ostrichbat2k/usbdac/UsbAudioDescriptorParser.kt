@@ -119,8 +119,10 @@ object UsbAudioDescriptorParser {
      * or Mixer Unit sitting between them -- never configured, never even known about -- would
      * show up here instead of silently gating the signal.
      */
-    fun dumpAcTopology(configBytes: ByteArray) {
-        val entries = walk(configBytes)
+    fun dumpAcTopology(configBytes: ByteArray) = dumpAcTopology(walk(configBytes))
+
+    /** [entries]-taking overload of [dumpAcTopology] -- see [walk]'s doc comment for why this exists. */
+    fun dumpAcTopology(entries: List<Pair<Int, ByteArray>>) {
         var currentInterfaceNumber = -1
         var currentInterfaceSubClass = -1
         var currentInterfaceProtocol = -1
@@ -192,8 +194,16 @@ object UsbAudioDescriptorParser {
         }
     }
 
-    /** Splits a raw configuration descriptor into its sequential (type, bytes) TLV entries. */
-    private fun walk(data: ByteArray): List<Pair<Int, ByteArray>> {
+    /**
+     * Splits a raw configuration descriptor into its sequential (type, bytes) TLV entries.
+     * Public so a caller walking the same buffer through more than one of this object's
+     * `ByteArray`-taking functions (see [UsbAudioManager.activateDac], which tries
+     * [parseUac3Playback]/[parseUac2Playback]/[parseUac1Playback] plus [dumpAcTopology] against
+     * the same bytes) can walk once and pass the result to each function's `entries`-taking
+     * overload instead -- walking is a full linear pass over the buffer, and every one of those
+     * functions would otherwise redo it independently.
+     */
+    fun walk(data: ByteArray): List<Pair<Int, ByteArray>> {
         val entries = mutableListOf<Pair<Int, ByteArray>>()
         var offset = 0
         while (offset + 2 <= data.size) {
@@ -215,9 +225,10 @@ object UsbAudioDescriptorParser {
      * with its linked USB-Streaming-to-output AudioStreaming interface, into a playback topology.
      * Returns null if this configuration isn't a (full, non-BADD) UAC 3.0 one.
      */
-    fun parseUac3Playback(configBytes: ByteArray): UacPlaybackTopology? {
-        val entries = walk(configBytes)
+    fun parseUac3Playback(configBytes: ByteArray): UacPlaybackTopology? = parseUac3Playback(walk(configBytes))
 
+    /** [entries]-taking overload of [parseUac3Playback] -- see [walk]'s doc comment for why this exists. */
+    fun parseUac3Playback(entries: List<Pair<Int, ByteArray>>): UacPlaybackTopology? {
         var configurationValue = 0
         var currentInterfaceNumber = -1
         var currentAltSetting = -1
@@ -408,8 +419,10 @@ object UsbAudioDescriptorParser {
      * into a separate Cluster Descriptor fetch) -- meaning mixerInputChannelBase can be computed
      * exactly here instead of only for a Mixer Unit's first input pin.
      */
-    fun parseUac2Playback(configBytes: ByteArray): UacPlaybackTopology? {
-        val entries = walk(configBytes)
+    fun parseUac2Playback(configBytes: ByteArray): UacPlaybackTopology? = parseUac2Playback(walk(configBytes))
+
+    /** [entries]-taking overload of [parseUac2Playback] -- see [walk]'s doc comment for why this exists. */
+    fun parseUac2Playback(entries: List<Pair<Int, ByteArray>>): UacPlaybackTopology? {
 
         var configurationValue = 0
         var currentInterfaceNumber = -1
@@ -594,8 +607,10 @@ object UsbAudioDescriptorParser {
      * selected. (Only the common discrete-rate-list form of FORMAT_TYPE is handled; the rarer
      * continuous-range form, bSamFreqType=0, is skipped.)
      */
-    fun parseUac1Playback(configBytes: ByteArray): UacPlaybackTopology? {
-        val entries = walk(configBytes)
+    fun parseUac1Playback(configBytes: ByteArray): UacPlaybackTopology? = parseUac1Playback(walk(configBytes))
+
+    /** [entries]-taking overload of [parseUac1Playback] -- see [walk]'s doc comment for why this exists. */
+    fun parseUac1Playback(entries: List<Pair<Int, ByteArray>>): UacPlaybackTopology? {
 
         var configurationValue = 0
         var currentInterfaceNumber = -1

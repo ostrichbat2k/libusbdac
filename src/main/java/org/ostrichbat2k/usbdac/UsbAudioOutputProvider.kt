@@ -50,11 +50,8 @@ class UsbAudioOutputProvider(
 ) : AudioOutputProvider {
 
     private companion object {
-        // Fallback only -- used when UacPlaybackTopology.channelCount couldn't be determined
-        // (always true for UAC 3.0, which pushes channel count into a Cluster Descriptor fetch
-        // this codebase doesn't do) or when a format's own supported rates couldn't be read back
-        // at all (see acceptedSampleRates). Not a hardcoded assumption applied unconditionally.
-        const val FALLBACK_CHANNELS = 2
+        // Fallback only -- used when a format's own supported rates couldn't be read back at all
+        // (see acceptedSampleRates). Not a hardcoded assumption applied unconditionally.
         val FALLBACK_SAMPLE_RATES = setOf(44100, 48000)
     }
 
@@ -62,12 +59,14 @@ class UsbAudioOutputProvider(
     // per bit depth) -- matched against per-track, not narrowed down to a single one up front.
     private val allFormats: List<UacStreamFormat> = session.topology.formats
 
-    // Real channel count from the device's own Input Terminal descriptor when known (see
-    // UacPlaybackTopology.channelCount); falls back to assuming stereo only for UAC 3.0, where
-    // this codebase doesn't resolve it at all. Assumed constant across every format/alt-setting
-    // this device offers -- channel count hasn't been observed to vary by bit depth on any device
-    // tested against.
-    val channels: Int = session.topology.channelCount.let { if (it > 0) it else FALLBACK_CHANNELS }
+    // Real channel count from the device's own Input Terminal descriptor, or UsbAudioManager.
+    // activateDac's UAC3 Cluster Descriptor fetch, or that same function's stereo-assumption
+    // fallback if even that fails -- see UacPlaybackTopology.channelCount's doc comment.
+    // session.topology is always one activateDac has already resolved by the time a provider is
+    // constructed (see UsbAudioManager.createAudioSink), so no fallback is needed here too.
+    // Assumed constant across every format/alt-setting this device offers -- channel count
+    // hasn't been observed to vary by bit depth on any device tested against.
+    val channels: Int = session.topology.channelCount
 
     // UAC 1.0 declares its actual supported rate(s) per-format directly (e.g. a real device this
     // was confirmed against offers only 8000/48000 Hz, not 44100 at all). UAC 2.0/3.0 negotiate

@@ -1,0 +1,95 @@
+buildscript {
+    ext {
+        agp_version = '9.3.2'
+        kotlin_version = '2.4.10'
+        kotlin_coroutines_version = '1.11.0'
+        core_version = '1.19.0'
+        media3_version = '1.11.0'
+        desugaring_version = '2.1.3'
+
+        min_sdk = 24
+        target_sdk = 37
+        ndk_version = "28.2.13676358"
+    }
+}
+
+plugins {
+    //noinspection GradlePluginVersion
+    id 'com.android.library' version "$agp_version"
+}
+
+android {
+    namespace 'org.ostrichbat2k.usbdac'
+    compileSdk target_sdk
+    ndkVersion "$ndk_version"
+
+    defaultConfig {
+        minSdk min_sdk
+
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+        consumerProguardFiles "consumer-rules.pro"
+        externalNativeBuild {
+            cmake {
+                cppFlags ""
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path "src/main/cpp/CMakeLists.txt"
+            version "3.22.1"
+        }
+    }
+
+    compileOptions {
+        coreLibraryDesugaringEnabled true
+        sourceCompatibility JavaVersion.VERSION_21
+        targetCompatibility JavaVersion.VERSION_21
+    }
+
+    buildFeatures {
+        buildConfig true
+    }
+    lint {
+        targetSdk target_sdk
+    }
+    testOptions {
+        targetSdk target_sdk
+    }
+}
+
+dependencies {
+    // Kotlin
+    implementation "org.jetbrains.kotlin:kotlin-stdlib:$kotlin_version"
+    implementation "org.jetbrains.kotlinx:kotlinx-coroutines-core:$kotlin_coroutines_version"
+
+    // AndroidX
+    implementation "androidx.core:core-ktx:$core_version"
+
+    // Media3 -- AudioOutput/AudioOutputProvider/Format/C are the integration surface this
+    // library's AudioOutputProvider/AudioOutput implementations plug into.
+    implementation "androidx.media3:media3-exoplayer:$media3_version"
+
+    // Logging
+    implementation 'com.jakewharton.timber:timber:5.0.1'
+
+    // Build
+    coreLibraryDesugaring "com.android.tools:desugar_jdk_libs:$desugaring_version"
+
+    // Testing
+    testImplementation "junit:junit:4.13.2"
+    testImplementation "io.mockk:mockk:1.14.11"
+    testImplementation "org.robolectric:robolectric:4.16.1"
+    testImplementation 'androidx.test:core-ktx:1.7.0'
+    testImplementation "org.jetbrains.kotlinx:kotlinx-coroutines-test:$kotlin_coroutines_version"
+    androidTestImplementation 'androidx.test.ext:junit:1.3.0'
+    androidTestImplementation 'androidx.test.espresso:espresso-core:3.7.0'
+}

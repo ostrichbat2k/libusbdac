@@ -1,0 +1,7 @@
+/build
+.gradle
+.cxx
+local.properties
+.idea
+*.iml
+.DS_Store

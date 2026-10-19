@@ -282,8 +282,18 @@ class RoutingAudioSink(private val usbAudioManager: UsbAudioManager, private val
         val previousDelegate = delegate
         val chosen = resolveForConfigure(params.format)
         if (chosen !== previousDelegate) {
-            // A real route switch: the newly-chosen delegate was never configured for this track
-            // at all (resolveForConfigure only picks it, it doesn't set it up).
+            // A real route switch, triggered mid-pause rather than at a genuine track boundary --
+            // unlike configure()'s own delegate-switch case, nothing upstream (ExoPlayer's own
+            // renderer) has flushed `chosen` first. `chosen` isn't necessarily brand new either:
+            // `fallback` is one single long-lived instance for the sink's whole lifetime, so a
+            // switch back to it can mean re-configuring an instance that already played earlier
+            // in this same session and was simply abandoned (paused, not flushed) when upgrading
+            // to USB. Confirmed, reproduced: configuring it again without flushing first left it
+            // "playing" with zero audio ever reaching AudioFlinger (every output thread sitting in
+            // standby) -- stale internal state from its last use, never cleared. flush() is a
+            // no-op if `chosen` was never configured at all (nothing buffered to discard), so this
+            // is safe to call unconditionally on the switch path.
+            chosen.flush()
             configureAndReport(chosen, params)
         }
         chosen.play()

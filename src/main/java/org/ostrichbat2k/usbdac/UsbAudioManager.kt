@@ -178,6 +178,8 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
     // tracks, see activateDac's tail and [releaseClaim].
     @Volatile private var interfaceClaimed = false
     @Volatile private var pendingRelease: ScheduledFuture<*>? = null
+    // See deactivateDac()'s and awaitAndroidOutputTakeover()'s own comments on this.
+    @Volatile private var lastDeactivatedDevice: UsbDevice? = null
     // How many UsbAudioOutput instances currently consider themselves actively streaming (see
     // notifyStreamingStarted/Stopped) -- i.e. actually depending on the claim right now, not just
     // having asked for it once. [releaseClaim] must never release out from under one of these:
@@ -298,7 +300,16 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
      * a fallback track's `configure()` run.
      */
     private fun awaitAndroidOutputTakeover() {
-        val device = activeSession?.device ?: return
+        // activeSession is already null by the time this runs if the caller got here via
+        // deactivateDac() (e.g. the user just disabled USB DAC output) rather than a per-track
+        // liveness switch -- lastDeactivatedDevice is deactivateDac()'s own record of exactly
+        // which device to wait for in that case. Without this fallback, this function returned
+        // immediately, silently skipping the whole wait -- confirmed, reproduced: switching to
+        // fallback right after disabling the DAC raced Android's own recognition of the
+        // just-released device far more often than the old "only re-resolves at the next track"
+        // path ever did, since that path had arbitrary real wall-clock time to let this settle
+        // naturally and this one doesn't.
+        val device = activeSession?.device ?: lastDeactivatedDevice ?: return
         val deadline = System.currentTimeMillis() + AWAIT_TAKEOVER_TIMEOUT_MS
         while (System.currentTimeMillis() < deadline) {
             val found =
@@ -1186,6 +1197,10 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
         pendingRelease?.cancel(false)
         pendingRelease = null
         interfaceClaimed = false
+        // Captured before clearing activeSession below -- see awaitAndroidOutputTakeover()'s
+        // fallback use of this, needed when this function is the one that triggered the switch
+        // to fallback rather than a per-track liveness check.
+        activeSession?.let { lastDeactivatedDevice = it.device }
         activeSession?.let { UsbAudioController.release(it) }
         activeSession = null
         activeFormat = null

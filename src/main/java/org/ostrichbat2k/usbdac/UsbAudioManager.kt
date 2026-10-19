@@ -333,7 +333,6 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
                     UsbManager.ACTION_USB_DEVICE_DETACHED -> {
                         L.i("USB device detached: ${intentDevice(intent)?.deviceName}")
                         deactivateDac()
-                        _capabilities.value = null
                         refresh()
                     }
                     ACTION_VOLUME_CHANGED -> {
@@ -1153,6 +1152,15 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
         retryActivation()
     }
 
+    /**
+     * Also clears [capabilities], not just [controlState] -- a caller disabling USB DAC output
+     * via [onUsbEnabledChanged] used to call this alone and leave [capabilities] (and therefore
+     * the Capabilities settings screen, and the one-line summary on the main USB screen) showing
+     * the *previous* session's device info indefinitely, since nothing else in the app clears it
+     * once set. Confirmed: the device-detach path already had to work around exactly this by
+     * clearing [capabilities] itself right after calling this function -- that workaround is now
+     * redundant and removed, since every caller gets the correct behavior from here instead.
+     */
     private fun deactivateDac() {
         pendingRelease?.cancel(false)
         pendingRelease = null
@@ -1162,6 +1170,7 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
         activeFormat = null
         activeSink = null
         _controlState.value = null
+        _capabilities.value = null
     }
 
     /**

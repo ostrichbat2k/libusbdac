@@ -71,6 +71,13 @@ class RoutingAudioSink(private val usbAudioManager: UsbAudioManager, private val
     AudioSink {
     private var delegate: AudioSink? = null
     private var pendingListener: AudioSink.Listener? = null
+    /** The most recent real [configure] call's parameters -- see [play]'s doc comment for why. */
+    private data class ConfigureParams(
+        val format: Format,
+        val specifiedBufferSize: Int,
+        val outputChannels: IntArray?,
+    )
+    private var lastConfigureParams: ConfigureParams? = null
     // Whether ExoPlayer currently considers this sink "playing" -- set by play()/pause(), the
     // only two calls it makes to tell us that. Needed because ExoPlayer calls play() once per
     // play *intent*, not again every time configure() causes this class to internally swap which
@@ -209,16 +216,11 @@ class RoutingAudioSink(private val usbAudioManager: UsbAudioManager, private val
 
     @Deprecated("Deprecated in AudioSink interface itself; this is still the signature callers use.")
     override fun configure(inputFormat: Format, specifiedBufferSize: Int, outputChannels: IntArray?) {
+        val params = ConfigureParams(inputFormat, specifiedBufferSize, outputChannels)
+        lastConfigureParams = params
         val previousDelegate = delegate
         val chosen = resolveForConfigure(inputFormat)
-        try {
-            chosen.configure(inputFormat, specifiedBufferSize, outputChannels)
-        } catch (e: Exception) {
-            // Whatever configure() was trying to do (claim the interface, lock the clock) didn't
-            // pan out -- don't leave the Now Playing screen stuck on "Switching" forever.
-            usbAudioManager.reportPlaybackRoute(fallbackRoute())
-            throw e
-        }
+        configureAndReport(chosen, params)
         // ExoPlayer only calls play() on *this* outer sink once per play intent -- it never
         // learns that resolveForConfigure() just switched which delegate we forward to for this
         // new track, so if we're already supposed to be playing, the new delegate needs an
@@ -227,25 +229,64 @@ class RoutingAudioSink(private val usbAudioManager: UsbAudioManager, private val
         if (chosen !== previousDelegate && isPlaying) {
             chosen.play()
         }
-        // Reported fresh on every real configure() call, not just when resolveForConfigure()
-        // decided to switch delegates -- back-to-back tracks on the same (already-settled)
-        // delegate never hit that branch, which would otherwise leave this stuck on whatever was
-        // reported for the *previous* format decision (e.g. still Fallback after a 96kHz track if
-        // the very next track is a 44.1kHz one the device supports fine).
+    }
+
+    /**
+     * Configures [chosen] with [params] and reports the resulting route, throwing (after
+     * reporting a fallback route so the Now Playing screen doesn't stick on "Switching") if
+     * [AudioSink.configure] itself fails. Shared by [configure] and [play] -- see [play]'s doc
+     * comment for why [play] needs this too, not just a one-line forward.
+     */
+    @Suppress("DEPRECATION") // AudioSink.configure() itself, not this function, is what's deprecated.
+    private fun configureAndReport(chosen: AudioSink, params: ConfigureParams) {
+        try {
+            chosen.configure(params.format, params.specifiedBufferSize, params.outputChannels)
+        } catch (e: Exception) {
+            usbAudioManager.reportPlaybackRoute(fallbackRoute())
+            throw e
+        }
+        // Reported fresh on every real configure(), not just when resolveForConfigure() decided
+        // to switch delegates -- back-to-back tracks on the same (already-settled) delegate never
+        // hit that branch, which would otherwise leave this stuck on whatever was reported for
+        // the *previous* format decision (e.g. still Fallback after a 96kHz track if the very
+        // next track is a 44.1kHz one the device supports fine).
         usbAudioManager.reportPlaybackRoute(
             if (chosen === fallback) {
                 fallbackRoute()
             } else {
                 UsbAudioManager.PlaybackRoute.Direct(
-                    bitDepth = bitDepthFor(inputFormat.pcmEncoding),
-                    sampleRateHz = inputFormat.sampleRate,
-                    channels = inputFormat.channelCount)
+                    bitDepth = bitDepthFor(params.format.pcmEncoding),
+                    sampleRateHz = params.format.sampleRate,
+                    channels = params.format.channelCount)
             })
     }
 
+    /**
+     * [configure] only ever runs again on a genuine new track/format -- flipping
+     * "Enable"/"Bit-perfect mode" (or the DAC appearing/disappearing) while paused used to only
+     * take effect on the *next track*, confusingly surviving a pause/resume on the exact same
+     * one. Confirmed, reported: flip the setting mid-track, tap play again, still the old route;
+     * only advancing to the next track (a real [configure] call) ever picked it up. Re-resolving
+     * here, against the last real [configure] call's cached [ConfigureParams], closes that gap
+     * without needing ExoPlayer to call [configure] again on its own.
+     */
     override fun play() {
         isPlaying = true
-        current().play()
+        val params = lastConfigureParams
+        if (params == null) {
+            // Never configured yet (shouldn't happen per ExoPlayer's own contract, but nothing
+            // to re-resolve against either way) -- same as the old unconditional forward.
+            current().play()
+            return
+        }
+        val previousDelegate = delegate
+        val chosen = resolveForConfigure(params.format)
+        if (chosen !== previousDelegate) {
+            // A real route switch: the newly-chosen delegate was never configured for this track
+            // at all (resolveForConfigure only picks it, it doesn't set it up).
+            configureAndReport(chosen, params)
+        }
+        chosen.play()
     }
 
     override fun handleDiscontinuity() = current().handleDiscontinuity()
@@ -301,10 +342,12 @@ class RoutingAudioSink(private val usbAudioManager: UsbAudioManager, private val
         // unplugged since the last track) rather than sticking with whatever was chosen before.
         delegate?.reset()
         delegate = null
+        lastConfigureParams = null
     }
 
     override fun release() {
         isPlaying = false
+        lastConfigureParams = null
         delegate?.release()
         delegate = null
     }

@@ -142,10 +142,23 @@ object UsbAudioDescriptorParser {
                     // (currentInterfaceProtocol == UAC2_PROTOCOL) they're shifted by one slot
                     // (see parseUac2Playback's docs), so this falls through to the raw hex dump
                     // for those -- still enough to see the entity graph, just not named.
+                    //
+                    // That fallthrough must be an explicit protocol check, not just the `else`
+                    // branch below: a UAC2 entity's shifted subtype byte can numerically collide
+                    // with an unrelated UAC3 constant (e.g. a UAC2 unit landing on UAC3's
+                    // AC_SELECTOR_UNIT value), which then misreads that entity's nrInPins-style
+                    // count from the wrong byte offset -- confirmed, reproduced on real hardware
+                    // (FiiO Snowsky Tiny A, UAC2): read a garbage pin count and walked off the
+                    // end of the (correctly-sized) 18-byte descriptor, throwing
+                    // ArrayIndexOutOfBoundsException from this diagnostic-only dump and crashing
+                    // the whole app, since activateDac() runs this on a background Thread with
+                    // no uncaught-exception handler.
                     val subtype = bytes.u8(2)
                     val hex = bytes.joinToString(" ") { "%02x".format(it) }
                     val desc =
-                        when (subtype) {
+                        if (currentInterfaceProtocol != UAC3_PROTOCOL) {
+                            "subtype=0x${"%02x".format(subtype)}"
+                        } else when (subtype) {
                             AC_INPUT_TERMINAL ->
                                 "INPUT_TERMINAL id=${bytes.u8(3)} type=0x${"%04x".format(bytes.u16(4))}"
                             AC_OUTPUT_TERMINAL ->

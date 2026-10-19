@@ -209,6 +209,10 @@ class RoutingAudioSink(private val usbAudioManager: UsbAudioManager, private val
 
     @Deprecated("Deprecated in AudioSink interface itself; this is still the signature callers use.")
     override fun configure(inputFormat: Format, specifiedBufferSize: Int, outputChannels: IntArray?) {
+        // Must run before resolveForConfigure() -- it decides (or clears) this track's hidden
+        // ABX assignment, which createAudioSink() (called from resolveForConfigure() below)
+        // consults in place of the user's own bitPerfectMode toggle while a test is active.
+        usbAudioManager.rollAbxTrial()
         val previousDelegate = delegate
         val chosen = resolveForConfigure(inputFormat)
         try {

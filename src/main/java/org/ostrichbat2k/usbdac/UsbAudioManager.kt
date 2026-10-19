@@ -44,6 +44,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlin.random.Random
 import timber.log.Timber as L
 
 /**
@@ -119,6 +120,117 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
         _playbackRoute.value = route
     }
 
+    private val _abxGroundTruth = MutableStateFlow<Boolean?>(null)
+    /**
+     * Whether the *current* track was secretly routed bit-perfect (`true`) or HAL fallback
+     * (`false`) by [rollAbxTrial], or `null` if [UsbDacPreferences.abxTestMode] is off or no
+     * trial could apply to this track (e.g. the device isn't [isBitPerfectCapable] right now).
+     * Only consulted by [createAudioSink] -- the host app should use [abxPendingGuess] instead,
+     * which is what's actually safe to act on without leaking the current track's route.
+     */
+    val abxGroundTruth: StateFlow<Boolean?> = _abxGroundTruth.asStateFlow()
+
+    private val _abxPendingGuess = MutableStateFlow<Boolean?>(null)
+    /**
+     * The ground truth of the track that *just finished* (whichever one [abxGroundTruth] held
+     * right before [rollAbxTrial] moved on to a new one), still ungraded -- `null` once
+     * [submitAbxGuess] consumes it, or if that track had no trial running to begin with. The host
+     * app should prompt for a guess the moment this goes non-null (i.e. on every track change),
+     * not at some other point mid-track -- the whole point is asking about a track that's already
+     * done playing, never the one that's still live.
+     */
+    val abxPendingGuess: StateFlow<Boolean?> = _abxPendingGuess.asStateFlow()
+
+    data class AbxStats(val correct: Int = 0, val total: Int = 0)
+
+    private val _abxStats = MutableStateFlow(AbxStats())
+    /** Cumulative score across every [submitAbxGuess] call this process lifetime. */
+    val abxStats: StateFlow<AbxStats> = _abxStats.asStateFlow()
+
+    /**
+     * Rerolls this track's hidden ABX coin flip -- called by [RoutingAudioSink] once per real
+     * `configure()` call (i.e. once per track), *before* it resolves which delegate to use, so
+     * each track gets an independent, fresh decision instead of being stuck on whatever the first
+     * track in the session happened to pick (createAudioSink's own [activeSink] caching would
+     * otherwise keep reusing one session-wide choice forever -- see its doc comment).
+     *
+     * Deliberately does not attempt to switch mid-track: this only ever changes what the *next*
+     * `configure()` call sees, same mechanism (and same real-hardware-proven code path) as
+     * ordinary bit-perfect/fallback switching already uses on every track change.
+     */
+    fun rollAbxTrial() {
+        // Whatever the *previous* track's trial was (if any, and if it's not already been
+        // guessed) is about to be overwritten below -- hand it off to abxPendingGuess first so
+        // the host app can still prompt about it, now that this track change means it's actually
+        // over. Unconditional: even a test turned off mid-track should still surface the trial
+        // that was genuinely running for the track that just ended.
+        _abxGroundTruth.value?.let { _abxPendingGuess.value = it }
+
+        if (!usbSettings.abxTestMode) {
+            _abxGroundTruth.value = null
+            return
+        }
+        if (!usbSettings.enabled || !isBitPerfectCapable()) {
+            // Can't offer a real trial if bit-perfect isn't even viable right now -- forcing one
+            // would just break playback instead of testing anything.
+            _abxGroundTruth.value = null
+            return
+        }
+        val useBitPerfect = Random.nextBoolean()
+        _abxGroundTruth.value = useBitPerfect
+        if (useBitPerfect) {
+            syncAbxLoudnessToBitPerfect()
+        } else {
+            // createAudioSink()'s activeSink?.let { return it } check runs before it ever
+            // consults this trial's result -- without clearing it here, a track secretly
+            // assigned to fallback would still get handed back a live, cached bit-perfect sink.
+            activeSink = null
+        }
+    }
+
+    /**
+     * Pushes the DAC's live hardware volume to whatever dB [mediaVolumeCurve] says matches
+     * STREAM_MUSIC's *current* index, right before an ABX trial that's about to go bit-perfect.
+     *
+     * [setVolume]/[onStreamMusicChanged]'s existing mirroring only runs reactively, when the user
+     * explicitly moves a volume control -- during a hands-off ABX run (queue just auto-advancing,
+     * nobody touching a volume key), two bit-perfect trials separated by a fallback trial in
+     * between would otherwise keep whatever hardware dB was last explicitly set, which could be a
+     * genuinely different perceived loudness than STREAM_MUSIC -- the *only* thing actually
+     * controlling loudness during that intervening fallback trial, since the hardware deliberately
+     * sits at forced unity gain the whole time one is live (see [UsbAudioController
+     * .setUnityVolume]). A real loudness mismatch between trials would confound the whole point of
+     * a blind test by giving away which path is live, or worse, making the "wrong" one sound
+     * better for a reason that has nothing to do with bit-perfection.
+     *
+     * Reuses the exact same write path a physical volume key press already takes ([setVolume]),
+     * including its own [mirrorDbToStreamMusic] call back onto STREAM_MUSIC -- a no-op round trip
+     * in this direction, since it's already at the value just read from it here.
+     */
+    private fun syncAbxLoudnessToBitPerfect() {
+        val range = currentVolumeRange() ?: return
+        val (minIndex, maxIndex) = streamMusicIndexRange()
+        if (maxIndex == minIndex) return
+        val currentIndex = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+        val percent = 100f * (currentIndex - minIndex) / (maxIndex - minIndex)
+        val dbValue = (curveDbAtPercent(percent) * 256f).roundToIntSafe(range.first, range.second)
+        setVolume(dbValue)
+    }
+
+    /**
+     * Grades [guessedBitPerfect] against [abxPendingGuess], updates [abxStats], and consumes the
+     * trial (clears [abxPendingGuess] so the host app's prompt goes away until the next track
+     * change surfaces a new one). Returns null if there was nothing pending -- the host app
+     * should not have offered a guess in that case to begin with.
+     */
+    fun submitAbxGuess(guessedBitPerfect: Boolean): Boolean? {
+        val truth = _abxPendingGuess.value ?: return null
+        val correct = truth == guessedBitPerfect
+        _abxStats.value = _abxStats.value.let { it.copy(correct = it.correct + if (correct) 1 else 0, total = it.total + 1) }
+        _abxPendingGuess.value = null
+        return correct
+    }
+
     sealed interface PlaybackRoute {
         /**
          * Playing through Android's normal audio HAL (speaker, or whatever it last routed to --
@@ -157,6 +269,8 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
     // tracks, see activateDac's tail and [releaseClaim].
     @Volatile private var interfaceClaimed = false
     @Volatile private var pendingRelease: ScheduledFuture<*>? = null
+    // See deactivateDac()'s and awaitAndroidOutputTakeover()'s own comments on this.
+    @Volatile private var lastDeactivatedDevice: UsbDevice? = null
     // How many UsbAudioOutput instances currently consider themselves actively streaming (see
     // notifyStreamingStarted/Stopped) -- i.e. actually depending on the claim right now, not just
     // having asked for it once. [releaseClaim] must never release out from under one of these:
@@ -277,7 +391,16 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
      * a fallback track's `configure()` run.
      */
     private fun awaitAndroidOutputTakeover() {
-        val device = activeSession?.device ?: return
+        // activeSession is already null by the time this runs if the caller got here via
+        // deactivateDac() (e.g. the user just disabled USB DAC output) rather than a per-track
+        // liveness switch -- lastDeactivatedDevice is deactivateDac()'s own record of exactly
+        // which device to wait for in that case. Without this fallback, this function returned
+        // immediately, silently skipping the whole wait -- confirmed, reproduced: switching to
+        // fallback right after disabling the DAC raced Android's own recognition of the
+        // just-released device far more often than the old "only re-resolves at the next track"
+        // path ever did, since that path had arbitrary real wall-clock time to let this settle
+        // naturally and this one doesn't.
+        val device = activeSession?.device ?: lastDeactivatedDevice ?: return
         val deadline = System.currentTimeMillis() + AWAIT_TAKEOVER_TIMEOUT_MS
         while (System.currentTimeMillis() < deadline) {
             val found =
@@ -310,6 +433,60 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
     // on a cold app launch calling configure() before a freshly-granted permission's activateDac()
     // thread had finished.
     @Volatile private var activationSettled: CompletableDeferred<Unit>? = null
+
+    private val _isActivating = MutableStateFlow(false)
+    private val _blockPlayback = MutableStateFlow(false)
+    /**
+     * True whenever a host UI's play control should hold off starting playback rather than let
+     * it land on [PlaybackRoute.Fallback] purely because [activateDac] hasn't finished yet --
+     * specifically: [UsbDacPreferences.enabled] and [UsbDacPreferences.bitPerfectMode] are both
+     * on (the exact condition [createAudioSink] itself gates on) *and* an activation triggered
+     * by [refresh]/[retryActivation] is currently in flight. False the rest of the time,
+     * including whenever there's no DAC in the picture at all, so a host UI binding its play
+     * button to this costs nothing outside the one real race window.
+     *
+     * This exists because [awaitActivation]'s fixed timeout is a guess against real, variable
+     * hardware-activation latency -- confirmed, reproduced on real hardware: a measured
+     * attach-to-"DAC session ready" activation took 5.24s end to end, close enough to the (then
+     * 4000ms, since bumped to 8000ms) bound that a restore landing unluckily close to
+     * activation's start could still time out early and legitimately fall back for just the
+     * first track. A host UI that disables its own play control on this instead -- actually
+     * waiting for activation rather than racing a number -- doesn't have that failure mode at
+     * all, at the cost of the user seeing the control briefly disabled instead of silent fallback.
+     */
+    val blockPlayback: StateFlow<Boolean> = _blockPlayback.asStateFlow()
+
+    /** Recomputes [blockPlayback] from current settings and activation state. */
+    private fun updateBlockPlayback() {
+        _blockPlayback.value = usbSettings.enabled && usbSettings.bitPerfectMode && _isActivating.value
+    }
+
+    /**
+     * Runs [activateDac] on a dedicated background daemon thread, tracking both
+     * [activationSettled] (an awaitable deferred, see [awaitActivation]) and [blockPlayback]'s
+     * underlying activation flag around it -- the single place both [refresh] and
+     * [retryActivation] dispatch activation from, so neither signal can drift out of sync with
+     * whether a background activation is actually running.
+     */
+    private fun runActivation(device: UsbDevice) {
+        val deferred = CompletableDeferred<Unit>()
+        activationSettled = deferred
+        _isActivating.value = true
+        updateBlockPlayback()
+        Thread {
+                try {
+                    activateDac(device)
+                } finally {
+                    _isActivating.value = false
+                    updateBlockPlayback()
+                    deferred.complete(Unit)
+                }
+            }
+            .apply {
+                isDaemon = true
+                start()
+            }
+    }
     // Only reflects SUPPORTED_SAMPLE_RATE_HZ (UAC 2.0/3.0) or whatever activateDac negotiated for
     // UAC 1.0 until the first track actually plays -- after that, ensureFormatActive keeps this
     // in sync with whatever rate each track genuinely streams at, since different tracks can (and
@@ -321,6 +498,14 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
     private var started = false
     private var knownDeviceNames = emptySet<String>()
     private var knownPermissions = emptyMap<String, Boolean>()
+    // Device names (keyed like knownPermissions, not knownDeviceNames' display names) we've
+    // already called requestPermission() for during their current attachment -- so a user's
+    // explicit denial doesn't turn into a repeated dialog-spam loop every time the resulting
+    // ACTION_USB_PERMISSION broadcast re-triggers refresh() (see onReceive/actionUsbPermission).
+    // Pruned down to currently-attached devices on every refresh(), so a physical detach/replug
+    // (confirmed, reproduced: doesn't always carry the permission grant over) gets a fresh
+    // automatic attempt, same as a genuinely new device.
+    private var permissionRequestedFor = emptySet<String>()
 
     private val receiver =
         object : BroadcastReceiver() {
@@ -333,7 +518,6 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
                     UsbManager.ACTION_USB_DEVICE_DETACHED -> {
                         L.i("USB device detached: ${intentDevice(intent)?.deviceName}")
                         deactivateDac()
-                        _capabilities.value = null
                         refresh()
                     }
                     ACTION_VOLUME_CHANGED -> {
@@ -421,26 +605,25 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
         // (null device, granted=false) on at least one real device/OS build even when the
         // permission was in fact granted a moment later.
         for (audioDevice in found) {
-            val wasPermitted = knownPermissions[audioDevice.device.deviceName] ?: false
+            val name = audioDevice.device.deviceName
+            val wasPermitted = knownPermissions[name] ?: false
             if (usbSettings.enabled && audioDevice.hasPermission && !wasPermitted) {
                 L.i("Permission newly granted for ${audioDevice.displayName}, activating DAC session")
                 // Session activation blocks on several control transfers; keep it off whatever
                 // thread refresh() was called on (the broadcast receiver's, normally main).
-                val deferred = CompletableDeferred<Unit>()
-                activationSettled = deferred
-                Thread {
-                        try {
-                            activateDac(audioDevice.device)
-                        } finally {
-                            deferred.complete(Unit)
-                        }
-                    }
-                    .apply {
-                        isDaemon = true
-                        start()
-                    }
+                runActivation(audioDevice.device)
+            } else if (usbSettings.enabled && !audioDevice.hasPermission && name !in permissionRequestedFor) {
+                // Auto-request instead of waiting for the user to manually tap "Retry
+                // activation" (retryActivation()) -- the common real-world trigger is a replug
+                // that didn't carry the grant over, not a first-ever attach. permissionRequestedFor
+                // guards against re-asking every time the (denied) result broadcast loops back
+                // into another refresh() call below.
+                L.i("Permission not granted for ${audioDevice.displayName}, requesting automatically")
+                permissionRequestedFor = permissionRequestedFor + name
+                requestPermission(audioDevice.device)
             }
         }
+        permissionRequestedFor = permissionRequestedFor intersect found.map { it.device.deviceName }.toSet()
         knownPermissions = found.associate { it.device.deviceName to it.hasPermission }
 
         L.d("USB audio devices: ${found.map { it.displayName to it.hasPermission }}")
@@ -479,8 +662,17 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
      * (e.g. [ExoPlaybackStateHolder][org.oxycblt.auxio.playback.service.ExoPlaybackStateHolder]'s
      * cold-launch restore path awaits once up front rather than letting the first per-track
      * [createAudioSink] call absorb the wait on its own).
+     *
+     * [timeoutMs] default was 4000, bumped to 8000: a real measured attach-to-"DAC session
+     * ready" activation on real hardware (FiiO Snowsky Tiny A) took 5.24s end to end (permission
+     * grant -> topology parse -> clock set -> settle). 4000ms was tighter than that, so a
+     * cold-launch restore landing close to activation's start could time out ~1s early and
+     * legitimately fall back to HAL for just the first track, self-correcting on the very next
+     * one once [activeSink] was populated -- confirmed, reproduced via real-hardware logcat
+     * timing. Not a correctness bug (it always recovers), but a user-visible first-track
+     * inconsistency; 8000ms gives real margin over the measured worst case.
      */
-    suspend fun awaitActivation(timeoutMs: Long = 4000L) {
+    suspend fun awaitActivation(timeoutMs: Long = 8000L) {
         val deferred = activationSettled ?: return
         withTimeoutOrNull(timeoutMs) { deferred.await() }
     }
@@ -511,7 +703,11 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
     fun createAudioSink(): AudioSink? {
         activeSink?.let { return it }
         runBlocking { awaitActivation() }
-        if (!usbSettings.bitPerfectMode || !isBitPerfectCapable()) return null
+        // While an ABX test is running, rollAbxTrial() -- called by RoutingAudioSink right
+        // before this -- already decided this track's route; substitute that for the user's own
+        // bitPerfectMode toggle so the test actually controls what plays, not just what's shown.
+        val bitPerfectWanted = if (usbSettings.abxTestMode) _abxGroundTruth.value == true else usbSettings.bitPerfectMode
+        if (!bitPerfectWanted || !isBitPerfectCapable()) return null
         val session = activeSession ?: return null
         return DefaultAudioSink.Builder(context)
             .setAudioOutputProvider(UsbAudioOutputProvider(this, session, usbSettings))
@@ -844,8 +1040,9 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
         // before marking the session ready. Do NOT call reassertKernelEviction after
         // selectFormat -- see the comment above that call for why.
         //
-        // Deliberately NOT running IsoToneTest here anymore: it was a useful one-off diagnostic
-        // (a blocking 3-second tone test) while chasing the intermittent-silence investigation,
+        // Deliberately not blocking on a diagnostic sine-tone playback test here anymore (that
+        // tool, IsoToneTest, has since been removed entirely): it was useful once while chasing
+        // the intermittent-silence investigation,
         // but running it on every single activation pushed "DAC session ready" out by 3+ seconds
         // -- which, in real playback, is 3+ seconds RoutingAudioSink's configure() could get
         // called first and commit to the fallback (AudioTrack/speaker) sink before this ever
@@ -1152,15 +1349,29 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
         retryActivation()
     }
 
+    /**
+     * Also clears [capabilities], not just [controlState] -- a caller disabling USB DAC output
+     * via [onUsbEnabledChanged] used to call this alone and leave [capabilities] (and therefore
+     * the Capabilities settings screen, and the one-line summary on the main USB screen) showing
+     * the *previous* session's device info indefinitely, since nothing else in the app clears it
+     * once set. Confirmed: the device-detach path already had to work around exactly this by
+     * clearing [capabilities] itself right after calling this function -- that workaround is now
+     * redundant and removed, since every caller gets the correct behavior from here instead.
+     */
     private fun deactivateDac() {
         pendingRelease?.cancel(false)
         pendingRelease = null
         interfaceClaimed = false
+        // Captured before clearing activeSession below -- see awaitAndroidOutputTakeover()'s
+        // fallback use of this, needed when this function is the one that triggered the switch
+        // to fallback rather than a per-track liveness check.
+        activeSession?.let { lastDeactivatedDevice = it.device }
         activeSession?.let { UsbAudioController.release(it) }
         activeSession = null
         activeFormat = null
         activeSink = null
         _controlState.value = null
+        _capabilities.value = null
     }
 
     /**
@@ -1189,11 +1400,7 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
         }
         L.i("retryActivation: re-activating DAC session for ${device.displayName}")
         deactivateDac()
-        Thread { activateDac(device.device) }
-            .apply {
-                isDaemon = true
-                start()
-            }
+        runActivation(device.device)
     }
 
     /**
@@ -1203,6 +1410,7 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
      * session immediately.
      */
     override fun onUsbEnabledChanged() {
+        updateBlockPlayback()
         if (usbSettings.enabled) {
             L.i("USB DAC output enabled by user, attempting activation")
             retryActivation()
@@ -1210,6 +1418,11 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
             L.i("USB DAC output disabled by user, releasing any active session")
             deactivateDac()
         }
+    }
+
+    /** [UsbDacPreferences.Listener] callback: see [blockPlayback]'s doc comment. */
+    override fun onBitPerfectModeChanged() {
+        updateBlockPlayback()
     }
 
     private companion object {

@@ -53,12 +53,10 @@ class IsoPacketScheduler(sampleRateHz: Int, private val packetsPerSecond: Int = 
 }
 
 /**
- * Pacing parameters derived from a device's negotiated USB speed -- shared by every isochronous
- * streaming loop in this library (both [UsbAudioOutput]'s real playback path and
- * [IsoToneTest]'s diagnostic one share the native iso-streaming plumbing, and used to each
- * independently re-derive this same math) so the high-speed-vs-full-speed distinction can't
- * drift out of sync between them. See [UsbNative.getUsbSpeed]'s doc comment for why 125us
- * microframes vs. 1ms frames matters here, not just cosmetically.
+ * Pacing parameters derived from a device's negotiated USB speed -- used by [UsbAudioOutput]'s
+ * real playback path so the high-speed-vs-full-speed distinction can't drift out of sync between
+ * callers that need it. See [UsbNative.getUsbSpeed]'s doc comment for why 125us microframes vs.
+ * 1ms frames matters here, not just cosmetically.
  */
 data class IsoPacing(val packetsPerSecond: Int, val packetDurationNs: Long, val packetsPerUrb: Int) {
     companion object {

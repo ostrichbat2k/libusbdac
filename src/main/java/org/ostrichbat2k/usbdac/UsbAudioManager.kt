@@ -844,8 +844,9 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
         // before marking the session ready. Do NOT call reassertKernelEviction after
         // selectFormat -- see the comment above that call for why.
         //
-        // Deliberately NOT running IsoToneTest here anymore: it was a useful one-off diagnostic
-        // (a blocking 3-second tone test) while chasing the intermittent-silence investigation,
+        // Deliberately not blocking on a diagnostic sine-tone playback test here anymore (that
+        // tool, IsoToneTest, has since been removed entirely): it was useful once while chasing
+        // the intermittent-silence investigation,
         // but running it on every single activation pushed "DAC session ready" out by 3+ seconds
         // -- which, in real playback, is 3+ seconds RoutingAudioSink's configure() could get
         // called first and commit to the fallback (AudioTrack/speaker) sink before this ever

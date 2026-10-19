@@ -78,16 +78,6 @@ object UsbAudioInspector {
                     UsbAudioController.setVolume(session, value = 0, channel = channel)
                 }
             }
-
-            // Prefer the 16-bit format: at 48kHz its packet size (192B) matches what the tone
-            // test computes from samples/ms directly, same as 24-bit's 288B -- either works, 16
-            // is just less data to push while proving the pipeline out.
-            val selected = found.formats.minByOrNull { it.bitResolution }
-            if (selected != null && setClock && UsbAudioController.selectFormat(session, selected)) {
-                IsoToneTest.play(session, selected, sampleRateHz, durationMs = 3000, channels = found.channelCount.coerceAtLeast(2))
-            } else {
-                L.w("Skipping tone test: clock/format setup did not succeed")
-            }
         } finally {
             UsbAudioController.release(session)
         }

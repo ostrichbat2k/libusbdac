@@ -102,27 +102,6 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
     /** Everything found on the attached device's descriptors -- see [UsbDeviceCapabilities]. */
     val capabilities: StateFlow<UsbDeviceCapabilities?> = _capabilities.asStateFlow()
 
-    private val _routingInvalidated = MutableStateFlow(0)
-    /**
-     * Bumped whenever [UsbDacPreferences.enabled] or [UsbDacPreferences.bitPerfectMode] changes
-     * -- a signal that [RoutingAudioSink]'s USB-vs-fallback decision for the *currently playing*
-     * track may now be stale, for a host app to act on (e.g. by forcing its audio renderer
-     * through a disable/enable cycle so the track picks up the new routing immediately, instead
-     * of only on the next real track change). A plain counter rather than a one-shot event type:
-     * this library has no dependency on any particular event-wrapper class, and a collector only
-     * needs to react to the value *changing*, not consume it exactly once.
-     *
-     * [RoutingAudioSink] itself deliberately does **not** try to react to a mid-track settings
-     * change on its own -- see its own history of two reverted attempts at exactly that (one
-     * left tracks "playing" with no audio reaching the device at all, the other caused a
-     * stutter/retry loop). The actual fix needs the full, officially-documented Media3 lifecycle
-     * reset (`BaseRenderer.enable()` -> `onPositionReset()`) that only a real renderer
-     * disable/enable cycle gets for free -- this library has no [androidx.media3.exoplayer.ExoPlayer]
-     * reference to trigger that itself, so it can only publish the signal and leave the actual
-     * nudge to whichever host app does hold one.
-     */
-    val routingInvalidated: StateFlow<Int> = _routingInvalidated.asStateFlow()
-
     private val _playbackRoute =
         MutableStateFlow<PlaybackRoute>(PlaybackRoute.Fallback(bitDepth = null, sampleRateHz = 0, channels = 0))
     /**
@@ -1249,7 +1228,6 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
      * session immediately.
      */
     override fun onUsbEnabledChanged() {
-        _routingInvalidated.value++
         if (usbSettings.enabled) {
             L.i("USB DAC output enabled by user, attempting activation")
             retryActivation()
@@ -1257,11 +1235,6 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
             L.i("USB DAC output disabled by user, releasing any active session")
             deactivateDac()
         }
-    }
-
-    /** [UsbDacPreferences.Listener] callback: see [routingInvalidated]'s doc comment. */
-    override fun onBitPerfectModeChanged() {
-        _routingInvalidated.value++
     }
 
     private companion object {

@@ -142,6 +142,10 @@ class UsbAudioOutput(
     // mute state can't be assumed to have survived however long Android (or another app) had the
     // device in the meantime.
     @Volatile private var activated = false
+    // True once this exact instance has completed the full clock/mute/volume relock sequence
+    // below at least once -- see activateAndStream()'s ALREADY_CLAIMED branch for why this, not
+    // just the claim outcome alone, has to gate the fast path.
+    @Volatile private var hasConfiguredHardware = false
 
     init {
         if (!activateAndStream()) {
@@ -155,13 +159,28 @@ class UsbAudioOutput(
      * [init]), and again from [play] whenever [pause] has stopped the stream in the meantime.
      *
      * Only actually renegotiates the clock/mute/volume when [UsbAudioManager.requestClaim] reports
-     * a genuine [UsbAudioManager.ClaimOutcome.RECLAIMED] -- i.e. the interface was truly handed
-     * back to the kernel (or another app) at some point and could have been touched -- rather than
-     * [UsbAudioManager.ClaimOutcome.ALREADY_CLAIMED], where nothing else could have changed
-     * anything since this same instance last confirmed it. [pause] always stops the stream, but
-     * doesn't necessarily let the *claim* lapse -- see [UsbAudioManager.releaseClaim]'s own grace
-     * period -- so a quick pause/resume within that window hits the cheap path, and only a resume
-     * after a genuine release pays the full relock cost.
+     * [UsbAudioManager.ClaimOutcome.ALREADY_CLAIMED] *and* [hasConfiguredHardware] is already true
+     * -- i.e. this exact instance itself previously completed a real relock, and the interface
+     * claim never lapsed since (see [UsbAudioManager.releaseClaim]'s grace period) -- rather than
+     * [UsbAudioManager.ClaimOutcome.RECLAIMED], which means a genuine hand-off happened and
+     * anything could have changed.
+     *
+     * [hasConfiguredHardware] matters separately from the claim outcome: a brand-new instance
+     * (a different target format/sample rate, constructed by
+     * [UsbAudioOutputProvider.getAudioOutput] for the next track) sees ALREADY_CLAIMED on its
+     * very first activation too, simply because that same provider's own preparatory
+     * [UsbAudioManager.ensureFormatActive] call already (re)claimed the interface moments earlier
+     * in the same call chain -- not because *this* instance ever configured anything. Gating the
+     * fast path on the claim outcome alone was confirmed, reproduced, to silently skip the actual
+     * clock-frequency SET_CUR on every single per-track rate change once the interface claim
+     * stopped lapsing between tracks (i.e. ordinary back-to-back playback): the DAC stayed
+     * pinned at whichever rate was last genuinely set, permanently, while [sampleRateHz] and
+     * [UsbAudioManager]'s own bookkeeping (`activeRateHz`) kept claiming the new rate was active
+     * -- heard as pitched/sped-up playback the moment a track's real rate actually differed from
+     * that stuck one, with zero errors anywhere. [pause] always stops the stream, but doesn't
+     * necessarily let the *claim* lapse -- so a quick pause/resume of *this* instance within that
+     * grace window correctly hits the cheap path, and only a resume after a genuine release, or a
+     * fresh instance's first-ever activation, pays the full relock cost.
      *
      * Returns false on failure instead of throwing, unlike the exception [init] turns a false
      * return into -- a failure here while resuming from [pause] shouldn't crash playback, it
@@ -188,7 +207,7 @@ class UsbAudioOutput(
             return false
         }
 
-        if (claim == UsbAudioManager.ClaimOutcome.ALREADY_CLAIMED) {
+        if (claim == UsbAudioManager.ClaimOutcome.ALREADY_CLAIMED && hasConfiguredHardware) {
             // Nothing else could have touched the device since this same instance last set it up
             // -- requestClaim() never actually let go of the interface (the release grace period
             // canceled before it ever fired), so the clock lock, mute state, and volume are
@@ -200,6 +219,11 @@ class UsbAudioOutput(
             // grace period was supposed to be sparing callers from in the first place, but never
             // actually did (the grace period only ever saved the cheap ensureFormatActive()
             // alt-setting reselect, not any of this).
+            //
+            // The hasConfiguredHardware check is load-bearing, not redundant -- see this
+            // function's own doc comment for the real bug it closes (a brand-new instance for a
+            // new track also sees ALREADY_CLAIMED, every time, because of its own provider's
+            // preparatory ensureFormatActive() call).
             startStreamingThread()
             activated = true
             usbAudioManager.notifyStreamingStarted()
@@ -322,6 +346,7 @@ class UsbAudioOutput(
 
         startStreamingThread()
         activated = true
+        hasConfiguredHardware = true
         // Tells UsbAudioManager's Settings-screen mutators (setMuted/setVolume/setMixerGain)
         // not to release the claim out from under this still-running stream just because their
         // own one-off control write finished -- see notifyStreamingStarted's doc comment.

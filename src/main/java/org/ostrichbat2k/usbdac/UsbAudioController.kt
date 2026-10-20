@@ -358,10 +358,17 @@ object UsbAudioController {
     }
 
     fun release(session: UsbAudioSession) {
-        session.connection.releaseInterface(session.controlInterface)
+        // Streaming before control, same reasoning (and same kernel source) as releaseToKernel's
+        // own doc comment -- releasing control first permanently skips creating this device's
+        // playback substream for its entire remaining lifetime, confirmed, reproduced: disabling
+        // USB DAC output mid-track left every fallback track, and even a later re-enable, hitting
+        // "pcm device cannot support given format. Supported config are:[]" in an endless retry
+        // loop until the device was unplugged. This function used to release control first; that
+        // was the bug.
         for (iface in session.streamingAltSettings.values) {
             session.connection.releaseInterface(iface)
         }
+        session.connection.releaseInterface(session.controlInterface)
         session.connection.close()
     }
 

@@ -1549,12 +1549,26 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
     private fun deactivateDac() {
         pendingRelease?.cancel(false)
         pendingRelease = null
+        val session = activeSession
+        if (session != null && interfaceClaimed) {
+            // Mirrors doReleaseClaim's own unmute-before-release bracket (see its doc comment on
+            // why this has to happen before the interface is released, not after) -- without it,
+            // disabling USB DAC output while still claimed (e.g. mid-track, not between tracks
+            // where doReleaseClaim already did this) leaves the device's hardware Feature Unit at
+            // whatever gain/mute bit-perfect mode last set it to. Android's own STREAM_MUSIC
+            // volume has no visibility into or control over that -- confirmed, reproduced: every
+            // fallback track afterward showed the correct route, correct Android-side volume, and
+            // played silently, until the device was unplugged or USB DAC output was re-enabled.
+            UsbAudioController.setMute(session, muted = true)
+            UsbAudioController.setUnityVolume(session, session.topology.channelCount)
+            UsbAudioController.setMute(session, muted = false)
+        }
         interfaceClaimed = false
         // Captured before clearing activeSession below -- see awaitAndroidOutputTakeover()'s
         // fallback use of this, needed when this function is the one that triggered the switch
         // to fallback rather than a per-track liveness check.
-        activeSession?.let { lastDeactivatedDevice = it.device }
-        activeSession?.let { UsbAudioController.release(it) }
+        lastDeactivatedDevice = session?.device
+        session?.let { UsbAudioController.release(it) }
         activeSession = null
         activeFormat = null
         activeSink = null

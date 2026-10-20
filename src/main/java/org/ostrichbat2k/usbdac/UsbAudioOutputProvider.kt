@@ -211,6 +211,18 @@ class UsbAudioOutputProvider(
             "UsbAudioOutputProvider: activating ${target.bitResolution}-bit/alt=${target.alternateSetting} " +
                 "at ${config.sampleRate}Hz for upcoming track")
         usbAudioManager.ensureFormatActive(target, config.sampleRate)
+        // ensureFormatActive() just claimed the interface (if it wasn't already) purely to select
+        // the alt-setting and refresh the control-state UI reads (volume range, bit-perfect
+        // capability) -- getAudioOutput() itself is called whenever DefaultAudioSink decides it
+        // needs a new AudioOutput, which includes merely preparing a track (e.g. opening the Now
+        // Playing screen), well before play() is ever pressed. The UsbAudioOutput constructed
+        // below no longer claims or streams anything on its own (see where its init{} used to be)
+        // -- so without this, that claim here would be the only thing left locking the DAC's
+        // interface away from Android's kernel driver for however long nothing plays. Letting it
+        // go after the normal grace period costs nothing if play() does follow shortly after:
+        // UsbAudioOutput.activateAndStream()'s own requestClaim() call cancels this pending
+        // release and does the real relock at that point either way.
+        usbAudioManager.releaseClaim()
         // Reads usbSettings.volumeDb fresh on every call rather than once at construction time --
         // this provider (and the DefaultAudioSink built from it) is cached and reused for an
         // entire DAC session (see UsbAudioManager.activeSink), while getAudioOutput() itself gets

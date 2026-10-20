@@ -22,7 +22,6 @@ import android.media.AudioDeviceInfo
 import androidx.media3.common.C
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.exoplayer.audio.AudioOutput
-import androidx.media3.exoplayer.audio.AudioOutputProvider
 import java.nio.ByteBuffer
 import timber.log.Timber as L
 
@@ -30,9 +29,11 @@ import timber.log.Timber as L
  * An [AudioOutput] that streams PCM directly to a UAC1/2/3 device's isochronous OUT endpoint via
  * raw USBDEVFS URBs (see [UsbNative]), bypassing AudioTrack and Android's mixer entirely.
  *
- * One instance is constructed per sample rate (see [UsbAudioOutputProvider.getAudioOutput]) --
- * all the one-time-per-rate setup (clock negotiation, power domain wake, mute/volume, settle
- * delay) happens in the constructor, mirroring [AudioOutput.canReuseAudioOutput]'s default
+ * One instance is constructed per sample rate (see [UsbAudioOutputProvider.getAudioOutput]), but
+ * the one-time-per-rate setup (claiming the interface, clock negotiation, power domain wake,
+ * mute/volume, settle delay) is deliberately NOT done in the constructor -- see [activateAndStream]
+ * and [play]'s doc comments for why it waits for a real [play] call instead. Everything else about
+ * this class (one instance per rate) still mirrors [AudioOutput.canReuseAudioOutput]'s default
  * "different config means a new instance" contract.
  *
  * This used to be a full, hand-rolled [androidx.media3.exoplayer.audio.AudioSink]
@@ -127,14 +128,16 @@ class UsbAudioOutput(
     //
     // Starts true, not false: a real AudioTrack stays silent until an explicit play() call even
     // if data's already been written to it, and this must match that, because DefaultAudioSink
-    // itself doesn't guarantee play() arrives before this class is even constructed. Confirmed,
+    // itself doesn't guarantee play() arrives before this class is even constructed -- confirmed,
     // reproduced: restoring saved playback state with playWhenReady left false (app relaunched,
     // auto-resume off) still has ExoPlayer decode and write real audio ahead into [ringBuffer] to
-    // pre-buffer for whenever play() eventually comes -- with this defaulting to false, the
-    // streaming thread (which starts immediately in init{}, before any play()/pause() call could
-    // possibly have happened yet) played that real buffered audio out audibly despite the player
-    // correctly considering itself paused the whole time. The Now Playing UI was actually correct
-    // (frozen, showing paused) -- the DAC was what was wrong, playing anyway.
+    // pre-buffer for whenever play() eventually comes. [activateAndStream] no longer runs at
+    // construction at all (see [play]'s doc comment), so the native streaming thread that would
+    // actually drain [ringBuffer] doesn't exist yet either in that scenario -- but this still has
+    // to start true rather than assuming that's protection enough on its own: the first genuine
+    // [play] call sets this false *before* calling [activateAndStream], specifically so whatever
+    // got pre-buffered is audible the moment the stream actually starts, not silenced one extra
+    // cycle behind it.
     @Volatile private var paused = true
     // Whether this instance currently holds the USB claim and has a live native stream running.
     // False right after pause() hands the interface back to Android (see pause()'s doc comment);
@@ -147,16 +150,34 @@ class UsbAudioOutput(
     // just the claim outcome alone, has to gate the fast path.
     @Volatile private var hasConfiguredHardware = false
 
-    init {
-        if (!activateAndStream()) {
-            throw AudioOutputProvider.InitializationException()
-        }
-    }
+    // Deliberately no init{} block here anymore. This used to call activateAndStream()
+    // unconditionally at construction -- claiming the raw USB interface and starting the native
+    // streaming thread the moment this instance existed, regardless of whether play() had ever
+    // been called. UsbAudioOutputProvider.getAudioOutput() (and therefore this constructor) runs
+    // whenever DefaultAudioSink decides it needs a new AudioOutput, which includes merely
+    // preparing a track -- e.g. opening the Now Playing screen alone was enough to trigger it.
+    // paused defaulting to true (see its own doc comment) already stopped that from producing
+    // audible garbage, but it still locked the DAC's interface away from Android's kernel driver
+    // -- and therefore every other app -- for as long as nothing happened to call pause(), which
+    // a bare prepare()-without-play() never does. Confirmed, reproduced: visiting Now Playing was
+    // enough to hold the device hostage until a real play()-then-pause() cycle ran pause()'s
+    // releaseClaim() -- play() alone never did, since [activated] was already true from this very
+    // init block by the time play() ran, so its own `if (!activated)` guard never fired.
+    //
+    // activated starts false (its declared default) and nothing here changes that anymore, so a
+    // brand-new instance is now in exactly the state [pause] already leaves a resumed one in --
+    // [play]'s existing `if (!activated) { activateAndStream() }` branch is what actually claims
+    // and streams anything, the first time it's genuinely called, not construction. A
+    // construction-time activation failure used to surface here as a thrown
+    // AudioOutputProvider.InitializationException; now a first-play activation failure surfaces
+    // the same graceful way a post-pause resume failure already did -- play() logs a warning and
+    // leaves [isStalled] to notice, which DefaultAudioSink's own stall recovery already handles.
 
     /**
      * Claims the interface and starts the native streaming thread -- everything needed to go from
-     * "not currently using the DAC" to "audibly streaming to it". Run once at construction (see
-     * [init]), and again from [play] whenever [pause] has stopped the stream in the meantime.
+     * "not currently using the DAC" to "audibly streaming to it". Run from [play] the first time
+     * it's genuinely called on a fresh instance, and again every time [pause] has stopped the
+     * stream in the meantime.
      *
      * Only actually renegotiates the clock/mute/volume when [UsbAudioManager.requestClaim] reports
      * [UsbAudioManager.ClaimOutcome.ALREADY_CLAIMED] *and* [hasConfiguredHardware] is already true
@@ -182,11 +203,11 @@ class UsbAudioOutput(
      * grace window correctly hits the cheap path, and only a resume after a genuine release, or a
      * fresh instance's first-ever activation, pays the full relock cost.
      *
-     * Returns false on failure instead of throwing, unlike the exception [init] turns a false
-     * return into -- a failure here while resuming from [pause] shouldn't crash playback, it
-     * should just leave this instance non-functional; [isStalled] has a dedicated check for
-     * exactly that so [androidx.media3.exoplayer.audio.DefaultAudioSink]'s own stall-recovery
-     * eventually notices and flushes, same as any other genuine stall.
+     * Returns false on failure instead of throwing -- a failure here, whether on the very first
+     * genuine [play] call or a later resume from [pause], shouldn't crash playback, it should
+     * just leave this instance non-functional; [isStalled] has a dedicated check for exactly that
+     * so [androidx.media3.exoplayer.audio.DefaultAudioSink]'s own stall-recovery eventually
+     * notices and flushes, same as any other genuine stall.
      */
     private fun activateAndStream(): Boolean {
         val claim = usbAudioManager.requestClaim()
@@ -358,10 +379,11 @@ class UsbAudioOutput(
         L.i("UsbAudioOutput: play()")
         paused = false
         if (!activated) {
-            // pause() released the claim (or activateAndStream() failed outright last time) --
-            // redo the whole clock/mute dance from scratch rather than just restarting the
-            // thread, since the hardware clock/mute state can't be assumed to have survived
-            // however long we didn't hold the interface.
+            // Either this is a fresh instance's very first play() (activated starts false --
+            // see the comment where init{} used to be), or pause() released the claim (or
+            // activateAndStream() failed outright last time) -- either way redo the whole
+            // clock/mute dance from scratch rather than just starting the thread, since the
+            // hardware clock/mute state can't be assumed to be already correct.
             if (!activateAndStream()) {
                 L.w("UsbAudioOutput: failed to resume streaming -- isStalled() will reflect this")
             }
@@ -646,6 +668,21 @@ class UsbAudioOutput(
                             if (!paused) {
                                 framesOutput += total / frameBytes
                             }
+                            // ~20 URBs at this class's ~8ms-of-real-audio-per-URB pacing (see
+                            // BASE_PACKETS_PER_URB) is roughly a 160ms cadence -- frequent enough
+                            // for a live pipeline visualizer to feel real-time without pushing a
+                            // new StateFlow value (and the GC churn that implies) on every single
+                            // URB, which happens ~125 times/sec.
+                            if (submitted % 20 == 0) {
+                                usbAudioManager.reportPipelineStats(
+                                    UsbPipelineStats(
+                                        atMs = System.currentTimeMillis(),
+                                        urbsSubmitted = submitted.toLong(),
+                                        reapErrors = reapErrors,
+                                        underrunCount = underrunCount,
+                                        bufferedBytes = ringBuffer.availableToRead(),
+                                        bufferCapacityBytes = ringBuffer.availableToRead() + ringBuffer.availableToWrite()))
+                            }
                             if (submitted % 500 == 0) {
                                 val realElapsedMs = (System.nanoTime() - streamStartNs) / 1_000_000L
                                 val pacedMs = urbsPaced * urbRealTimeNs / 1_000_000L
@@ -677,5 +714,9 @@ class UsbAudioOutput(
             UsbNative.closeIsoStream(isoHandle)
             isoHandle = 0L
         }
+        // Stream genuinely stopped (not a transient pause-silence gap, which doesn't call this at
+        // all) -- clear rather than leave the pipeline visualizer showing numbers frozen from a
+        // track that isn't playing anymore.
+        usbAudioManager.reportPipelineStats(null)
     }
 }

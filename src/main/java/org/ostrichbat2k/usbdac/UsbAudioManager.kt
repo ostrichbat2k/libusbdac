@@ -100,6 +100,15 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
         _diagnosticLog.value = (listOf("$stamp  $message") + _diagnosticLog.value).take(LOG_CAPACITY)
     }
 
+    private val _pipelineStats = MutableStateFlow<UsbPipelineStats?>(null)
+    /**
+     * Live ring-buffer/USB-transfer stats for the "Pipeline" diagnostic screen -- see
+     * [UsbPipelineStats] and [reportPipelineStats]. Null whenever nothing is actually streaming
+     * right now, not just a transient pause-silence gap, so that screen can show "idle" instead
+     * of numbers frozen from a track that already stopped.
+     */
+    val pipelineStats: StateFlow<UsbPipelineStats?> = _pipelineStats.asStateFlow()
+
     private val _controlState = MutableStateFlow<UsbControlState?>(null)
     /** Live, read-back-from-the-device state of the active session's adjustable controls. */
     val controlState: StateFlow<UsbControlState?> = _controlState.asStateFlow()
@@ -297,6 +306,15 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
     /** The inverse of [notifyStreamingStarted] -- call before, not after, releasing anything. */
     fun notifyStreamingStopped() {
         activeStreamCount = (activeStreamCount - 1).coerceAtLeast(0)
+    }
+
+    /**
+     * Called periodically (not per-URB -- see the call site) by the actively-streaming
+     * [UsbAudioOutput]'s own streaming thread, and with `null` the moment it genuinely stops --
+     * see [pipelineStats].
+     */
+    fun reportPipelineStats(stats: UsbPipelineStats?) {
+        _pipelineStats.value = stats
     }
 
     /** [requestClaim]'s result -- see its own doc comment for what each caller should do with it. */
@@ -1259,6 +1277,30 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
         releaseClaim(delayMs = 0, awaitAndroidTakeover = true)
     }
 
+    /**
+     * Tries [probe] against channels 0..[channelCount] in order and returns the first non-null
+     * result.
+     *
+     * The write side ([scheduleVolumeWrite], [activateDac]) always broadcasts the same target to
+     * every channel, so on a device with real per-channel Feature Unit controls, whichever
+     * channel actually answers is reporting the same value by construction -- there's no need to
+     * know in advance which channel that is. This replaced a hardcoded channel-0 (master) read
+     * that was previously misdiagnosed as a device-side firmware limitation: confirmed against
+     * the FiiO Snowsky Tiny A's own descriptors (`bmaControls(0)=0x00000000`, i.e. the device
+     * declares *no* controls at all on the master channel -- only `bmaControls(1)` and `(2)` (the
+     * individual L/R channels) have the Volume Control bit set). A GET_CUR for a channel the
+     * device never declared support for is spec'd to STALL (UAC2 §5.2.5.4.2), which is exactly
+     * the `result=-1` that looked like a broken device. Probing every channel instead of
+     * hardcoding one means this works whether a device's control lives on master, on individual
+     * channels only, or (as here) anywhere but master.
+     */
+    private fun <T> probeChannels(channelCount: Int, probe: (channel: Int) -> T?): T? {
+        for (channel in 0..channelCount) {
+            probe(channel)?.let { return it }
+        }
+        return null
+    }
+
     /** Re-reads every adjustable control from the device and republishes [controlState]. */
     private fun refreshControlState(session: UsbAudioSession, format: UacStreamFormat, deviceName: String) {
         val mixerUnitId = session.topology.mixerUnitId
@@ -1284,17 +1326,18 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
             mixerChannels.firstOrNull()?.let { (inCh, outCh) ->
                 UsbAudioController.getMixerGainRange(session, mixerUnitId, inCh, outCh)
             }
-        // Some devices (confirmed: FiiO Snowsky Tiny A) accept every SET_CUR volume write but
-        // always fail GET_CUR on readback (result=-1) -- a firmware limitation, not a transient
-        // error. Falling back to null here used to mean every single caller of [controlState]
-        // (this screen's volume slider, [MediaSessionHolder]'s physical-volume-key routing) saw
-        // "volume unknown" after *every* write on such a device, and both of them treat unknown
-        // as "assume max" -- so on a device like this, every write was immediately followed by
-        // every reader snapping back to full volume. Preserving the last known value (readback or
-        // our own just-applied write, whichever is freshest) instead means a GET_CUR failure
-        // looks like "nothing changed" rather than "reset to max", which is the correct read on a
-        // device that we just told to be at a specific value two lines above.
-        val volume = UsbAudioController.getVolume(session, 0) ?: _controlState.value?.volume
+        // See [probeChannels]'s doc comment: a single hardcoded channel (especially master/0)
+        // can be one a given device never declared a Volume control on at all, which used to be
+        // misread as a dead device rather than the wrong address. Falling back to the last known
+        // value if every channel comes back null (transient USB error, or a device with no
+        // volume control whatsoever) still matters for the same reason as before: every caller of
+        // [controlState] (this screen's volume slider, [MediaSessionHolder]'s physical-volume-key
+        // routing) treats "unknown" as "assume max", so losing the last known value entirely
+        // would read as "reset to max" instead of "nothing changed".
+        val volume =
+            probeChannels(session.topology.channelCount) { channel ->
+                UsbAudioController.getVolume(session, channel)
+            } ?: _controlState.value?.volume
         _controlState.value =
             UsbControlState(
                 deviceName = deviceName,
@@ -1303,7 +1346,10 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
                 sampleRateHz = activeRateHz,
                 muted = UsbAudioController.getMute(session),
                 volume = volume,
-                volumeRange = UsbAudioController.getVolumeRange(session, 0),
+                volumeRange =
+                    probeChannels(session.topology.channelCount) { channel ->
+                        UsbAudioController.getVolumeRange(session, channel)
+                    },
                 mixerChannels = mixerChannels,
                 mixerGains = mixerGains,
                 mixerGainRange = mixerGainRange,

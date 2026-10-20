@@ -651,30 +651,6 @@ object UsbAudioController {
      */
     fun defaultVolumeTarget(range: Pair<Int, Int>?): Int = range?.let { (it.first + it.second) / 2 } ?: 0
 
-    /**
-     * Sets every channel's Feature Unit volume to unity gain (the top of its own reported
-     * range -- see [getVolumeRange]'s doc comment on why that's the general UAC convention for
-     * "loudest/least attenuated", not a hardcoded 0).
-     *
-     * Called right before handing the interface back to the kernel for Android's normal HAL
-     * path: that path only ever applies its own software volume curve on top of whatever the
-     * Feature Unit's hardware gain already is, the same way it would for any other ordinary USB
-     * audio device -- it has no reason to assume *this* one might be sitting at some attenuated
-     * level a different, unrelated code path (bit-perfect mode's own volume control, or just the
-     * device's own initial-activation midpoint default) left it at. Confirmed, reproduced:
-     * without this, a HAL-routed track topped out at roughly 40-50% of real full volume even at
-     * 100% system volume, because the hardware gain was still sitting wherever it was last set
-     * for bit-perfect playback (or the activation-time midpoint, if the user never even touched
-     * bit-perfect mode) -- Android's software curve was stacking on top of that, not replacing
-     * it.
-     */
-    fun setUnityVolume(session: UsbAudioSession, channelCount: Int) {
-        for (channel in 0..channelCount.coerceAtLeast(2)) {
-            val range = getVolumeRange(session, channel) ?: continue
-            setVolume(session, range.second, channel)
-        }
-    }
-
     /** Sets the Feature Unit's volume for [channel] (0=master, 1=left, 2=right), in 1/256 dB. */
     fun setVolume(session: UsbAudioSession, value: Int, channel: Int): Boolean {
         val unitId = session.topology.outputFeatureUnitId

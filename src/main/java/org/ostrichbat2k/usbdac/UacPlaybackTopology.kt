@@ -89,6 +89,37 @@ data class UacPlaybackTopology(
 )
 
 /**
+ * One USB interface number on the device's selected configuration, independent of whether it's
+ * audio at all -- a composite device (e.g. a headset with its own inline-remote HID interface
+ * alongside its audio ones, confirmed on a real EarPods: interfaces 0-2 audio, 3-4 class=HID)
+ * has entries here that [UacPlaybackTopology] itself never represents, since that type only
+ * describes the playback path. Display-only: [UsbAudioManager.activateDac] only ever reads or
+ * claims [topology]'s own [UacPlaybackTopology.controlInterfaceNumber]/
+ * [UacPlaybackTopology.streamingInterfaceNumber], regardless of what else is listed here, and
+ * [role] exists so a host app's UI can say so plainly instead of leaving every other interface
+ * an unexplained mystery number.
+ */
+data class UsbInterfaceInfo(
+    val number: Int,
+    /** An `UsbConstants.USB_CLASS_*` value. */
+    val interfaceClass: Int,
+    /** How many alternate settings this interface number declares (always >= 1). */
+    val alternateSettingCount: Int,
+    val role: Role,
+) {
+    enum class Role {
+        /** [UacPlaybackTopology.controlInterfaceNumber] -- Auxio sends mute/volume/clock commands here. */
+        CONTROL,
+        /** [UacPlaybackTopology.streamingInterfaceNumber] -- Auxio sends the actual audio data here. */
+        STREAMING,
+        /** Audio class, but not the one playback path Auxio uses (e.g. a capture/mic interface). */
+        OTHER_AUDIO,
+        /** Not audio class at all -- Auxio never claims or touches this one. */
+        NON_AUDIO,
+    }
+}
+
+/**
  * Everything [UsbAudioDescriptorParser] found on a device's descriptors, bundled for read-only
  * display in a host app's UI -- published as soon as a topology is parsed, independent of
  * whether the control-transfer setup that follows (clock, mute, volume, mixer gain) ends up
@@ -100,4 +131,6 @@ data class UsbDeviceCapabilities(
     val vendorId: Int,
     val productId: Int,
     val topology: UacPlaybackTopology,
+    /** Every interface on the device's selected configuration, not just [topology]'s own. */
+    val interfaces: List<UsbInterfaceInfo> = emptyList(),
 )

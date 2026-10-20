@@ -1002,7 +1002,8 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
                 deviceName = deviceName,
                 vendorId = device.vendorId,
                 productId = device.productId,
-                topology = found)
+                topology = found,
+                interfaces = UsbAudioController.listInterfaces(device, found))
         val format =
             found.formats.firstOrNull { it.bitResolution == preferredBitResolution }
                 ?: found.formats.firstOrNull()
@@ -1061,7 +1062,8 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
                         deviceName = deviceName,
                         vendorId = device.vendorId,
                         productId = device.productId,
-                        topology = found)
+                        topology = found,
+                        interfaces = UsbAudioController.listInterfaces(device, found))
             }
         }
 

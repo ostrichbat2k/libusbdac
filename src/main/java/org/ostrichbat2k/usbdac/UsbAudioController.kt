@@ -230,6 +230,36 @@ object UsbAudioController {
     }
 
     /**
+     * Every interface on [device]'s configuration matching [topology.configurationValue],
+     * independent of whether it's audio -- display-only, for a host app's Capabilities UI to
+     * show a composite device's non-audio interfaces (e.g. an inline-remote HID one, see the
+     * eviction-sweep comment in [activate]) instead of leaving them invisible. Doesn't open a
+     * connection or claim anything itself.
+     */
+    fun listInterfaces(device: UsbDevice, topology: UacPlaybackTopology): List<UsbInterfaceInfo> {
+        val config =
+            (0 until device.configurationCount)
+                .map { device.getConfiguration(it) }
+                .firstOrNull { it.id == topology.configurationValue }
+                ?: return emptyList()
+        return (0 until config.interfaceCount)
+            .map { config.getInterface(it) }
+            .groupBy { it.id }
+            .map { (number, altSettings) ->
+                val interfaceClass = altSettings.first().interfaceClass
+                val role =
+                    when {
+                        number == topology.controlInterfaceNumber -> UsbInterfaceInfo.Role.CONTROL
+                        number == topology.streamingInterfaceNumber -> UsbInterfaceInfo.Role.STREAMING
+                        interfaceClass == UsbConstants.USB_CLASS_AUDIO -> UsbInterfaceInfo.Role.OTHER_AUDIO
+                        else -> UsbInterfaceInfo.Role.NON_AUDIO
+                    }
+                UsbInterfaceInfo(number, interfaceClass, altSettings.size, role)
+            }
+            .sortedBy { it.number }
+    }
+
+    /**
      * Re-evicts whatever kernel driver is bound to this session's interfaces, right before
      * streaming starts.
      *

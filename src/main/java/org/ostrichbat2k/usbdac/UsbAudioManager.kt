@@ -18,29 +18,20 @@
 
 package org.ostrichbat2k.usbdac
 
-import android.app.PendingIntent
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
-import android.hardware.usb.UsbConstants
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
-import android.media.AudioDeviceCallback
-import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.os.Build
-import android.os.Handler
-import android.os.Looper
-import android.widget.Toast
 import androidx.media3.exoplayer.audio.AudioSink
 import androidx.media3.exoplayer.audio.DefaultAudioSink
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
-import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -84,9 +75,6 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
     fun halOutputSampleRate(): Int =
         audioManager.getProperty(AudioManager.PROPERTY_OUTPUT_SAMPLE_RATE)?.toIntOrNull() ?: 0
 
-    private val _devices = MutableStateFlow<List<UsbAudioDevice>>(emptyList())
-    val devices: StateFlow<List<UsbAudioDevice>> = _devices.asStateFlow()
-
     private val _diagnosticLog = MutableStateFlow<List<String>>(emptyList())
     /** Most-recent-first log of activation events, for the USB settings screen. */
     val diagnosticLog: StateFlow<List<String>> = _diagnosticLog.asStateFlow()
@@ -128,6 +116,51 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
      * the Now Playing screen -- nothing here feeds back into any routing decision.
      */
     val playbackRoute: StateFlow<PlaybackRoute> = _playbackRoute.asStateFlow()
+
+    // All hardware volume/mute decision logic lives here, not scattered across this class and
+    // UsbAudioController -- see its own class doc comment for why that scatter was a real risk,
+    // not just untidiness.
+    private val volumeController =
+        UsbVolumeController(audioManager, usbSettings, controlState, playbackRoute, ::logEvent)
+
+    // Everything about who holds the raw USB interface claim right now and the hand-off to/from
+    // Android's HAL lives here -- see its own class doc comment for why. getActiveSession reads
+    // live, at the moment each callback actually runs (which can be after a real delay), not a
+    // snapshot frozen when a call into this controller was first made -- deliberately preserving
+    // the pre-extraction code's own behavior of reading its session field fresh every time.
+    private val claimController =
+        UsbClaimController(
+            audioManager,
+            volumeController,
+            getActiveSession = { activeSession },
+            onReclaimed = { activeFormat = null },
+            onClaimFailed = {
+                logEvent("Failed to reclaim USB interface from kernel -- deactivating session")
+                deactivateDac()
+            },
+            // See UsbClaimController.awaitAndroidOutputTakeover()'s doc comment: on at least one
+            // real device, Android's HAL never recognizes this device as long as we hold the
+            // connection open at all, so a timeout here means fully deactivating -- not
+            // reclaiming back to ourselves -- is what actually lets HAL reach the real device.
+            onTakeoverTimeout = { deactivateDac() },
+        )
+
+    // Device attach/detach/permission tracking lives here, not in this class -- see its own
+    // class doc comment for why. onDeviceDetached tears down any active session the same as the
+    // pre-extraction receiver did inline; onRefreshed prunes activationAttemptedFor at the exact
+    // same point (synchronously, right after devices itself updates) the pre-extraction code did.
+    private val deviceDiscovery =
+        UsbDeviceDiscovery(
+            context,
+            usbManager,
+            usbSettings,
+            actionUsbPermission,
+            onDeviceDetached = { deactivateDac() },
+            onRefreshed = { found ->
+                activationAttemptedFor = activationAttemptedFor.takeIf { it in found.map { d -> d.device.deviceName } }
+            },
+        )
+    val devices: StateFlow<List<UsbAudioDevice>> = deviceDiscovery.devices
 
     /** See [playbackRoute]. Called by [RoutingAudioSink], not meant for any other caller. */
     fun reportPlaybackRoute(route: PlaybackRoute) {
@@ -203,32 +236,16 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
     }
 
     /**
-     * Pushes the DAC's live hardware volume to whatever dB [mediaVolumeCurve] says matches
-     * STREAM_MUSIC's *current* index, right before an ABX trial that's about to go bit-perfect.
-     *
-     * [setVolume]/[onStreamMusicChanged]'s existing mirroring only runs reactively, when the user
-     * explicitly moves a volume control -- during a hands-off ABX run (queue just auto-advancing,
-     * nobody touching a volume key), two bit-perfect trials separated by a fallback trial in
-     * between would otherwise keep whatever hardware dB was last explicitly set, which could be a
-     * genuinely different perceived loudness than STREAM_MUSIC -- the *only* thing actually
-     * controlling loudness during that intervening fallback trial, since the hardware deliberately
-     * sits at forced unity gain the whole time one is live (see [UsbAudioController
-     * .setUnityVolume]). A real loudness mismatch between trials would confound the whole point of
-     * a blind test by giving away which path is live, or worse, making the "wrong" one sound
-     * better for a reason that has nothing to do with bit-perfection.
+     * Pushes the DAC's live hardware volume to match STREAM_MUSIC's *current* index, right
+     * before an ABX trial that's about to go bit-perfect -- see
+     * [UsbVolumeController.abxSyncTargetDb] for why this needs to exist at all.
      *
      * Reuses the exact same write path a physical volume key press already takes ([setVolume]),
-     * including its own [mirrorDbToStreamMusic] call back onto STREAM_MUSIC -- a no-op round trip
-     * in this direction, since it's already at the value just read from it here.
+     * including its own STREAM_MUSIC mirroring call -- a no-op round trip in this direction,
+     * since it's already at the value just read from it here.
      */
     private fun syncAbxLoudnessToBitPerfect() {
-        val range = currentVolumeRange() ?: return
-        val (minIndex, maxIndex) = streamMusicIndexRange()
-        if (maxIndex == minIndex) return
-        val currentIndex = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
-        val percent = 100f * (currentIndex - minIndex) / (maxIndex - minIndex)
-        val dbValue = (curveDbAtPercent(percent) * 256f).roundToIntSafe(range.first, range.second)
-        setVolume(dbValue)
+        volumeController.abxSyncTargetDb()?.let { setVolume(it) }
     }
 
     /**
@@ -268,45 +285,17 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
         /**
          * A real hand-off between [Fallback] and [Direct] is in progress -- [requestClaim] is
          * doing its (blocking, hundreds-of-ms-to-low-seconds) reclaim-and-relock-the-clock work,
-         * or [releaseClaim] is waiting out [awaitAndroidOutputTakeover]. Shown so the Now Playing
-         * screen doesn't look like nothing is happening during that gap.
+         * or [releaseClaim] is waiting out [UsbClaimController]'s device-takeover wait. Shown so
+         * the Now Playing screen doesn't look like nothing is happening during that gap.
          */
         data object Switching : PlaybackRoute
     }
 
-    private val claimScheduler =
-        Executors.newSingleThreadScheduledExecutor { r ->
-            Thread(r, "UsbAudioControl-Claim").apply { isDaemon = true }
-        }
-    // Whether we currently hold the raw interface claim (vs. having handed it to the kernel's own
-    // driver for Android's normal USB-audio HAL to use). Distinct from activeSession existing at
-    // all -- a session can be fully discovered/activated and sitting completely unclaimed between
-    // tracks, see activateDac's tail and [releaseClaim].
-    @Volatile private var interfaceClaimed = false
-    @Volatile private var pendingRelease: ScheduledFuture<*>? = null
-    // See deactivateDac()'s and awaitAndroidOutputTakeover()'s own comments on this.
-    @Volatile private var lastDeactivatedDevice: UsbDevice? = null
-    // How many UsbAudioOutput instances currently consider themselves actively streaming (see
-    // notifyStreamingStarted/Stopped) -- i.e. actually depending on the claim right now, not just
-    // having asked for it once. [releaseClaim] must never release out from under one of these:
-    // confirmed, reproduced, a real multi-second dropout -- a volume key press during active
-    // playback ran setVolume()'s background write, which (like every other Settings-style
-    // mutator here) unconditionally called releaseClaim() afterward on the assumption nothing
-    // else needed the claim. With a track genuinely streaming, that scheduled release fired
-    // ~RELEASE_GRACE_MS later and yanked the interface out from under the still-running native
-    // thread, which only recovered once DefaultAudioSink's own stall detection eventually noticed
-    // and forced a fresh reconfigure/reclaim.
-    @Volatile private var activeStreamCount = 0
-
     /** Called by [UsbAudioOutput] once it's actually claimed and streaming -- see [releaseClaim]. */
-    fun notifyStreamingStarted() {
-        activeStreamCount++
-    }
+    fun notifyStreamingStarted() = claimController.notifyStreamingStarted()
 
     /** The inverse of [notifyStreamingStarted] -- call before, not after, releasing anything. */
-    fun notifyStreamingStopped() {
-        activeStreamCount = (activeStreamCount - 1).coerceAtLeast(0)
-    }
+    fun notifyStreamingStopped() = claimController.notifyStreamingStopped()
 
     /**
      * Called periodically (not per-URB -- see the call site) by the actively-streaming
@@ -341,31 +330,7 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
      * why that distinction, not just success/failure, decides whether a resume needs to redo its
      * whole clock/mute/volume relock dance.
      */
-    fun requestClaim(): ClaimOutcome {
-        pendingRelease?.cancel(false)
-        pendingRelease = null
-        if (interfaceClaimed) return ClaimOutcome.ALREADY_CLAIMED
-        val session = activeSession ?: return ClaimOutcome.FAILED
-        val ok = UsbAudioController.reclaimFromKernel(session)
-        if (ok) {
-            interfaceClaimed = true
-            // reclaimFromKernel only re-claims the control interface and the streaming
-            // interface's alt-0 -- the actual bit-depth alt-setting is whatever
-            // ensureFormatActive's selectFormat call puts it at, further down the line. But that
-            // call only runs selectFormat when it thinks the format "changed" from activeFormat,
-            // and activeFormat was never invalidated by giving the interface away -- so without
-            // this, a reclaim after this exact format was already active looked like a no-op
-            // change and selectFormat never ran again, leaving the interface sitting at alt-0
-            // while UsbAudioOutput opened its iso stream assuming the real target alt-setting's
-            // endpoint. Confirmed, reproduced: every post-reclaim stream failed submitIso on
-            // every single slot, immediately.
-            activeFormat = null
-        } else {
-            logEvent("Failed to reclaim USB interface from kernel -- deactivating session")
-            deactivateDac()
-        }
-        return if (ok) ClaimOutcome.RECLAIMED else ClaimOutcome.FAILED
-    }
+    fun requestClaim(): ClaimOutcome = claimController.requestClaim(activeSession)
 
     /**
      * Schedules handing the interface back to the kernel's own driver after [delayMs] (see
@@ -374,148 +339,22 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
      * release immediately (used when something -- a pause, a track that can't use the DAC, the
      * player itself -- is definitely, not just momentarily, done with it).
      *
-     * [awaitAndroidTakeover] only changes whether *this call* blocks on [awaitAndroidOutputTakeover]
+     * [awaitAndroidTakeover] only changes whether *this call* blocks on the device-takeover wait
      * before returning -- a caller with its own next step that depends on Android having actually
      * recognized the device (e.g. [RoutingAudioSink.resolveForConfigure] about to let a fallback
-     * track's `configure()` proceed) needs that. Every real release gets verified either way (see
-     * [doReleaseClaim]), so a caller that doesn't need to block still gets a definitive log
-     * confirming -- or, on [AWAIT_TAKEOVER_TIMEOUT_MS] timeout, warning -- whether the kernel
-     * actually took the device back, rather than silently trusting the release call.
-     */
-    fun releaseClaim(delayMs: Long = RELEASE_GRACE_MS, awaitAndroidTakeover: Boolean = false) {
-        pendingRelease?.cancel(false)
-        if (activeStreamCount > 0) {
-            // Something is genuinely streaming right now and still needs the claim -- a caller
-            // here (a Settings-screen mutator, most likely) just wanted it briefly for its own
-            // one-off write and is in no position to know that. Not even worth scheduling: the
-            // active UsbAudioOutput's own pause()/release() is what will actually call this once
-            // it's really done.
-            pendingRelease = null
-            return
-        }
-        pendingRelease =
-            if (delayMs <= 0) {
-                doReleaseClaim(awaitAndroidTakeover)
-                null
-            } else {
-                claimScheduler.schedule({ doReleaseClaim(awaitAndroidTakeover) }, delayMs, TimeUnit.MILLISECONDS)
-            }
-    }
-
-    private fun doReleaseClaim(awaitAndroidTakeover: Boolean) {
-        if (activeStreamCount > 0) return
-        val session = activeSession
-        if (session != null && interfaceClaimed) {
-            // Bracketed with mute the same way UsbAudioOutput's own clock-relock is (see its
-            // init-time comment on why): setUnityVolume can be a large, sudden jump (e.g.
-            // -30dB -> 0dB) from wherever bit-perfect mode last left it, and doing that while
-            // unmuted is audible as a real pop/click -- confirmed, reported. Unmuting again
-            // before releaseToKernel, not after, since by the time Android's HAL actually opens
-            // the device for a fallback track, it needs to already be unmuted to be audible.
-            UsbAudioController.setMute(session, muted = true)
-            UsbAudioController.setUnityVolume(session, session.topology.channelCount)
-            UsbAudioController.setMute(session, muted = false)
-            // Must happen before releaseToKernel, not after -- once released, these control
-            // transfers need the interface claimed the same as any other, and by the time
-            // Android's HAL actually opens the device it's too late to fix the gain up front.
-            UsbAudioController.releaseToKernel(session)
-            interfaceClaimed = false
-            if (awaitAndroidTakeover) {
-                awaitAndroidOutputTakeover()
-            } else {
-                // The caller doesn't need to block on this, but still deserves a definitive
-                // answer in the log instead of just trusting releaseToKernel's own ioctl-level
-                // success silently -- run the same check, just off this thread.
-                claimScheduler.execute { awaitAndroidOutputTakeover() }
-            }
-        }
-    }
-
-    /**
-     * Blocks (briefly, bounded) until Android's own audio framework reports this device as an
-     * available output, or [AWAIT_TAKEOVER_TIMEOUT_MS] elapses.
+     * track's `configure()` proceed) needs that. Every real release gets verified either way, so
+     * a caller that doesn't need to block still gets a definitive log confirming -- or, on
+     * timeout, warning -- whether the kernel actually took the device back, rather than silently
+     * trusting the release call. See [UsbClaimController] for the actual claim/release mechanics
+     * and that wait.
      *
-     * The kernel-side decision (will snd-usb-audio actually bind and create a playback PCM
-     * substream) is already synchronous by the time [UsbAudioController.releaseToKernel]'s
-     * `releaseInterface()` call returns -- see its own doc comment: the `USBDEVFS_CONNECT` ioctl
-     * that hands the interface back runs `device_attach()` inline, so there is nothing to wait
-     * out, let alone "submit" or nudge, at the kernel/USB-subsystem layer itself. What *does* have
-     * real, measured latency (confirmed via logcat: ~100-300ms from release to `UsbAlsaManager:
-     * alsaFileAdded(pcmC1D0p)` on the one device tested) is Android's own userspace audio stack,
-     * running in a separate process (`audioserver`/`UsbAlsaManager`), noticing that already-bound
-     * kernel substream, creating its `/dev/snd/` node, and updating AudioPolicyManager's device
-     * list -- ordinary app code has no API to directly trigger or accelerate that recognition
-     * (no "submit claim now" equivalent is exposed), only to observe it. Opening a *fallback*
-     * `AudioTrack` while that's still in flight doesn't fail -- it just succeeds, silently routed
-     * to the speaker, and Android never revisits that choice later, which is what
-     * [RoutingAudioSink] calls this for, right before letting a fallback track's `configure()` run.
-     *
-     * Implemented via [AudioDeviceCallback] rather than polling [AudioManager.getDevices] on a
-     * fixed interval: this reacts to Android's own recognition the instant it's reported, instead
-     * of discovering it up to one poll tick late.
+     * [deactivateOnTimeout] should only be `true` when a concrete track genuinely needs this
+     * device to reach HAL right now (currently only [RoutingAudioSink.resolveForConfigure]'s
+     * fallback branch) -- see [UsbClaimController.releaseClaim]'s own doc comment for why every
+     * other caller should leave it `false`.
      */
-    private fun awaitAndroidOutputTakeover() {
-        // activeSession is already null by the time this runs if the caller got here via
-        // deactivateDac() (e.g. the user just disabled USB DAC output) rather than a per-track
-        // liveness switch -- lastDeactivatedDevice is deactivateDac()'s own record of exactly
-        // which device to wait for in that case. Without this fallback, this function returned
-        // immediately, silently skipping the whole wait -- confirmed, reproduced: switching to
-        // fallback right after disabling the DAC raced Android's own recognition of the
-        // just-released device far more often than the old "only re-resolves at the next track"
-        // path ever did, since that path had arbitrary real wall-clock time to let this settle
-        // naturally and this one doesn't.
-        val device = activeSession?.device ?: lastDeactivatedDevice ?: return
-        // Consume-once, right away -- this wait only needs to happen for the one real gap right
-        // after *this* release/detach. Without clearing it here, every later fallback track's
-        // configure() (see RoutingAudioSink.resolveForConfigure) re-ran this same wait for a
-        // device that was either already confirmed as an output on the very first attempt, or
-        // (a genuine physical unplug) is never coming back at all -- confirmed, reproduced: after
-        // any one deactivation, *every* subsequent track blocked the configure()-calling thread
-        // for up to AWAIT_TAKEOVER_TIMEOUT_MS, forever, until the process restarted, even though
-        // there was no USB DAC in the picture anymore.
-        lastDeactivatedDevice = null
-        val targetName = device.productName?.toString() ?: device.deviceName
-        // Not an equality check -- confirmed, reproduced: Android registers this device's
-        // AudioDeviceInfo.productName as "USB-Audio - <productName>" (its own internal naming
-        // convention for USB audio devices, visible via `dumpsys audio`'s DeviceInfo listing),
-        // not UsbDevice.productName's bare value. An exact match against the bare name silently
-        // never matched anything -- this function always timed out and warned, even though
-        // UsbAlsaManager had already recognized the device within single-digit milliseconds of
-        // release every time.
-        fun matches(info: AudioDeviceInfo) =
-            (info.type == AudioDeviceInfo.TYPE_USB_HEADSET || info.type == AudioDeviceInfo.TYPE_USB_DEVICE) &&
-                info.productName?.toString()?.contains(targetName) == true
-
-        val startedAt = System.currentTimeMillis()
-        if (audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS).any(::matches)) {
-            L.i("UsbAudioManager: kernel had already reclaimed $targetName as an Android output")
-            return
-        }
-        val latch = CountDownLatch(1)
-        val callback =
-            object : AudioDeviceCallback() {
-                override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>) {
-                    if (addedDevices.any(::matches)) latch.countDown()
-                }
-            }
-        audioManager.registerAudioDeviceCallback(callback, Handler(Looper.getMainLooper()))
-        try {
-            // Re-check after registering -- covers the race where the device landed between the
-            // first check above and this callback actually being registered, which
-            // onAudioDevicesAdded alone would never report (it only fires for future additions).
-            val took =
-                audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS).any(::matches) ||
-                    latch.await(AWAIT_TAKEOVER_TIMEOUT_MS, TimeUnit.MILLISECONDS)
-            if (took) {
-                L.i(
-                    "UsbAudioManager: kernel reclaimed $targetName as an Android output after " +
-                        "${System.currentTimeMillis() - startedAt}ms")
-            } else {
-                L.w("UsbAudioManager: Android didn't report the USB device as an output within timeout")
-            }
-        } finally {
-            audioManager.unregisterAudioDeviceCallback(callback)
-        }
+    fun releaseClaim(delayMs: Long = RELEASE_GRACE_MS, awaitAndroidTakeover: Boolean = false, deactivateOnTimeout: Boolean = false) {
+        claimController.releaseClaim(delayMs, awaitAndroidTakeover, deactivateOnTimeout)
     }
 
     // In-memory only: which bit resolution to prefer when multiple formats are offered. Not
@@ -570,8 +409,22 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
      * underlying activation flag around it -- the single place both [ensureActivated] and
      * [retryActivation] dispatch activation from, so neither signal can drift out of sync with
      * whether a background activation is actually running.
+     *
+     * Also the single place [activationAttemptedFor] gets marked, not just [ensureActivated]'s
+     * own lazy path -- confirmed, reproduced: a session last (re)activated via [retryActivation]
+     * (which calls this directly, bypassing [ensureActivated]'s guard entirely) left
+     * [activationAttemptedFor] unset for this attachment, so the instant [activeSession] went
+     * null again (e.g. [UsbClaimController]'s own timeout-escalation calling [deactivateDac]),
+     * the very next per-buffer [resolveActiveSink] call's [ensureActivated] check saw no record
+     * of a prior attempt and immediately reclaimed the interface -- winning the race against
+     * Android's HAL recognizing the just-freed device every single time, since that reclaim is
+     * synchronous and HAL's recognition never is. Marking it here instead means a device that's
+     * been tried at all during this attachment, by any path, stays left alone until the user's
+     * own retry/replug, exactly as [ensureActivated]'s "once per attachment" doc comment already
+     * claimed it would.
      */
     private fun runActivation(device: UsbDevice) {
+        activationAttemptedFor = device.deviceName
         val deferred = CompletableDeferred<Unit>()
         activationSettled = deferred
         _isActivating.value = true
@@ -599,15 +452,6 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
     @Volatile private var activeRateHz: Int = SUPPORTED_SAMPLE_RATE_HZ
 
     private var started = false
-    private var knownDeviceNames = emptySet<String>()
-    // Device names (keyed like knownDeviceNames' display names, but the raw deviceName) we've
-    // already called requestPermission() for during their current attachment -- so a user's
-    // explicit denial doesn't turn into a repeated dialog-spam loop every time the resulting
-    // ACTION_USB_PERMISSION broadcast re-triggers refresh() (see onReceive/actionUsbPermission).
-    // Pruned down to currently-attached devices on every refresh(), so a physical detach/replug
-    // (confirmed, reproduced: doesn't always carry the permission grant over) gets a fresh
-    // automatic attempt, same as a genuinely new device.
-    private var permissionRequestedFor = emptySet<String>()
     // The device name [ensureActivated] has already tried activation for during its current
     // attachment, successfully or not -- same pruning/re-eligibility pattern as
     // [permissionRequestedFor] (see its own comment), so a replug gets a fresh automatic attempt
@@ -615,51 +459,18 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
     // doesn't retry on every single track's resolveActiveSink() call.
     private var activationAttemptedFor: String? = null
 
-    private val receiver =
+    // Only ACTION_VOLUME_CHANGED -- device attach/detach/permission broadcasts are
+    // UsbDeviceDiscovery's own receiver now (see its class doc comment for why this one stayed
+    // separate rather than folding into it).
+    private val volumeChangeReceiver =
         object : BroadcastReceiver() {
             override fun onReceive(ctx: Context, intent: Intent) {
-                when (intent.action) {
-                    UsbManager.ACTION_USB_DEVICE_ATTACHED -> {
-                        L.i("USB device attached: ${intentDevice(intent)?.deviceName}")
-                        refresh()
-                    }
-                    UsbManager.ACTION_USB_DEVICE_DETACHED -> {
-                        L.i("USB device detached: ${intentDevice(intent)?.deviceName}")
-                        deactivateDac()
-                        refresh()
-                    }
-                    ACTION_VOLUME_CHANGED -> {
-                        if (intent.getIntExtra(EXTRA_VOLUME_STREAM_TYPE, -1) ==
-                            AudioManager.STREAM_MUSIC) {
-                            onStreamMusicChanged(audioManager.getStreamVolume(AudioManager.STREAM_MUSIC))
-                        }
-                    }
-                    actionUsbPermission -> {
-                        val device = intentDevice(intent)
-                        val granted =
-                            intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
-                        L.i("USB permission result for ${device?.deviceName}: granted=$granted")
-                        if (device != null) {
-                            val label = device.productName ?: device.deviceName
-                            Toast.makeText(
-                                    context,
-                                    if (granted) "USB DAC permission granted: $label"
-                                    else "USB DAC permission denied: $label",
-                                    Toast.LENGTH_LONG,
-                                )
-                                .show()
-                        }
-                        refresh()
-                    }
+                if (intent.action == ACTION_VOLUME_CHANGED &&
+                    intent.getIntExtra(EXTRA_VOLUME_STREAM_TYPE, -1) == AudioManager.STREAM_MUSIC) {
+                    volumeController.onStreamMusicChanged(
+                        audioManager.getStreamVolume(AudioManager.STREAM_MUSIC))
                 }
             }
-        }
-
-    private fun intentDevice(intent: Intent): UsbDevice? =
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
-        } else {
-            @Suppress("DEPRECATION") intent.getParcelableExtra(UsbManager.EXTRA_DEVICE)
         }
 
     /** Begins listening for USB device attach/detach/permission events. Call once at startup. */
@@ -667,77 +478,18 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
         if (started) return
         started = true
         usbSettings.registerListener(this)
+        deviceDiscovery.start()
 
-        val filter =
-            IntentFilter().apply {
-                addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED)
-                addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
-                addAction(actionUsbPermission)
-                addAction(ACTION_VOLUME_CHANGED)
-            }
+        val filter = IntentFilter(ACTION_VOLUME_CHANGED)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            context.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
+            context.registerReceiver(volumeChangeReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
         } else {
-            @Suppress("UnspecifiedRegisterReceiverFlag") context.registerReceiver(receiver, filter)
+            @Suppress("UnspecifiedRegisterReceiverFlag") context.registerReceiver(volumeChangeReceiver, filter)
         }
-
-        refresh()
     }
 
     /** Requests permission to use [device]. The result arrives asynchronously via broadcast. */
-    fun requestPermission(device: UsbDevice) {
-        val permissionIntent =
-            PendingIntent.getBroadcast(
-                context,
-                0,
-                Intent(actionUsbPermission).setPackage(context.packageName),
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-            )
-        usbManager.requestPermission(device, permissionIntent)
-    }
-
-    private fun refresh() {
-        val found =
-            usbManager.deviceList.values.filter { it.isAudioDevice() }.map {
-                UsbAudioDevice(it, usbManager.hasPermission(it))
-            }
-
-        val newNames = found.map { it.displayName }.toSet()
-        for (name in newNames - knownDeviceNames) {
-            Toast.makeText(context, "USB Audio Device detected: $name", Toast.LENGTH_LONG).show()
-        }
-        knownDeviceNames = newNames
-
-        // Getting permission is cheap and worth doing eagerly -- it's just an Android dialog,
-        // never touches the USB interface itself. Actually activating (see ensureActivated,
-        // called lazily from resolveActiveSink) is not: it forcibly evicts the kernel's own
-        // snd-usb-audio driver to read descriptors/volume range, which tears down and recreates
-        // that device's ALSA PCM node -- confirmed, reproduced: merely opening this app with
-        // permission already granted (never pressing play, never touching bit-perfect mode) was
-        // enough to silence *another* app's audio on this same device for up to a minute while
-        // the kernel re-settled, purely as a side effect of us having been opened at all.
-        for (audioDevice in found) {
-            val name = audioDevice.device.deviceName
-            if (usbSettings.enabled && !audioDevice.hasPermission && name !in permissionRequestedFor) {
-                // Auto-request instead of waiting for the user to manually tap "Retry
-                // activation" (retryActivation()) -- the common real-world trigger is a replug
-                // that didn't carry the grant over, not a first-ever attach. permissionRequestedFor
-                // guards against re-asking every time the (denied) result broadcast loops back
-                // into another refresh() call below.
-                L.i("Permission not granted for ${audioDevice.displayName}, requesting automatically")
-                permissionRequestedFor = permissionRequestedFor + name
-                requestPermission(audioDevice.device)
-            }
-        }
-        permissionRequestedFor = permissionRequestedFor intersect found.map { it.device.deviceName }.toSet()
-        activationAttemptedFor = activationAttemptedFor.takeIf { it in found.map { d -> d.device.deviceName } }
-
-        L.d("USB audio devices: ${found.map { it.displayName to it.hasPermission }}")
-        _devices.value = found
-    }
-
-    private fun UsbDevice.isAudioDevice(): Boolean =
-        (0 until interfaceCount).any { getInterface(it).interfaceClass == UsbConstants.USB_CLASS_AUDIO }
+    fun requestPermission(device: UsbDevice) = deviceDiscovery.requestPermission(device)
 
     // A host app building more than one audio renderer (e.g. a preferred decoder plus a
     // fallback), each wrapping its own RoutingAudioSink -- both get queried
@@ -811,9 +563,8 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
     private fun ensureActivated() {
         if (activeSession != null || _isActivating.value) return
         if (!usbSettings.enabled) return
-        val device = _devices.value.firstOrNull { it.hasPermission } ?: return
+        val device = deviceDiscovery.devices.value.firstOrNull { it.hasPermission } ?: return
         if (device.device.deviceName == activationAttemptedFor) return
-        activationAttemptedFor = device.device.deviceName
         runActivation(device.device)
     }
 
@@ -885,6 +636,17 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
         val session = activeSession ?: return null
         return DefaultAudioSink.Builder(context)
             .setAudioOutputProvider(UsbAudioOutputProvider(this, session, usbSettings))
+            // Off by default in DefaultAudioSink -- without this, getFormatSupport() silently
+            // rewrites every float-PCM query back down to 16-bit before UsbAudioOutputProvider
+            // ever sees it, which is exactly what made every decoder's own float-vs-16-bit
+            // negotiation always choose 16-bit regardless of the DAC's real capability --
+            // confirmed, reproduced via a temporary diagnostic log: RoutingAudioSink.
+            // getFormatSupport() correctly received the decoder's pcmEncoding=4 (FLOAT) query,
+            // but this exact sink -- not the RoutingAudioSink.fallback one, which already has
+            // this flag -- rewrote it to 16-bit before UsbAudioOutputProvider's own log ever
+            // saw anything but "16-bit". See DefaultAudioSink.getFormatSupport()'s own
+            // shouldUseFloatOutput() check.
+            .setEnableFloatOutput(true)
             .build()
             .also { activeSink = it }
     }
@@ -912,8 +674,22 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
         // this must succeed before selectFormat, not be left for later.
         if (requestClaim() == ClaimOutcome.FAILED) return false
         val formatChanged = format != activeFormat
+        val rateChanged = sampleRateHz != activeRateHz
         var ok = true
-        if (formatChanged) {
+        if (formatChanged || rateChanged) {
+            // Re-selecting the alt-setting -- even to the *same* alternateSetting value when
+            // only the sample rate changed, not the bit depth -- always issues a real
+            // SET_INTERFACE request (UsbDeviceConnection.setInterface never short-circuits a
+            // same-value call), which resets the device's endpoint, flushing whatever's still
+            // sitting in its internal FIFO from the previous rate. Without this, a same-alt
+            // rate-only change (e.g. 24-bit 44.1kHz -> 24-bit 96kHz) never touched the
+            // interface at all, since the old condition only re-selected on a genuine bit-depth
+            // change -- confirmed, reproduced: exactly that rate-only case (not a bit-depth
+            // change, which already re-selected and so was never affected) produced an audible
+            // crackle right as streaming resumed, consistent with leftover samples from the old
+            // rate getting flushed out of the device's FIFO at the new rate's timing instead of
+            // discarded cleanly beforehand.
+            //
             // Same reasoning as the identical call in activateDac(): Android's own ALSA driver
             // can race to re-claim the interface, and evicting it again right before
             // selectFormat is safe/cheap insurance against that.
@@ -926,7 +702,7 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
                 logEvent("Failed to switch to ${format.bitResolution}-bit (alt=${format.alternateSetting}) for upcoming track")
             }
         }
-        if (formatChanged || sampleRateHz != activeRateHz) {
+        if (formatChanged || rateChanged) {
             activeRateHz = sampleRateHz
             refreshControlState(session, activeFormat ?: format, session.device.productName ?: session.device.deviceName)
         }
@@ -1273,7 +1049,7 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
         // succeeds routed to the speaker instead, and Android never revisits that choice for it
         // -- confirmed, reproduced: opening another app's player right after granting permission,
         // before ever pressing play in this app at all.
-        interfaceClaimed = true
+        claimController.markAlreadyClaimed()
         releaseClaim(delayMs = 0, awaitAndroidTakeover = true)
     }
 
@@ -1407,126 +1183,8 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
         // Persisted so the next activation (new session, app restart, DAC reconnect) starts from
         // here instead of a fixed default -- see [UsbAudioOutput]'s constructor.
         usbSettings.volumeDb = valueDb
-        mirrorDbToStreamMusic(valueDb)
+        volumeController.mirrorDbToStreamMusic(valueDb)
         scheduleVolumeWrite()
-    }
-
-    // The range this volume value belongs to -- same one setVolume's own callers already read
-    // from controlState, kept here just so mirrorDbToStreamMusic doesn't need its own copy
-    // threaded through every call site.
-    private fun currentVolumeRange(): Pair<Int, Int>? = _controlState.value?.volumeRange
-
-    /**
-     * [AUDIO_STREAM_MUSIC, DEVICE_CATEGORY_HEADSET] and [..., DEVICE_CATEGORY_EXT_MEDIA] (USB
-     * falls under one or the other either way) both reference this exact curve in AOSP's
-     * `frameworks/av/services/audiopolicy/config/audio_policy_volumes.xml` ->
-     * `default_volume_tables.xml`'s `DEFAULT_MEDIA_VOLUME_CURVE`: (percent-of-index-range,
-     * attenuation in dB), linearly interpolated in dB between points -- confirmed against the
-     * actual interpolation code, `VolumeCurve::volIndexToDb` in
-     * `frameworks/av/services/audiopolicy/engine/common/src/VolumeCurve.cpp`. This is AOSP's
-     * documented default, not a guess, but OEMs commonly retune these tables for their own
-     * devices, so it's still only an approximation of *this* device's real curve -- a much
-     * closer one than a flat linear guess, though.
-     */
-    private val mediaVolumeCurve = listOf(1f to -58f, 20f to -40f, 60f to -17f, 100f to 0f)
-
-    /** The curve's attenuation (dB) at a given [percent] (0..100) of the index range. */
-    private fun curveDbAtPercent(percent: Float): Float {
-        val p = percent.coerceIn(0f, 100f)
-        for (i in 1 until mediaVolumeCurve.size) {
-            val (idxHi, dbHi) = mediaVolumeCurve[i]
-            if (p <= idxHi) {
-                val (idxLo, dbLo) = mediaVolumeCurve[i - 1]
-                val t = if (idxHi == idxLo) 0f else (p - idxLo) / (idxHi - idxLo)
-                return dbLo + t * (dbHi - dbLo)
-            }
-        }
-        return mediaVolumeCurve.last().second
-    }
-
-    /** The inverse of [curveDbAtPercent]: the percent (0..100) at which the curve reads [db]. */
-    private fun curvePercentAtDb(db: Float): Float {
-        val d = db.coerceIn(mediaVolumeCurve.first().second, mediaVolumeCurve.last().second)
-        for (i in 1 until mediaVolumeCurve.size) {
-            val (idxHi, dbHi) = mediaVolumeCurve[i]
-            val (idxLo, dbLo) = mediaVolumeCurve[i - 1]
-            if (d <= dbHi) {
-                val t = if (dbHi == dbLo) 0f else (d - dbLo) / (dbHi - dbLo)
-                return idxLo + t * (idxHi - idxLo)
-            }
-        }
-        return mediaVolumeCurve.last().first
-    }
-
-    private fun streamMusicIndexRange(): Pair<Int, Int> {
-        val max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
-        val min =
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                audioManager.getStreamMinVolume(AudioManager.STREAM_MUSIC)
-            } else {
-                0
-            }
-        return min to max
-    }
-
-    /**
-     * Keeps Android's own [AudioManager.STREAM_MUSIC] index matched (via [mediaVolumeCurve],
-     * Android's own real curve, not a flat linear guess) to the DAC's hardware dB level, purely
-     * so switching between a bit-perfect track (loudness controlled by the Feature Unit) and a
-     * fallback track (loudness controlled by STREAM_MUSIC -- see [UsbAudioController
-     * .setUnityVolume]'s doc comment on why the hardware itself sits at unity during fallback)
-     * doesn't sound like a jump up or down in level just because the two tracks happened to use
-     * different control paths. [ignoreNextStreamMusicBroadcast] guards against this call's own
-     * [AudioManager.setStreamVolume] immediately feeding back into [onStreamMusicChanged] as if
-     * the user had just adjusted it externally.
-     */
-    private fun mirrorDbToStreamMusic(valueDb: Int) {
-        currentVolumeRange() ?: return
-        val percent = curvePercentAtDb(valueDb / 256f)
-        val (minIndex, maxIndex) = streamMusicIndexRange()
-        val index = (minIndex + percent / 100f * (maxIndex - minIndex)).roundToIntSafe(minIndex, maxIndex)
-        if (index == audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)) return
-        ignoreNextStreamMusicBroadcast = true
-        audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, index, 0)
-    }
-
-    private fun Float.roundToIntSafe(min: Int, max: Int): Int =
-        kotlin.math.round(this).toInt().coerceIn(min, max)
-
-    // Set right before mirrorDbToStreamMusic's own setStreamVolume call, and cleared by the very
-    // next VOLUME_CHANGED_ACTION broadcast [onStreamMusicChanged] sees -- distinguishes "this
-    // broadcast is just an echo of our own write" from "the user (or another app) genuinely
-    // changed STREAM_MUSIC", which is the only case that should feed back into [usbSettings
-    // .volumeDb]. A plain boolean is enough: Android delivers this broadcast synchronously
-    // enough relative to the call that there's never more than one in flight at a time in
-    // practice, and worst case a missed real external change just waits for the next one.
-    @Volatile private var ignoreNextStreamMusicBroadcast = false
-
-    /**
-     * The inverse of [mirrorDbToStreamMusic]: called when [AudioManager.VOLUME_CHANGED_ACTION]
-     * reports a real (not self-caused) STREAM_MUSIC change while a fallback track -- the only
-     * time STREAM_MUSIC is actually what's audible -- is the current route. Persists
-     * the dB equivalent to [UsbDacPreferences.volumeDb] so the *next* bit-perfect track picks up from
-     * roughly the same perceived loudness, but deliberately does not touch the hardware live --
-     * it's intentionally sitting at unity gain for the whole time a fallback track is playing
-     * (see [UsbAudioController.setUnityVolume]), and touching it now would mean reclaiming the
-     * interface right out from under HAL's own active use of it, the same dropout bug
-     * [UsbAudioManager.releaseClaim]'s [activeStreamCount] check exists to prevent.
-     */
-    private fun onStreamMusicChanged(newIndex: Int) {
-        if (ignoreNextStreamMusicBroadcast) {
-            ignoreNextStreamMusicBroadcast = false
-            return
-        }
-        if (!usbSettings.bitPerfectMode || _controlState.value == null) return
-        if (_playbackRoute.value !is PlaybackRoute.Fallback) return
-        val range = currentVolumeRange() ?: return
-        val (minIndex, maxIndex) = streamMusicIndexRange()
-        if (maxIndex == minIndex) return
-        val percent = 100f * (newIndex - minIndex) / (maxIndex - minIndex)
-        val dbValue = (curveDbAtPercent(percent) * 256f).roundToIntSafe(range.first, range.second)
-        logEvent("STREAM_MUSIC changed to $newIndex while on fallback -- syncing DAC volume target to ${dbValue}dB")
-        usbSettings.volumeDb = dbValue
     }
 
     private fun scheduleVolumeWrite() {
@@ -1593,27 +1251,25 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
      * redundant and removed, since every caller gets the correct behavior from here instead.
      */
     private fun deactivateDac() {
-        pendingRelease?.cancel(false)
-        pendingRelease = null
+        claimController.cancelPendingRelease()
         val session = activeSession
-        if (session != null && interfaceClaimed) {
-            // Mirrors doReleaseClaim's own unmute-before-release bracket (see its doc comment on
-            // why this has to happen before the interface is released, not after) -- without it,
-            // disabling USB DAC output while still claimed (e.g. mid-track, not between tracks
-            // where doReleaseClaim already did this) leaves the device's hardware Feature Unit at
-            // whatever gain/mute bit-perfect mode last set it to. Android's own STREAM_MUSIC
-            // volume has no visibility into or control over that -- confirmed, reproduced: every
-            // fallback track afterward showed the correct route, correct Android-side volume, and
-            // played silently, until the device was unplugged or USB DAC output was re-enabled.
-            UsbAudioController.setMute(session, muted = true)
-            UsbAudioController.setUnityVolume(session, session.topology.channelCount)
-            UsbAudioController.setMute(session, muted = false)
+        if (session != null && claimController.isClaimed()) {
+            // Mirrors UsbClaimController's own UsbVolumeController.prepareForHalHandoff call
+            // (see its doc comment on why this has to happen before the interface is released,
+            // not after) -- without it, disabling USB DAC output while still claimed (e.g.
+            // mid-track, not between tracks where that path already did this) leaves the
+            // device's hardware Feature Unit at whatever gain/mute bit-perfect mode last set it
+            // to. Android's own STREAM_MUSIC volume has no visibility into or control over that
+            // -- confirmed, reproduced: every fallback track afterward showed the correct route,
+            // correct Android-side volume, and played silently, until the device was unplugged
+            // or USB DAC output was re-enabled.
+            volumeController.prepareForHalHandoff(session, session.topology.channelCount)
         }
-        interfaceClaimed = false
-        // Captured before clearing activeSession below -- see awaitAndroidOutputTakeover()'s
-        // fallback use of this, needed when this function is the one that triggered the switch
-        // to fallback rather than a per-track liveness check.
-        lastDeactivatedDevice = session?.device
+        claimController.markReleased()
+        // Captured before clearing activeSession below -- see UsbClaimController's
+        // awaitAndroidOutputTakeover()'s fallback use of this, needed when this function is the
+        // one that triggered the switch to fallback rather than a per-track liveness check.
+        claimController.recordDeactivatedDevice(session?.device)
         session?.let { UsbAudioController.release(it) }
         activeSession = null
         activeFormat = null
@@ -1637,7 +1293,7 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
             L.i("retryActivation: USB DAC output is disabled in settings")
             return
         }
-        val device = _devices.value.firstOrNull()
+        val device = deviceDiscovery.devices.value.firstOrNull()
         if (device == null) {
             L.w("retryActivation: no USB audio device attached")
             return
@@ -1688,10 +1344,5 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
         // brief Settings screen tweak) never pays the real hand-off cost, short enough that
         // genuinely leaving playback paused or idle frees the device for every other app promptly.
         const val RELEASE_GRACE_MS = 3000L
-        // How long awaitAndroidOutputTakeover() will wait before giving up -- confirmed via
-        // logcat the real kernel-driver-rebind-to-ALSA-node latency is ~100-300ms on the one
-        // device tested; this leaves a lot of headroom for a slower device/host combo without
-        // blocking indefinitely if Android never picks the device up at all.
-        const val AWAIT_TAKEOVER_TIMEOUT_MS = 1500L
     }
 }

@@ -218,7 +218,10 @@ class RoutingAudioSink(private val usbAudioManager: UsbAudioManager, private val
             // Android's own device list actually reports the USB device as available -- the
             // kernel-side decision is synchronous (see UsbAudioController.releaseToKernel's doc
             // comment) but Android's own userspace recognition of it still has real latency.
-            usbAudioManager.releaseClaim(delayMs = 0, awaitAndroidTakeover = true)
+            // deactivateOnTimeout=true: this track genuinely needs HAL to reach the device right
+            // now, so on timeout the session should fully deactivate rather than reclaim the
+            // interface back to us -- see UsbAudioManager.releaseClaim's own doc comment.
+            usbAudioManager.releaseClaim(delayMs = 0, awaitAndroidTakeover = true, deactivateOnTimeout = true)
         }
         delegate = chosen
         return chosen
@@ -311,7 +314,18 @@ class RoutingAudioSink(private val usbAudioManager: UsbAudioManager, private val
                 fallbackRoute(inputFormat)
             } else {
                 UsbAudioManager.PlaybackRoute.Direct(
-                    bitDepth = bitDepthFor(inputFormat.pcmEncoding),
+                    // Prefer the DAC's own real active alt-setting (already updated by
+                    // UsbAudioOutputProvider.getAudioOutput -> ensureFormatActive ->
+                    // refreshControlState, moments before this call) over deriving it from
+                    // inputFormat.pcmEncoding -- that guess is wrong whenever the decoder is
+                    // feeding float PCM for the bit-perfect-via-float-conversion path (see
+                    // UsbAudioOutputProvider.floatTargetFormat): bitDepthFor(PCM_FLOAT) has no
+                    // mapping and returns null, which showed as a blank bit depth on the Now
+                    // Playing screen despite the DAC genuinely streaming real (24-bit-sourced)
+                    // 32-bit integer PCM. Falls back to the old guess only if controlState
+                    // somehow isn't populated yet.
+                    bitDepth = usbAudioManager.controlState.value?.activeFormat?.bitResolution
+                        ?: bitDepthFor(inputFormat.pcmEncoding),
                     sampleRateHz = inputFormat.sampleRate,
                     channels = inputFormat.channelCount)
             })

@@ -49,6 +49,15 @@ interface UsbDacPreferences {
     var volumeDb: Int?
 
     /**
+     * Whether a blind ABX listening test is in progress. While on, [UsbAudioManager] secretly
+     * randomizes bit-perfect vs HAL fallback on every new track (instead of respecting
+     * [bitPerfectMode]) whenever the device is actually capable of both for that track, and the
+     * host app is expected to hide which one is active (see [UsbAudioManager.abxGroundTruth])
+     * until the user submits a guess via [UsbAudioManager.submitAbxGuess].
+     */
+    val abxTestMode: Boolean
+
+    /**
      * Add a listener to be notified of settings changes.
      *
      * @param listener The listener to add.
@@ -68,5 +77,8 @@ interface UsbDacPreferences {
 
         /** Called when [bitPerfectMode] has changed. */
         fun onBitPerfectModeChanged() {}
+
+        /** Called when [abxTestMode] has changed. */
+        fun onAbxTestModeChanged() {}
     }
 }

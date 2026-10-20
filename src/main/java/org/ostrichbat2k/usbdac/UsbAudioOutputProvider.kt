@@ -28,7 +28,7 @@ import timber.log.Timber as L
  * An [AudioOutputProvider] that reports direct-PCM support for a UAC1/2/3 device's own declared
  * capabilities (bit depth, channel count, and sample rate(s)) and hands out [UsbAudioOutput]
  * instances that stream to it -- plugged into a plain `DefaultAudioSink` (see
- * [UsbAudioManager.createAudioSink]) rather than rolling our own full `AudioSink`, so all of
+ * [UsbAudioManager.resolveActiveSink]) rather than rolling our own full `AudioSink`, so all of
  * `DefaultAudioSink`'s buffering/retry/stall-recovery logic applies to USB output the same way it
  * already does for normal AudioTrack output.
  *
@@ -63,7 +63,7 @@ class UsbAudioOutputProvider(
     // activateDac's UAC3 Cluster Descriptor fetch, or that same function's stereo-assumption
     // fallback if even that fails -- see UacPlaybackTopology.channelCount's doc comment.
     // session.topology is always one activateDac has already resolved by the time a provider is
-    // constructed (see UsbAudioManager.createAudioSink), so no fallback is needed here too.
+    // constructed (see UsbAudioManager.resolveActiveSink), so no fallback is needed here too.
     // Assumed constant across every format/alt-setting this device offers -- channel count
     // hasn't been observed to vary by bit depth on any device tested against.
     val channels: Int = session.topology.channelCount

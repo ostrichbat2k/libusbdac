@@ -36,16 +36,40 @@ UAC3 interface.
   sample rates).
 - Per-track dynamic format matching: a device offering multiple bit
   depths (e.g. 16-bit and 24-bit alt-settings) switches alt-setting per
-  track instead of locking the whole session to one fixed format.
+  track instead of locking the whole session to one fixed format, and
+  the clock-frequency `SET_CUR` is re-applied on every genuinely new
+  track rather than assumed from a cached rate.
 - High/full-speed-aware isochronous pacing (125µs vs. 1ms packet
   scheduling), with explicit wall-clock pacing rather than trusting the
   kernel's URB completion timing alone.
 - Hardware volume/mute control via the device's Feature Unit, including
-  graceful handling of devices whose `GET_CUR` readback doesn't work.
+  graceful handling of devices whose `GET_CUR` readback doesn't work --
+  and kept mirrored with Android's `STREAM_MUSIC` volume across route
+  switches, so loudness doesn't jump just because a track moved between
+  the DAC's own hardware gain and the system mixer.
 - Falls back to the host app's normal audio path per-track (not per
   session) for formats the device can't take directly, and releases the
   USB claim back to the kernel driver while idle so Android's own USB
-  audio HAL can use the same physical device.
+  audio HAL can use the same physical device. Release/reclaim ordering
+  matches what the kernel's USB Audio Class driver actually requires
+  (control vs. streaming interface), so toggling bit-perfect mode or
+  unplugging mid-track never permanently wedges the device's fallback
+  path -- confirmed against the real kernel source, not just by retrying
+  until it seemed to work.
+- Never permanently evicts a composite device's non-audio interfaces
+  (e.g. an inline remote's HID interface) -- the kernel-driver detach
+  needed to claim the audio interfaces hands everything else straight
+  back.
+- A read-only `UsbDeviceCapabilities` snapshot (vendor/product IDs, the
+  playback topology, and every interface on the device's active
+  configuration with its class and role) for a host app's own
+  Capabilities/about screen, independent of whether bit-perfect mode
+  ever actually activates.
+- Optional built-in blind ABX test mode: secretly alternates bit-perfect
+  and fallback routing per track (reusing the same per-track routing
+  path, no mid-track switching), tracks a running correct/total score,
+  and keeps the two routes' loudness forced in sync for the duration of
+  a trial so level alone can't give away the hidden answer.
 
 ## Requirements
 
@@ -59,8 +83,8 @@ UAC3 interface.
 
 | Class | Role |
 | --- | --- |
-| `UsbAudioManager` | Entry point. Owns device detection, permission handling, session activation, and the `AudioSink` the host wires into its player. |
-| `UsbAudioDescriptorParser` / `UacPlaybackTopology` | Parses a device's USB Audio Class configuration descriptor into the entities (clock source, feature unit, mixer unit, streaming formats) the rest of the library needs. |
+| `UsbAudioManager` | Entry point. Owns device detection, permission handling, session activation, claim/release lifecycle, the ABX test harness, and the `AudioSink` the host wires into its player. Publishes `capabilities: StateFlow<UsbDeviceCapabilities?>` and `blockPlayback: StateFlow<Boolean>` for a host's UI. |
+| `UsbAudioDescriptorParser` / `UacPlaybackTopology` | Parses a device's USB Audio Class configuration descriptor into the entities (clock source, feature unit, mixer unit, streaming formats) the rest of the library needs, and into the `UsbDeviceCapabilities`/`UsbInterfaceInfo` snapshot exposed for display. |
 | `UsbAudioController` | Low-level UAC control-transfer calls (clock frequency, volume, mute, power domain) addressed by entity ID. |
 | `UsbNative` / `usb_native.cpp` | Native isochronous transfer layer: raw `USBDEVFS_DISCONNECT`/URB submission, since `UsbDeviceConnection` doesn't expose either. |
 | `UsbAudioOutput` / `UsbAudioOutputProvider` | Implements Media3's `AudioOutput`/`AudioOutputProvider`, handing a plain `DefaultAudioSink` a native isochronous stream to write to. |
@@ -97,6 +121,17 @@ suspend fun beforeRestoringPlayback() {
     usbAudioManager.awaitActivation()
 }
 ```
+
+`UsbAudioOutput`'s own `pause()` schedules releasing the USB claim after a
+short grace period (so a quick pause/resume doesn't pay the full hand-off
+cost), but a host that knows playback stopped for a reason that *isn't*
+momentary -- most notably losing Android audio focus to another app --
+should call `usbAudioManager.releaseClaim(delayMs = 0)` itself right away.
+Audio focus loss in particular is worth reacting to immediately: Android
+can grant the new app focus and let it start opening the device before
+this app's own focus-loss callback even arrives, so every millisecond this
+library still holds the claim after that point is a millisecond more that
+the other app's first attempt is likely to fail.
 
 ## Building
 

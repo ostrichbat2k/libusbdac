@@ -19,6 +19,7 @@
 package org.ostrichbat2k.usbdac
 
 import android.content.Context
+import android.hardware.usb.UsbConstants
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbInterface
@@ -200,6 +201,31 @@ object UsbAudioController {
             "Activated UAC${topology.uacVersion} session: config=${targetConfig.id} " +
                 "control=${control.id} streaming=${topology.streamingInterfaceNumber} " +
                 "alts=${streamingAlts.keys}")
+
+        // The disconnect-everything sweep above was necessary for setConfiguration() to succeed
+        // (confirmed, reproduced: filtering it down to just audio interfaces makes
+        // setConfiguration() itself fail outright -- proc_setconfig really does require every
+        // interface of the device free, not just the ones we care about), but it leaves every
+        // non-audio interface -- e.g. a composite headset's own inline-remote HID interface(s),
+        // not part of the Audio Interface Collection -- evicted with nothing to ever reclaim it.
+        // Unlike control/streaming (explicitly given back by releaseToKernel), nothing else here
+        // ever reconnects them: confirmed, reproduced, this silently and permanently killed the
+        // kernel's usbhid binding to a real EarPods remote the first time any track ever
+        // streamed (`adb shell getevent -lp` lost the device, button presses stopped doing
+        // anything), for the rest of the session. claimInterface(force=true) followed by an
+        // immediate releaseInterface() is the only tool this codebase has to turn "evicted,
+        // unclaimed" back into a real USBDEVFS_CONNECT/device_attach() (see releaseToKernel's own
+        // doc comment) -- Auxio never wants to hold these, so release happens right away.
+        for (i in 0 until targetConfig.interfaceCount) {
+            val iface = targetConfig.getInterface(i)
+            if (iface.interfaceClass == UsbConstants.USB_CLASS_AUDIO) continue
+            if (connection.claimInterface(iface, true)) {
+                connection.releaseInterface(iface)
+            } else {
+                L.w("Could not give non-audio interface ${iface.id} back to the kernel")
+            }
+        }
+
         return UsbAudioSession(device, connection, topology, control, streamingAlts)
     }
 
@@ -217,15 +243,31 @@ object UsbAudioController {
      * would make iso transfers look completely clean at our claimed interface while the device's
      * actual output stage got reconfigured out from under us by the competing driver. Calling
      * this again immediately before the first packet goes out closes that window.
+     *
+     * Only ever targets audio-class interfaces -- confirmed, reproduced: a composite device like
+     * a headset with its own inline remote exposes that remote as one or more entirely separate
+     * class=HID interfaces (not part of the Audio Interface Collection this function cares
+     * about), and the raw USBDEVFS_DISCONNECT ioctl this calls doesn't distinguish "ours" from
+     * "someone else's" -- it evicts whatever kernel driver (usbhid included) is currently bound
+     * to whatever interface number it's given. Called before every single track, unfiltered this
+     * used to permanently kill the kernel's usbhid binding to the remote the first time any track
+     * ever streamed, with nothing anywhere in this codebase ever reconnecting it afterward
+     * (unlike the control/streaming interfaces, which [releaseToKernel] explicitly hands back) --
+     * confirmed via `adb shell getevent -lp`: the remote's input device vanished the moment
+     * streaming started and never came back, and physical button presses stopped doing anything.
      */
     fun reassertKernelEviction(session: UsbAudioSession) {
         val fd = session.connection.fileDescriptor
         val defaultConfig = session.device.getConfiguration(0)
         var disconnected = 0
+        var audioInterfaces = 0
         for (i in 0 until defaultConfig.interfaceCount) {
-            if (UsbNative.disconnectKernelDriver(fd, defaultConfig.getInterface(i).id)) disconnected++
+            val iface = defaultConfig.getInterface(i)
+            if (iface.interfaceClass != UsbConstants.USB_CLASS_AUDIO) continue
+            audioInterfaces++
+            if (UsbNative.disconnectKernelDriver(fd, iface.id)) disconnected++
         }
-        L.i("Re-evicted $disconnected/${defaultConfig.interfaceCount} interfaces before streaming")
+        L.i("Re-evicted $disconnected/$audioInterfaces audio interfaces before streaming")
     }
 
     /**

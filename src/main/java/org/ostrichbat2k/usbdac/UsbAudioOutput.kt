@@ -150,12 +150,18 @@ class UsbAudioOutput(
     }
 
     /**
-     * Claims the interface, negotiates the clock, and starts the native streaming thread --
-     * everything needed to go from "not currently using the DAC" to "audibly streaming to it".
-     * Run once at construction (see [init]), and again from [play] whenever [pause] has released
-     * the claim back to Android in the meantime, since the hardware clock/mute state can't be
-     * assumed to have survived that -- another app (or Android's own UsbAlsaManager) may well
-     * have used the device for something else entirely while we didn't hold it.
+     * Claims the interface and starts the native streaming thread -- everything needed to go from
+     * "not currently using the DAC" to "audibly streaming to it". Run once at construction (see
+     * [init]), and again from [play] whenever [pause] has stopped the stream in the meantime.
+     *
+     * Only actually renegotiates the clock/mute/volume when [UsbAudioManager.requestClaim] reports
+     * a genuine [UsbAudioManager.ClaimOutcome.RECLAIMED] -- i.e. the interface was truly handed
+     * back to the kernel (or another app) at some point and could have been touched -- rather than
+     * [UsbAudioManager.ClaimOutcome.ALREADY_CLAIMED], where nothing else could have changed
+     * anything since this same instance last confirmed it. [pause] always stops the stream, but
+     * doesn't necessarily let the *claim* lapse -- see [UsbAudioManager.releaseClaim]'s own grace
+     * period -- so a quick pause/resume within that window hits the cheap path, and only a resume
+     * after a genuine release pays the full relock cost.
      *
      * Returns false on failure instead of throwing, unlike the exception [init] turns a false
      * return into -- a failure here while resuming from [pause] shouldn't crash playback, it
@@ -164,7 +170,8 @@ class UsbAudioOutput(
      * eventually notices and flushes, same as any other genuine stall.
      */
     private fun activateAndStream(): Boolean {
-        if (!usbAudioManager.requestClaim()) {
+        val claim = usbAudioManager.requestClaim()
+        if (claim == UsbAudioManager.ClaimOutcome.FAILED) {
             L.w("UsbAudioOutput: could not claim USB interface for streaming")
             return false
         }
@@ -179,6 +186,24 @@ class UsbAudioOutput(
         if (!usbAudioManager.ensureFormatActive(format, sampleRateHz)) {
             L.w("UsbAudioOutput: failed to select alt-setting for ${format.bitResolution}-bit")
             return false
+        }
+
+        if (claim == UsbAudioManager.ClaimOutcome.ALREADY_CLAIMED) {
+            // Nothing else could have touched the device since this same instance last set it up
+            // -- requestClaim() never actually let go of the interface (the release grace period
+            // canceled before it ever fired), so the clock lock, mute state, and volume are
+            // exactly how this instance last left them; ensureFormatActive() above already
+            // confirmed the alt-setting itself didn't need reselecting either. Confirmed,
+            // reproduced: redoing the full relock/volume/settle/poll dance below unconditionally
+            // on *every* resume -- even one that never actually lost the claim -- cost 600ms-2s+
+            // of silence every single pause/resume, the exact "real hand-off cost" the release
+            // grace period was supposed to be sparing callers from in the first place, but never
+            // actually did (the grace period only ever saved the cheap ensureFormatActive()
+            // alt-setting reselect, not any of this).
+            startStreamingThread()
+            activated = true
+            usbAudioManager.notifyStreamingStarted()
+            return true
         }
 
         // Mute before touching the clock at all, not after -- a clock-frequency change makes the

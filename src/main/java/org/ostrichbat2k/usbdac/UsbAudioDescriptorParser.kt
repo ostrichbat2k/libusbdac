@@ -83,6 +83,18 @@ object UsbAudioDescriptorParser {
     // come from a separate FORMAT_TYPE descriptor that follows it.
     private const val AS2_FORMAT_TYPE = 0x02
 
+    // bmFormats bit 0 (UAC2 Table A-19, UAC3 Table A-13): Type I PCM. Only the field's lowest
+    // byte needs reading to test it, regardless of whether the field itself is 4 bytes (UAC2) or
+    // 8 (UAC3), since bit 0 always lives in the first byte of a little-endian bitmap. Confirmed
+    // necessary against a real device (FiiO Snowsky Tiny A): its 4th alt setting is raw bitstream
+    // DSD (bmFormats=0x80000000) but otherwise parses byte-for-byte identically to an ordinary
+    // 32-bit PCM alt setting -- same bFormatType, same bSubslotSize/bBitResolution in the
+    // FORMAT_TYPE descriptor that follows. bmFormats is the only field that actually
+    // distinguishes them; without checking it, a PCM track's format matcher could tie-break onto
+    // the DSD alt setting and stream ordinary linear PCM into an endpoint that only accepts a raw
+    // DSD bitstream.
+    private const val FORMAT_BIT_PCM = 0x01
+
     private const val TERMINAL_USB_STREAMING = 0x0101
 
     // USB Endpoint Descriptor bmAttributes synchronization-type field (bits 3:2).
@@ -367,9 +379,18 @@ object UsbAudioDescriptorParser {
                         val terminalLink = bytes.u8(3)
                         if (terminalLink == usbStreamingTerminalId) {
                             streamingInterfaceNumber = currentInterfaceNumber
-                            pendingClusterId = bytes.u16(8) // wClusterDescrID
-                            pendingSubslotSize = bytes.u8(18) // bSubslotSize
-                            pendingBitResolution = bytes.u8(19) // bBitResolution
+                            // bmFormats at offset 10 (bLength/type/subtype/terminalLink each 1
+                            // byte, bmControls 4 bytes, wClusterDescrID 2 bytes, then this 8-byte
+                            // bitmap in UAC3) -- see FORMAT_BIT_PCM's doc comment. Recording
+                            // subslot/bit-resolution only for a PCM alt setting means a non-PCM
+                            // one (e.g. DSD) is excluded the same way the UAC2 parser excludes
+                            // it: pendingBitResolution stays at its reset default and
+                            // flushPendingFormat's existing check skips adding it.
+                            if ((bytes.u8(10) and FORMAT_BIT_PCM) != 0) {
+                                pendingClusterId = bytes.u16(8) // wClusterDescrID
+                                pendingSubslotSize = bytes.u8(18) // bSubslotSize
+                                pendingBitResolution = bytes.u8(19) // bBitResolution
+                            }
                         }
                     }
                 }
@@ -465,6 +486,13 @@ object UsbAudioDescriptorParser {
         var pendingBitResolution = -1
         var pendingSubslotSize = -1
         var isPendingTerminalLinked = false
+        // Set from AS_GENERAL's bmFormats, independently of isPendingTerminalLinked (which only
+        // tracks whether this alt setting's AS_GENERAL is linked to our USB streaming terminal --
+        // streamingInterfaceNumber still needs to resolve correctly even on a device whose only
+        // alt settings happen to be non-PCM). Gates AS2_FORMAT_TYPE below instead, so a non-PCM
+        // alt setting's bSubslotSize/bBitResolution never get recorded, and flushPendingFormat's
+        // existing pendingBitResolution > 0 check then naturally excludes it from formatsByInterface.
+        var pendingFormatIsPcm = false
 
         fun flushPendingFormat(interfaceNumber: Int) {
             if (pendingAltSetting >= 0 && pendingEndpointAddress >= 0 && pendingBitResolution > 0) {
@@ -487,6 +515,7 @@ object UsbAudioDescriptorParser {
             pendingBitResolution = -1
             pendingSubslotSize = -1
             isPendingTerminalLinked = false
+            pendingFormatIsPcm = false
         }
 
         for ((type, bytes) in entries) {
@@ -550,9 +579,13 @@ object UsbAudioDescriptorParser {
                                 if (isPendingTerminalLinked) {
                                     streamingInterfaceNumber = currentInterfaceNumber
                                 }
+                                // bmFormats at offset 6 (bLength/type/subtype/terminalLink/
+                                // bmControls/bFormatType each 1 byte, then this 4-byte bitmap) --
+                                // see FORMAT_BIT_PCM's doc comment.
+                                pendingFormatIsPcm = (bytes.u8(6) and FORMAT_BIT_PCM) != 0
                             }
                             AS2_FORMAT_TYPE -> {
-                                if (isPendingTerminalLinked) {
+                                if (isPendingTerminalLinked && pendingFormatIsPcm) {
                                     pendingSubslotSize = bytes.u8(4) // bSubslotSize
                                     pendingBitResolution = bytes.u8(5) // bBitResolution
                                 }

@@ -64,7 +64,9 @@ UAC3 interface.
   playback topology, and every interface on the device's active
   configuration with its class and role) for a host app's own
   Capabilities/about screen, independent of whether bit-perfect mode
-  ever actually activates.
+  ever actually activates. Non-PCM alt settings a device declares (e.g.
+  raw DSD) are parsed and included in this snapshot too, rather than
+  being silently dropped the way they are from playback selection.
 - Optional built-in blind ABX test mode: secretly alternates bit-perfect
   and fallback routing per track (reusing the same per-track routing
   path, no mid-track switching), tracks a running correct/total score,
@@ -83,8 +85,11 @@ UAC3 interface.
 
 | Class | Role |
 | --- | --- |
-| `UsbAudioManager` | Entry point. Owns device detection, permission handling, session activation, claim/release lifecycle, the ABX test harness, and the `AudioSink` the host wires into its player. Publishes `capabilities: StateFlow<UsbDeviceCapabilities?>` and `blockPlayback: StateFlow<Boolean>` for a host's UI. |
-| `UsbAudioDescriptorParser` / `UacPlaybackTopology` | Parses a device's USB Audio Class configuration descriptor into the entities (clock source, feature unit, mixer unit, streaming formats) the rest of the library needs, and into the `UsbDeviceCapabilities`/`UsbInterfaceInfo` snapshot exposed for display. |
+| `UsbAudioManager` | Entry point and thin wrapper: delegates device detection to `UsbDeviceDiscovery`, volume/mute to `UsbVolumeController`, and claim/release hand-off to `UsbClaimController`, while still owning session activation, the ABX test harness, and the `AudioSink` the host wires into its player. Publishes `capabilities: StateFlow<UsbDeviceCapabilities?>` and `blockPlayback: StateFlow<Boolean>` for a host's UI. |
+| `UsbDeviceDiscovery` | Tracks attached USB Audio Class devices and their permission state; owns the `ACTION_USB_DEVICE_ATTACHED`/`DETACHED`/permission-result `BroadcastReceiver`. |
+| `UsbVolumeController` | All hardware volume/mute decision logic: the Feature Unit read/write path, the unity-gain hand-off to Android's HAL, and mirroring with `STREAM_MUSIC` across route switches. |
+| `UsbClaimController` | Who currently holds the raw USB interface -- this library's own streaming path or Android's kernel-driver-backed USB-audio HAL -- and the hand-off between them, including the fallback that fully releases the connection (rather than just reclaiming it) when HAL doesn't recognize the device within a bounded wait. |
+| `UsbAudioDescriptorParser` / `UacPlaybackTopology` | Parses a device's USB Audio Class configuration descriptor into the entities (clock source, feature unit, mixer unit, streaming formats, non-PCM alt settings) the rest of the library needs, and into the `UsbDeviceCapabilities`/`UsbInterfaceInfo` snapshot exposed for display. |
 | `UsbAudioController` | Low-level UAC control-transfer calls (clock frequency, volume, mute, power domain) addressed by entity ID. |
 | `UsbNative` / `usb_native.cpp` | Native isochronous transfer layer: raw `USBDEVFS_DISCONNECT`/URB submission, since `UsbDeviceConnection` doesn't expose either. |
 | `UsbAudioOutput` / `UsbAudioOutputProvider` | Implements Media3's `AudioOutput`/`AudioOutputProvider`, handing a plain `DefaultAudioSink` a native isochronous stream to write to. |

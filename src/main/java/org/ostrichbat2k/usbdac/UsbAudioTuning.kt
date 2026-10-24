@@ -18,6 +18,12 @@
 
 package org.ostrichbat2k.usbdac
 
+import org.ostrichbat2k.usbdac.claim.UsbClaimControllerImpl
+import org.ostrichbat2k.usbdac.diagnostics.UsbDiagnosticLog
+import org.ostrichbat2k.usbdac.protocol.UsbAudioController
+import org.ostrichbat2k.usbdac.protocol.UsbAudioDescriptorHelper
+import org.ostrichbat2k.usbdac.streaming.PcmRingBuffer
+import org.ostrichbat2k.usbdac.streaming.UsbAudioOutput
 /**
  * Every tuning/config knob used across the library's components, in one place rather than one
  * private constant per class -- timing margins, retry counts, buffer sizing, and the couple of

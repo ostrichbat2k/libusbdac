@@ -18,10 +18,13 @@
 
 package org.ostrichbat2k.usbdac
 
+import org.ostrichbat2k.usbdac.claim.UsbClaimController
+import org.ostrichbat2k.usbdac.protocol.UacStreamFormat
+import org.ostrichbat2k.usbdac.protocol.UsbAudioSession
+import org.ostrichbat2k.usbdac.streaming.RoutingAudioSink
 import android.hardware.usb.UsbDevice
 import androidx.media3.exoplayer.audio.AudioSink
 import kotlinx.coroutines.CompletableDeferred
-import org.ostrichbat2k.usbdac.api.UsbClaimController
 
 /**
  * Everything that decides whether [UsbAudioManagerImpl.ensureFormatActive] needs to reassert the

@@ -18,6 +18,37 @@
 
 package org.ostrichbat2k.usbdac
 
+import org.ostrichbat2k.usbdac.UsbAudioManager.AbxStats
+import org.ostrichbat2k.usbdac.UsbAudioManager.ClaimOutcome
+import org.ostrichbat2k.usbdac.UsbAudioManager.PlaybackRoute
+import org.ostrichbat2k.usbdac.abx.UsbAbxTester
+import org.ostrichbat2k.usbdac.abx.UsbAbxTesterImpl
+import org.ostrichbat2k.usbdac.activation.UsbDacActivator
+import org.ostrichbat2k.usbdac.activation.UsbDacActivatorImpl
+import org.ostrichbat2k.usbdac.activation.UsbDacDescriptorCache
+import org.ostrichbat2k.usbdac.activation.UsbDacDescriptorCacheImpl
+import org.ostrichbat2k.usbdac.claim.UsbClaimController
+import org.ostrichbat2k.usbdac.claim.UsbClaimControllerImpl
+import org.ostrichbat2k.usbdac.control.UsbControlState
+import org.ostrichbat2k.usbdac.control.UsbControlWriter
+import org.ostrichbat2k.usbdac.control.UsbControlWriterImpl
+import org.ostrichbat2k.usbdac.control.UsbVolumeController
+import org.ostrichbat2k.usbdac.control.UsbVolumeControllerImpl
+import org.ostrichbat2k.usbdac.diagnostics.UsbDiagnosticLog
+import org.ostrichbat2k.usbdac.diagnostics.UsbDiagnosticLogImpl
+import org.ostrichbat2k.usbdac.discovery.UsbAudioDevice
+import org.ostrichbat2k.usbdac.discovery.UsbDeviceDiscovery
+import org.ostrichbat2k.usbdac.discovery.UsbDeviceDiscoveryImpl
+import org.ostrichbat2k.usbdac.protocol.UacPlaybackTopology
+import org.ostrichbat2k.usbdac.protocol.UacStreamFormat
+import org.ostrichbat2k.usbdac.protocol.UsbAudioController
+import org.ostrichbat2k.usbdac.protocol.UsbAudioSession
+import org.ostrichbat2k.usbdac.protocol.UsbDeviceCapabilities
+import org.ostrichbat2k.usbdac.streaming.IsoPacketScheduler
+import org.ostrichbat2k.usbdac.streaming.RoutingAudioSink
+import org.ostrichbat2k.usbdac.streaming.UsbAudioOutput
+import org.ostrichbat2k.usbdac.streaming.UsbAudioOutputProvider
+import org.ostrichbat2k.usbdac.streaming.UsbPipelineStats
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -34,19 +65,6 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
-import org.ostrichbat2k.usbdac.api.UsbAbxTester
-import org.ostrichbat2k.usbdac.api.UsbAudioManager
-import org.ostrichbat2k.usbdac.api.UsbAudioManager.AbxStats
-import org.ostrichbat2k.usbdac.api.UsbAudioManager.ClaimOutcome
-import org.ostrichbat2k.usbdac.api.UsbAudioManager.PlaybackRoute
-import org.ostrichbat2k.usbdac.api.UsbClaimController
-import org.ostrichbat2k.usbdac.api.UsbControlWriter
-import org.ostrichbat2k.usbdac.api.UsbDacActivator
-import org.ostrichbat2k.usbdac.api.UsbDacDescriptorCache
-import org.ostrichbat2k.usbdac.api.UsbDacPreferences
-import org.ostrichbat2k.usbdac.api.UsbDeviceDiscovery
-import org.ostrichbat2k.usbdac.api.UsbDiagnosticLog
-import org.ostrichbat2k.usbdac.api.UsbVolumeController
 import timber.log.Timber as L
 
 /**

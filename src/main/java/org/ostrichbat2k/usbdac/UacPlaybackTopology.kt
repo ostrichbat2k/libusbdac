@@ -35,6 +35,25 @@ data class UacStreamFormat(
     val sampleRates: List<Int> = emptyList(),
 )
 
+/**
+ * A non-PCM alt setting found on the streaming interface (e.g. raw DSD) -- excluded from
+ * [UacPlaybackTopology.formats] since nothing in this codebase ever selects it for playback (see
+ * [UsbAudioDescriptorParser]'s `FORMAT_BIT_PCM` doc comment), but still surfaced here so it isn't
+ * simply invisible on a capabilities/diagnostics screen.
+ */
+data class UacNonPcmFormat(
+    val alternateSetting: Int,
+    val endpointAddress: Int,
+    val maxPacketSize: Int,
+    /**
+     * True if bmFormats bit 31 ("raw data") is set -- the real-world convention for DSD-over-USB,
+     * confirmed on a real device (see [UsbAudioDescriptorParser]'s `RAW_DATA_BYTE_MASK` doc
+     * comment). False means "non-PCM for some other declared reason" (e.g. a genuinely compressed
+     * Type II/III format), which this parser doesn't otherwise distinguish.
+     */
+    val isRawData: Boolean,
+)
+
 /** The USB Audio Class playback topology discovered on a device: enough to start a stream. */
 data class UacPlaybackTopology(
     val configurationValue: Int,
@@ -86,6 +105,8 @@ data class UacPlaybackTopology(
      */
     val channelCount: Int,
     val formats: List<UacStreamFormat>,
+    /** See [UacNonPcmFormat]. Always empty on UAC 1.0, which has no bmFormats bitmap to exclude by. */
+    val nonPcmFormats: List<UacNonPcmFormat> = emptyList(),
 )
 
 /**

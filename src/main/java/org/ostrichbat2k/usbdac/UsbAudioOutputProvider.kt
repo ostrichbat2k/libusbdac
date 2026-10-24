@@ -161,9 +161,45 @@ class UsbAudioOutputProvider(
                 f.sampleRate in acceptedSampleRates(candidate)
         }
 
+    /**
+     * The best integer device format to convert *float* PCM down to. ExoPlayer never actually
+     * hands a custom `AudioOutputProvider` real 32-bit integer PCM, no matter what the decoder
+     * produced or what this provider claims to accept: `DefaultAudioSink.configure()`
+     * unconditionally funnels every `MimeTypes.AUDIO_RAW` input through exactly one of two fixed
+     * internal processors -- `ToInt16PcmAudioProcessor` or `ToFloatPcmAudioProcessor` -- *before*
+     * this provider ever sees the format (confirmed by reading `DefaultAudioSink.configure()`
+     * and `shouldUseFloatOutput()` directly; there is no custom-provider escape hatch from this).
+     * So a 32-bit source that `FfmpegAudioDecoder.OUTPUT_MODE_NATIVE_INTEGER` decoded exactly
+     * (see that mode's doc comment: FFmpeg's own FLAC/ALAC/PCM decoders pick 16- or 32-bit based
+     * on the real source bps) always arrives here as float -- `shouldUseFloatOutput()` is keyed
+     * on the *decoder's* reported encoding being wider than 16-bit, and the USB sink is built
+     * with `enableFloatOutput = true` specifically so that rewrite lands on float, not a forced
+     * 16-bit truncation. (An earlier version of this method matched on
+     * `C.ENCODING_PCM_32BIT` instead, on the wrong assumption that the real 32-bit decode would
+     * reach this provider unmodified -- confirmed, reproduced: it silently forced every >16-bit
+     * source, including a genuine 24-bit FLAC, down to 16-bit with no warning, since that
+     * encoding can structurally never arrive here to match against.)
+     *
+     * This picks the device's own *smallest* integer bit depth that's still wide enough to hold
+     * real 24-bit content (24-bit when the device offers it, 32-bit only as a fallback): both are
+     * an equally lossless, exact round-trip for it (a 24-bit target reconstructs the original
+     * integer directly; a 32-bit one reconstructs it scaled up by a fixed power-of-two factor --
+     * float32's mantissa represents either exactly), so there's no fidelity reason to prefer the
+     * wider one, only a real cost: 33% more bytes over USB for identical information.
+     */
+    private fun wideIntTargetFormat(targetChannels: Int, sampleRate: Int): UacStreamFormat? =
+        allFormats
+            .filter { it.subslotSize >= 3 && targetChannels == channels && sampleRate in acceptedSampleRates(it) }
+            .minByOrNull { it.subslotSize }
+
     override fun getFormatSupport(formatConfig: AudioOutputProvider.FormatConfig): AudioOutputProvider.FormatSupport {
         val format = formatConfig.format
-        val match = matchingFormat(format)
+        val match =
+            if (format.pcmEncoding == C.ENCODING_PCM_FLOAT) {
+                wideIntTargetFormat(format.channelCount, format.sampleRate)
+            } else {
+                matchingFormat(format)
+            }
         // Logged on every track (not just failures) -- the file's actual decoded format, printed
         // here, is what made the earlier 16-bit-vs-24-bit byte-alignment mismatch and the 96kHz
         // rejection both obvious from a single logcat capture instead of having to cross-
@@ -184,9 +220,15 @@ class UsbAudioOutputProvider(
     override fun getOutputConfig(formatConfig: AudioOutputProvider.FormatConfig): AudioOutputProvider.OutputConfig {
         val format = formatConfig.format
         // getFormatSupport already gated on a match existing for this exact format/encoding --
-        // this just has to agree with it, requesting the matched device format's own real
-        // integer encoding.
-        val encoding = matchingFormat(format)?.let { encodingFor(it.subslotSize) } ?: C.ENCODING_PCM_16BIT
+        // this just has to agree with it. Float input stays float all the way to UsbAudioOutput
+        // (which converts it to whatever wideIntTargetFormat picked); everything else requests
+        // the matched device format's own real integer encoding.
+        val encoding =
+            if (format.pcmEncoding == C.ENCODING_PCM_FLOAT) {
+                C.ENCODING_PCM_FLOAT
+            } else {
+                matchingFormat(format)?.let { encodingFor(it.subslotSize) } ?: C.ENCODING_PCM_16BIT
+            }
         val channelMask = channelMaskFor(channels)
         return AudioOutputProvider.OutputConfig.Builder()
             .setEncoding(encoding)
@@ -202,15 +244,51 @@ class UsbAudioOutputProvider(
         // Only called when DefaultAudioSink has already decided the OutputConfig genuinely
         // changed (AudioOutput.canReuseAudioOutput's default contract) -- so this is exactly the
         // point, and the only point, where switching the device's alt-setting is actually needed.
+        val isFloatInput = config.encoding == C.ENCODING_PCM_FLOAT
         val target =
-            allFormats.firstOrNull { encodingFor(it.subslotSize) == config.encoding }
-                ?: allFormats.first().also {
-                    L.w("UsbAudioOutputProvider: no format matches encoding=${config.encoding}, using ${it.bitResolution}-bit")
-                }
+            if (isFloatInput) {
+                wideIntTargetFormat(channels, config.sampleRate)
+                    ?: allFormats.first().also {
+                        L.w("UsbAudioOutputProvider: no float conversion target at ${config.sampleRate}Hz, using ${it.bitResolution}-bit")
+                    }
+            } else {
+                allFormats.firstOrNull { encodingFor(it.subslotSize) == config.encoding }
+                    ?: allFormats.first().also {
+                        L.w("UsbAudioOutputProvider: no format matches encoding=${config.encoding}, using ${it.bitResolution}-bit")
+                    }
+            }
         L.i(
             "UsbAudioOutputProvider: activating ${target.bitResolution}-bit/alt=${target.alternateSetting} " +
-                "at ${config.sampleRate}Hz for upcoming track")
+                "at ${config.sampleRate}Hz for upcoming track" +
+                (if (isFloatInput) " (converting from float)" else ""))
         usbAudioManager.ensureFormatActive(target, config.sampleRate)
+        // Authoritative Now Playing route report -- RoutingAudioSink.configure() also reports
+        // an immediate, optimistic one right after resolveForConfigure() for UI responsiveness,
+        // but that one derives bit depth from the decoder's own inputFormat.pcmEncoding, which
+        // is wrong whenever this is the float-conversion path (pcmEncoding is PCM_FLOAT, not a
+        // real bit depth at all) -- confirmed, reproduced: the Now Playing screen showed blank,
+        // then (after routing that through controlState.activeFormat instead) a stale leftover
+        // value, because configure() reports before this function -- the only place that
+        // actually knows the real [target] -- has run for this specific track at all
+        // (DefaultAudioSink defers building the AudioOutput until the first handleBuffer call).
+        // This report, right here with the real target this call just resolved, supersedes it.
+        usbAudioManager.reportPlaybackRoute(
+            UsbAudioManager.PlaybackRoute.Direct(
+                bitDepth = target.bitResolution,
+                sampleRateHz = config.sampleRate,
+                channels = channels))
+        // ensureFormatActive() just claimed the interface (if it wasn't already) purely to select
+        // the alt-setting and refresh the control-state UI reads (volume range, bit-perfect
+        // capability) -- getAudioOutput() itself is called whenever DefaultAudioSink decides it
+        // needs a new AudioOutput, which includes merely preparing a track (e.g. opening the Now
+        // Playing screen), well before play() is ever pressed. The UsbAudioOutput constructed
+        // below no longer claims or streams anything on its own (see where its init{} used to be)
+        // -- so without this, that claim here would be the only thing left locking the DAC's
+        // interface away from Android's kernel driver for however long nothing plays. Letting it
+        // go after the normal grace period costs nothing if play() does follow shortly after:
+        // UsbAudioOutput.activateAndStream()'s own requestClaim() call cancels this pending
+        // release and does the real relock at that point either way.
+        usbAudioManager.releaseClaim()
         // Reads usbSettings.volumeDb fresh on every call rather than once at construction time --
         // this provider (and the DefaultAudioSink built from it) is cached and reused for an
         // entire DAC session (see UsbAudioManager.activeSink), while getAudioOutput() itself gets
@@ -219,7 +297,8 @@ class UsbAudioOutputProvider(
         // the next format/rate change silently reverted to whatever was persisted back when this
         // provider was first created, confirmed reproduced as "volume still wrong on a new song"
         // even after explicitly correcting it on the previous one.
-        return UsbAudioOutput(session, target, channels, config.sampleRate, usbSettings.volumeDb, usbAudioManager)
+        return UsbAudioOutput(
+            session, target, channels, config.sampleRate, usbSettings.volumeDb, isFloatInput, usbAudioManager)
     }
 
     override fun addListener(listener: AudioOutputProvider.Listener) {}

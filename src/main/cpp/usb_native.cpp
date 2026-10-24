@@ -33,7 +33,10 @@
 #include <cstring>
 #include <jni.h>
 #include <linux/usbdevice_fs.h>
+#include <mutex>
+#include <new>
 #include <sys/ioctl.h>
+#include <unordered_map>
 
 #define LOG_TAG "UsbNative"
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -41,6 +44,10 @@
 extern "C" JNIEXPORT jboolean JNICALL
 Java_org_ostrichbat2k_usbdac_UsbNative_disconnectKernelDriver(
         JNIEnv* /*env*/, jobject /*thiz*/, jint fd, jint interfaceNumber) {
+    if (fd < 0) {
+        LOGE("disconnectKernelDriver called with invalid fd %d", fd);
+        return JNI_FALSE;
+    }
     struct usbdevfs_ioctl ctl {};
     ctl.ifno = interfaceNumber;
     ctl.ioctl_code = USBDEVFS_DISCONNECT;
@@ -61,6 +68,10 @@ Java_org_ostrichbat2k_usbdac_UsbNative_disconnectKernelDriver(
 // *aggregate* transfer still completes successfully either way.
 extern "C" JNIEXPORT jint JNICALL
 Java_org_ostrichbat2k_usbdac_UsbNative_getUsbSpeed(JNIEnv* /*env*/, jobject /*thiz*/, jint fd) {
+    if (fd < 0) {
+        LOGE("getUsbSpeed called with invalid fd %d", fd);
+        return -1;
+    }
     int ret = ioctl(fd, USBDEVFS_GET_SPEED);
     return (jint) ret;
 }
@@ -89,50 +100,145 @@ struct IsoStream {
     struct usbdevfs_urb** urbs;
 };
 
+// Sane ceilings on caller-supplied sizes. Real usage (see UsbAudioOutput.kt/IsoPacketScheduler.kt)
+// is numUrbs=4, packetsPerUrb in {8, 64}, maxPacketSize well under 1024 -- these caps are
+// generously above that, but exist so a bad/corrupted caller value can't (a) overflow the 32-bit
+// arithmetic that sizes the urb/buffer allocations below, or (b) trigger a multi-gigabyte
+// allocation that looks like a hang rather than a clean, logged failure.
+namespace {
+constexpr jint kMaxNumUrbs = 64;
+constexpr jint kMaxPacketsPerUrb = 4096;
+constexpr jint kMaxPacketSize = 4096;
+}  // namespace
+
+// Handles are opaque integer IDs into this table, never the IsoStream* itself. Two reasons:
+// (1) it lets every entry point validate a handle against a live set before touching any memory,
+// turning a stale/double-closed/garbage handle from the Kotlin side into a logged no-op instead
+// of a use-after-free or double-free; (2) unlike a registry keyed by the raw pointer, a
+// monotonically-increasing ID can never collide with a *different*, later stream that the
+// allocator happens to place at the same freed address (the classic ABA problem) -- once an ID is
+// erased here, it is never reused, regardless of what the heap does with that memory afterward.
+// The lock is only ever held for a map lookup/insert/erase, never across any ioctl, so the
+// per-URB submit/reap hot path (called every ~1-8ms) pays only an uncontended mutex + hash lookup.
+namespace {
+std::mutex g_streamsMutex;
+std::unordered_map<int64_t, IsoStream*> g_streams;
+int64_t g_nextHandle = 1;
+
+IsoStream* lookupStream(jlong handle) {
+    std::lock_guard<std::mutex> lock(g_streamsMutex);
+    auto it = g_streams.find((int64_t) handle);
+    return it != g_streams.end() ? it->second : nullptr;
+}
+}  // namespace
+
+static void freeStream(IsoStream* stream) {
+    if (!stream) return;
+    if (stream->urbs) {
+        for (int i = 0; i < stream->numUrbs; i++) {
+            if (stream->urbs[i]) {
+                free(stream->urbs[i]->buffer);
+                free(stream->urbs[i]);
+            }
+        }
+        delete[] stream->urbs;
+    }
+    delete stream;
+}
+
 extern "C" JNIEXPORT jlong JNICALL
 Java_org_ostrichbat2k_usbdac_UsbNative_openIsoStream(
         JNIEnv* /*env*/, jobject /*thiz*/, jint fd, jint endpointAddress, jint maxPacketSize,
         jint packetsPerUrb, jint numUrbs) {
-    auto* stream = new IsoStream();
-    stream->fd = fd;
-    stream->endpoint = (unsigned char) endpointAddress;
-    stream->packetsPerUrb = packetsPerUrb;
-    stream->numUrbs = numUrbs;
-    stream->bufferLength = (unsigned int) (packetsPerUrb * maxPacketSize);
-    stream->urbs = new struct usbdevfs_urb*[numUrbs];
-
-    size_t urbSize = sizeof(struct usbdevfs_urb) +
-            (size_t) packetsPerUrb * sizeof(struct usbdevfs_iso_packet_desc);
-
-    for (int i = 0; i < numUrbs; i++) {
-        auto* urb = (struct usbdevfs_urb*) calloc(1, urbSize);
-        void* buffer = urb ? malloc(stream->bufferLength) : nullptr;
-        if (!urb || !buffer) {
-            LOGE("Failed to allocate urb/buffer %d", i);
-            free(urb);
-            free(buffer);
-            for (int j = 0; j < i; j++) {
-                free(stream->urbs[j]->buffer);
-                free(stream->urbs[j]);
-            }
-            delete[] stream->urbs;
-            delete stream;
-            return 0;
-        }
-        memset(buffer, 0, stream->bufferLength);
-        urb->type = USBDEVFS_URB_TYPE_ISO;
-        urb->endpoint = stream->endpoint;
-        urb->flags = USBDEVFS_URB_ISO_ASAP;
-        urb->buffer = buffer;
-        urb->usercontext = (void*) (intptr_t) i;
-        // iso_frame_desc[].length, buffer_length, and number_of_packets are set per submission
-        // (see submitIso) since sample rates that don't divide evenly into the 1ms packet
-        // schedule (e.g. 44100 Hz) need a varying number of samples -- and therefore bytes --
-        // per packet, not the fixed maxPacketSize every time.
-        stream->urbs[i] = urb;
+    if (fd < 0) {
+        LOGE("openIsoStream called with invalid fd %d", fd);
+        return 0;
+    }
+    if (endpointAddress < 0 || endpointAddress > 0xFF) {
+        LOGE("openIsoStream called with invalid endpointAddress %d", endpointAddress);
+        return 0;
+    }
+    if (maxPacketSize <= 0 || maxPacketSize > kMaxPacketSize) {
+        LOGE("openIsoStream called with out-of-range maxPacketSize %d", maxPacketSize);
+        return 0;
+    }
+    if (packetsPerUrb <= 0 || packetsPerUrb > kMaxPacketsPerUrb) {
+        LOGE("openIsoStream called with out-of-range packetsPerUrb %d", packetsPerUrb);
+        return 0;
+    }
+    if (numUrbs <= 0 || numUrbs > kMaxNumUrbs) {
+        LOGE("openIsoStream called with out-of-range numUrbs %d", numUrbs);
+        return 0;
     }
 
-    return (jlong) (intptr_t) stream;
+    // Every size below is computed in 64-bit before being narrowed, and checked against a sane
+    // ceiling -- packetsPerUrb/maxPacketSize/numUrbs are caller-controlled ints, and multiplying
+    // them directly as plain int/unsigned int (as the original version did) can silently
+    // overflow and wrap into a too-small allocation that the rest of this file would then write
+    // past the end of, even though every individual argument passed its own range check above.
+    uint64_t bufferLength64 = (uint64_t) packetsPerUrb * (uint64_t) maxPacketSize;
+    uint64_t urbSize64 = sizeof(struct usbdevfs_urb) +
+            (uint64_t) packetsPerUrb * sizeof(struct usbdevfs_iso_packet_desc);
+    if (bufferLength64 == 0 || bufferLength64 > UINT32_MAX || urbSize64 > UINT32_MAX) {
+        LOGE("openIsoStream requested implausible buffer sizes (buffer=%llu urb=%llu)",
+             (unsigned long long) bufferLength64, (unsigned long long) urbSize64);
+        return 0;
+    }
+
+    IsoStream* stream = nullptr;
+    try {
+        // `new` can throw std::bad_alloc under real memory pressure -- letting a C++ exception
+        // propagate across the JNI boundary is undefined behavior (the JVM's unwinder doesn't
+        // understand it and this app crashes unpredictably rather than failing cleanly), so every
+        // throwing call in this function must be inside this try block.
+        stream = new IsoStream();
+        stream->fd = fd;
+        stream->endpoint = (unsigned char) endpointAddress;
+        stream->packetsPerUrb = packetsPerUrb;
+        stream->numUrbs = numUrbs;
+        stream->bufferLength = (unsigned int) bufferLength64;
+        stream->urbs = new struct usbdevfs_urb*[numUrbs];
+        // new T*[n] does not zero-initialize -- without this, the cleanup paths below (which
+        // check `stream->urbs[j]` for null to know what's actually been allocated) would be
+        // reading indeterminate pointers instead of a reliable "not yet allocated" sentinel.
+        memset(stream->urbs, 0, sizeof(struct usbdevfs_urb*) * (size_t) numUrbs);
+
+        size_t urbSize = (size_t) urbSize64;
+        for (int i = 0; i < numUrbs; i++) {
+            auto* urb = (struct usbdevfs_urb*) calloc(1, urbSize);
+            void* buffer = urb ? malloc(stream->bufferLength) : nullptr;
+            if (!urb || !buffer) {
+                LOGE("Failed to allocate urb/buffer %d", i);
+                free(urb);
+                free(buffer);
+                freeStream(stream);
+                return 0;
+            }
+            memset(buffer, 0, stream->bufferLength);
+            urb->type = USBDEVFS_URB_TYPE_ISO;
+            urb->endpoint = stream->endpoint;
+            urb->flags = USBDEVFS_URB_ISO_ASAP;
+            urb->buffer = buffer;
+            urb->usercontext = (void*) (intptr_t) i;
+            // iso_frame_desc[].length, buffer_length, and number_of_packets are set per
+            // submission (see submitIso) since sample rates that don't divide evenly into the
+            // 1ms packet schedule (e.g. 44100 Hz) need a varying number of samples -- and
+            // therefore bytes -- per packet, not the fixed maxPacketSize every time.
+            stream->urbs[i] = urb;
+        }
+    } catch (const std::bad_alloc& e) {
+        LOGE("openIsoStream: allocation threw: %s", e.what());
+        freeStream(stream);
+        return 0;
+    }
+
+    int64_t id;
+    {
+        std::lock_guard<std::mutex> lock(g_streamsMutex);
+        id = g_nextHandle++;
+        g_streams[id] = stream;
+    }
+    return (jlong) id;
 }
 
 // Fills URB [slot] with bytes from [data] (zero-padded if shorter than the total of
@@ -148,8 +254,15 @@ extern "C" JNIEXPORT jboolean JNICALL
 Java_org_ostrichbat2k_usbdac_UsbNative_submitIso(
         JNIEnv* env, jobject /*thiz*/, jlong handle, jint slot, jbyteArray data,
         jintArray packetLengths) {
-    auto* stream = (IsoStream*) (intptr_t) handle;
+    IsoStream* stream = lookupStream(handle);
     if (!stream || slot < 0 || slot >= stream->numUrbs) return JNI_FALSE;
+    if (!data || !packetLengths) {
+        // GetArrayLength/GetByteArrayRegion/GetIntArrayElements on a null jarray is undefined
+        // behavior at the JNI boundary, not a Java-level NullPointerException -- this must be
+        // checked before any of those are called, not after.
+        LOGE("submitIso called with a null data or packetLengths array for slot %d", slot);
+        return JNI_FALSE;
+    }
     struct usbdevfs_urb* urb = stream->urbs[slot];
 
     jsize numPackets = env->GetArrayLength(packetLengths);
@@ -159,12 +272,28 @@ Java_org_ostrichbat2k_usbdac_UsbNative_submitIso(
     }
 
     jint* lengths = env->GetIntArrayElements(packetLengths, nullptr);
+    if (!lengths) {
+        LOGE("GetIntArrayElements failed for slot %d", slot);
+        return JNI_FALSE;
+    }
     unsigned int total = 0;
-    for (jsize p = 0; p < numPackets; p++) {
-        urb->iso_frame_desc[p].length = (unsigned int) lengths[p];
-        total += (unsigned int) lengths[p];
+    bool negativeLength = false;
+    for (jsize p = 0; p < numPackets && !negativeLength; p++) {
+        jint len = lengths[p];
+        if (len < 0) {
+            // A negative length cast to unsigned would silently become huge below, defeating the
+            // bufferLength bounds check that exists specifically to prevent an overflow.
+            negativeLength = true;
+            break;
+        }
+        urb->iso_frame_desc[p].length = (unsigned int) len;
+        total += (unsigned int) len;
     }
     env->ReleaseIntArrayElements(packetLengths, lengths, JNI_ABORT);
+    if (negativeLength) {
+        LOGE("Negative packet length in packetLengths for slot %d", slot);
+        return JNI_FALSE;
+    }
 
     if (total > stream->bufferLength) {
         LOGE("Packet total %u exceeds buffer capacity %u for slot %d", total, stream->bufferLength, slot);
@@ -172,6 +301,10 @@ Java_org_ostrichbat2k_usbdac_UsbNative_submitIso(
     }
 
     jsize dataLen = env->GetArrayLength(data);
+    if (dataLen < 0) {
+        LOGE("GetArrayLength returned negative length for slot %d", slot);
+        return JNI_FALSE;
+    }
     unsigned int toCopy = (unsigned int) dataLen < total ? (unsigned int) dataLen : total;
     if (toCopy > 0) {
         env->GetByteArrayRegion(data, 0, (jsize) toCopy, (jbyte*) urb->buffer);
@@ -198,7 +331,7 @@ Java_org_ostrichbat2k_usbdac_UsbNative_submitIso(
 // on error/cancellation.
 extern "C" JNIEXPORT jint JNICALL
 Java_org_ostrichbat2k_usbdac_UsbNative_reapIso(JNIEnv* /*env*/, jobject /*thiz*/, jlong handle) {
-    auto* stream = (IsoStream*) (intptr_t) handle;
+    IsoStream* stream = lookupStream(handle);
     if (!stream) return -1;
 
     struct usbdevfs_urb* reaped = nullptr;
@@ -217,10 +350,20 @@ Java_org_ostrichbat2k_usbdac_UsbNative_reapIso(JNIEnv* /*env*/, jobject /*thiz*/
     // (each has its own status/actual_length in iso_frame_desc[]). Checking only the aggregate
     // status is exactly the kind of gap that would make a transfer look completely clean while
     // the device received partial or no usable audio data.
+    int numPackets = reaped->number_of_packets;
+    if (numPackets < 0 || numPackets > stream->packetsPerUrb) {
+        // iso_frame_desc[] was allocated for exactly stream->packetsPerUrb entries (see
+        // openIsoStream) -- this should never happen since the kernel only ever reaps a urb we
+        // ourselves submitted, but trusting number_of_packets blindly as a loop bound would turn
+        // any unexpected kernel/driver value into an out-of-bounds read past the array's end.
+        LOGE("Reaped urb slot %ld has implausible number_of_packets=%d (max %d), skipping packet scan",
+             (long) (intptr_t) reaped->usercontext, numPackets, stream->packetsPerUrb);
+        numPackets = 0;
+    }
     int badPackets = 0;
     unsigned int totalActual = 0;
     unsigned int totalExpected = 0;
-    for (int p = 0; p < reaped->number_of_packets; p++) {
+    for (int p = 0; p < numPackets; p++) {
         const auto& desc = reaped->iso_frame_desc[p];
         totalActual += desc.actual_length;
         totalExpected += desc.length;
@@ -239,7 +382,15 @@ Java_org_ostrichbat2k_usbdac_UsbNative_reapIso(JNIEnv* /*env*/, jobject /*thiz*/
              totalActual, totalExpected);
     }
 
-    return (jint) (intptr_t) reaped->usercontext;
+    intptr_t slot = (intptr_t) reaped->usercontext;
+    if (slot < 0 || slot >= stream->numUrbs) {
+        // The caller uses this return value directly as an array index to refill/resubmit --
+        // an out-of-range value here must never reach it.
+        LOGE("Reaped urb has out-of-range usercontext slot=%ld (numUrbs=%d)",
+             (long) slot, stream->numUrbs);
+        return -1;
+    }
+    return (jint) slot;
 }
 
 // Shared by cancelIso() and closeIsoStream() -- both need every outstanding URB discarded
@@ -256,7 +407,7 @@ static void discardAllUrbs(IsoStream* stream) {
 // to call concurrently with reapIso()/submitIso() on another thread, unlike closeIsoStream.
 extern "C" JNIEXPORT void JNICALL
 Java_org_ostrichbat2k_usbdac_UsbNative_cancelIso(JNIEnv* /*env*/, jobject /*thiz*/, jlong handle) {
-    auto* stream = (IsoStream*) (intptr_t) handle;
+    IsoStream* stream = lookupStream(handle);
     if (!stream) return;
     discardAllUrbs(stream);
 }
@@ -266,8 +417,21 @@ Java_org_ostrichbat2k_usbdac_UsbNative_cancelIso(JNIEnv* /*env*/, jobject /*thiz
 // submitIso() on this handle -- this frees the same memory those functions read and write.
 extern "C" JNIEXPORT void JNICALL
 Java_org_ostrichbat2k_usbdac_UsbNative_closeIsoStream(JNIEnv* /*env*/, jobject /*thiz*/, jlong handle) {
-    auto* stream = (IsoStream*) (intptr_t) handle;
-    if (!stream) return;
+    IsoStream* stream;
+    {
+        std::lock_guard<std::mutex> lock(g_streamsMutex);
+        auto it = g_streams.find((int64_t) handle);
+        if (it == g_streams.end()) {
+            // Erasing the handle from the table before anything below frees memory is what
+            // makes a double-close (or a call with a garbage/already-closed handle) a safe,
+            // logged no-op instead of a double-free -- the second call simply never finds it.
+            LOGE("closeIsoStream called with an unknown or already-closed handle %lld",
+                 (long long) handle);
+            return;
+        }
+        stream = it->second;
+        g_streams.erase(it);
+    }
 
     // Callers are required to have already called cancelIso() + joined before this (see this
     // function's own doc comment) -- discarding again here is a harmless no-op safety net, not
@@ -277,10 +441,5 @@ Java_org_ostrichbat2k_usbdac_UsbNative_closeIsoStream(JNIEnv* /*env*/, jobject /
     while (ioctl(stream->fd, USBDEVFS_REAPURBNDELAY, &reaped) == 0) {
         // Drain whatever the kernel still has queued so it can free its own bookkeeping.
     }
-    for (int i = 0; i < stream->numUrbs; i++) {
-        free(stream->urbs[i]->buffer);
-        free(stream->urbs[i]);
-    }
-    delete[] stream->urbs;
-    delete stream;
+    freeStream(stream);
 }

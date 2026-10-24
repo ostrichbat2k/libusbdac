@@ -294,16 +294,15 @@ class UsbAudioOutputProvider(
         // UsbAudioOutput.activateAndStream()'s own requestClaim() call cancels this pending
         // release and does the real relock at that point either way.
         usbAudioManager.releaseClaim()
-        // Reads usbSettings.volumeDb fresh on every call rather than once at construction time --
-        // this provider (and the DefaultAudioSink built from it) is cached and reused for an
-        // entire DAC session (see UsbAudioManager.activeSink), while getAudioOutput() itself gets
-        // called again for every track whose format actually differs. Capturing the volume once
-        // up front meant every later volume-key correction only applied to the current track --
-        // the next format/rate change silently reverted to whatever was persisted back when this
-        // provider was first created, confirmed reproduced as "volume still wrong on a new song"
-        // even after explicitly correcting it on the previous one.
-        return UsbAudioOutput(
-            session, target, channels, config.sampleRate, usbSettings.volumeDb, isFloatInput, usbAudioManager)
+        // Passes usbSettings itself, not usbSettings.volumeDb -- UsbAudioOutput.
+        // restoreVolumeAfterRelock() reads it fresh on every relock, not just once here. This
+        // provider (and the DefaultAudioSink built from it) is cached and reused for an entire DAC
+        // session (see UsbAudioManager.activeSink), while getAudioOutput() itself only gets called
+        // again for a track whose format actually differs -- so a one-time read here, like this
+        // call used to pass, would go stale the moment a volume-key change happened mid-track with
+        // no format change in between, see UsbAudioOutput.restoreVolumeAfterRelock's own doc
+        // comment for the confirmed bug this caused.
+        return UsbAudioOutput(session, target, channels, config.sampleRate, usbSettings, isFloatInput, usbAudioManager)
     }
 
     override fun addListener(listener: AudioOutputProvider.Listener) {}

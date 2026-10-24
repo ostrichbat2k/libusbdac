@@ -25,6 +25,7 @@ import androidx.media3.common.Format
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.exoplayer.audio.AudioSink
 import java.nio.ByteBuffer
+import org.ostrichbat2k.usbdac.api.UsbAudioManager
 
 /**
  * Picks between a USB-direct sink (via [usbAudioManager]) and [fallback] the first time

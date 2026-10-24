@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2026 libusbdac Project
- * UsbVolumeController.kt is part of libusbdac.
+ * UsbVolumeControllerImpl.kt is part of libusbdac.
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -21,6 +21,9 @@ package org.ostrichbat2k.usbdac
 import android.media.AudioManager
 import android.os.Build
 import kotlinx.coroutines.flow.StateFlow
+import org.ostrichbat2k.usbdac.api.UsbAudioManager
+import org.ostrichbat2k.usbdac.api.UsbDacPreferences
+import org.ostrichbat2k.usbdac.api.UsbVolumeController
 
 /**
  * Everything this app decides about USB DAC hardware volume/mute -- as opposed to
@@ -38,13 +41,13 @@ import kotlinx.coroutines.flow.StateFlow
  * both of these silently, since the invariant they rely on was only ever documented as scattered
  * comments pointing at a function in a different file.
  */
-class UsbVolumeController(
+class UsbVolumeControllerImpl(
     private val audioManager: AudioManager,
     private val usbSettings: UsbDacPreferences,
     private val controlState: StateFlow<UsbControlState?>,
     private val playbackRoute: StateFlow<UsbAudioManager.PlaybackRoute>,
     private val logEvent: (String) -> Unit,
-) {
+) : UsbVolumeController {
     private fun currentVolumeRange(): Pair<Int, Int>? = controlState.value?.volumeRange
 
     /**
@@ -76,7 +79,7 @@ class UsbVolumeController(
      * once the interface is released these control transfers need it claimed the same as any
      * other.
      */
-    fun prepareForHalHandoff(session: UsbAudioSession, channelCount: Int) {
+    override fun prepareForHalHandoff(session: UsbAudioSession, channelCount: Int) {
         UsbAudioController.setMute(session, muted = true)
         for (channel in 0..channelCount.coerceAtLeast(2)) {
             val range = UsbAudioController.getVolumeRange(session, channel) ?: continue
@@ -97,7 +100,7 @@ class UsbVolumeController(
      * release attempt, or a bit-perfect track reclaiming it for real) decides the actual level
      * from there, not this call.
      */
-    fun remuteForUnconfirmedHandoff(session: UsbAudioSession) {
+    override fun remuteForUnconfirmedHandoff(session: UsbAudioSession) {
         UsbAudioController.setMute(session, muted = true)
     }
 
@@ -177,7 +180,7 @@ class UsbVolumeController(
      * [AudioManager.setStreamVolume] immediately feeding back into [onStreamMusicChanged] as if
      * the user had just adjusted it externally.
      */
-    fun mirrorDbToStreamMusic(valueDb: Int) {
+    override fun mirrorDbToStreamMusic(valueDb: Int) {
         currentVolumeRange() ?: return
         val percent = curvePercentAtDb(valueDb / 256f)
         val (minIndex, maxIndex) = streamMusicIndexRange()
@@ -198,7 +201,7 @@ class UsbVolumeController(
      * out from under HAL's own active use of it, the same dropout bug
      * [UsbAudioManager.releaseClaim]'s `activeStreamCount` check exists to prevent.
      */
-    fun onStreamMusicChanged(newIndex: Int) {
+    override fun onStreamMusicChanged(newIndex: Int) {
         if (ignoreNextStreamMusicBroadcast) {
             ignoreNextStreamMusicBroadcast = false
             return
@@ -231,7 +234,7 @@ class UsbVolumeController(
      * point of a blind test by giving away which path is live, or worse, making the "wrong" one
      * sound better for a reason that has nothing to do with bit-perfection.
      */
-    fun abxSyncTargetDb(): Int? {
+    override fun abxSyncTargetDb(): Int? {
         val range = currentVolumeRange() ?: return null
         val (minIndex, maxIndex) = streamMusicIndexRange()
         if (maxIndex == minIndex) return null

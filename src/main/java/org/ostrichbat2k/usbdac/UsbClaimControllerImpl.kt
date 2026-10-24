@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2026 libusbdac Project
- * UsbClaimController.kt is part of libusbdac.
+ * UsbClaimControllerImpl.kt is part of libusbdac.
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -28,6 +28,9 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
+import org.ostrichbat2k.usbdac.api.UsbAudioManager
+import org.ostrichbat2k.usbdac.api.UsbClaimController
+import org.ostrichbat2k.usbdac.api.UsbVolumeController
 import timber.log.Timber as L
 
 /**
@@ -53,14 +56,14 @@ import timber.log.Timber as L
  * effects (invalidating its `activeFormat` cache, tearing the session down) -- they stay
  * [UsbAudioManager]'s responsibility, just invoked from here via callback rather than inlined.
  */
-class UsbClaimController(
+class UsbClaimControllerImpl(
     private val audioManager: AudioManager,
     private val volumeController: UsbVolumeController,
     private val getActiveSession: () -> UsbAudioSession?,
     private val onReclaimed: () -> Unit,
     private val onClaimFailed: () -> Unit,
     private val onTakeoverTimeout: () -> Unit,
-) {
+) : UsbClaimController {
     private val claimScheduler =
         Executors.newSingleThreadScheduledExecutor { r ->
             Thread(r, "UsbAudioControl-Claim").apply { isDaemon = true }
@@ -96,17 +99,17 @@ class UsbClaimController(
     @Volatile private var pendingDeactivateOnTimeout = false
 
     /** Called by [UsbAudioOutput] once it's actually claimed and streaming -- see [releaseClaim]. */
-    fun notifyStreamingStarted() {
+    override fun notifyStreamingStarted() {
         activeStreamCount++
     }
 
     /** The inverse of [notifyStreamingStarted] -- call before, not after, releasing anything. */
-    fun notifyStreamingStopped() {
+    override fun notifyStreamingStopped() {
         activeStreamCount = (activeStreamCount - 1).coerceAtLeast(0)
     }
 
     /** Whether we currently hold the raw interface claim -- see [interfaceClaimed]. */
-    fun isClaimed(): Boolean = interfaceClaimed
+    override fun isClaimed(): Boolean = interfaceClaimed
 
     /**
      * For [UsbAudioManager.activateDac]'s tail: its own `UsbAudioController.activate()` call
@@ -114,7 +117,7 @@ class UsbClaimController(
      * discovery/setup, outside of [requestClaim] -- this just records that fact so later
      * [releaseClaim]/[requestClaim] calls agree with reality.
      */
-    fun markAlreadyClaimed() {
+    override fun markAlreadyClaimed() {
         interfaceClaimed = true
     }
 
@@ -123,12 +126,12 @@ class UsbClaimController(
      * hand-back to the kernel) and needs to mark the claim gone without going through the normal
      * [releaseClaim] dance.
      */
-    fun markReleased() {
+    override fun markReleased() {
         interfaceClaimed = false
     }
 
     /** For [UsbAudioManager.deactivateDac], canceling any release scheduled before a teardown. */
-    fun cancelPendingRelease() {
+    override fun cancelPendingRelease() {
         pendingRelease?.cancel(false)
         pendingRelease = null
     }
@@ -137,7 +140,7 @@ class UsbClaimController(
      * For [UsbAudioManager.deactivateDac] to record which device to wait for -- see
      * [awaitAndroidOutputTakeover]'s own comment on why.
      */
-    fun recordDeactivatedDevice(device: UsbDevice?) {
+    override fun recordDeactivatedDevice(device: UsbDevice?) {
         lastDeactivatedDevice = device
     }
 
@@ -155,7 +158,7 @@ class UsbClaimController(
      * why that distinction, not just success/failure, decides whether a resume needs to redo its
      * whole clock/mute/volume relock dance.
      */
-    fun requestClaim(session: UsbAudioSession?): UsbAudioManager.ClaimOutcome {
+    override fun requestClaim(session: UsbAudioSession?): UsbAudioManager.ClaimOutcome {
         pendingRelease?.cancel(false)
         pendingRelease = null
         if (interfaceClaimed) return UsbAudioManager.ClaimOutcome.ALREADY_CLAIMED
@@ -210,7 +213,7 @@ class UsbClaimController(
      * activation, including activateDac's own tail release where nothing was actually trying to
      * use the device via HAL at all.
      */
-    fun releaseClaim(delayMs: Long, awaitAndroidTakeover: Boolean, deactivateOnTimeout: Boolean = false) {
+    override fun releaseClaim(delayMs: Long, awaitAndroidTakeover: Boolean, deactivateOnTimeout: Boolean = false) {
         pendingRelease?.cancel(false)
         if (activeStreamCount > 0) {
             // Something is genuinely streaming right now and still needs the claim -- a caller

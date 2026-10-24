@@ -23,6 +23,8 @@ import androidx.media3.common.C
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.exoplayer.audio.AudioOutput
 import java.nio.ByteBuffer
+import org.ostrichbat2k.usbdac.api.UsbAudioManager
+import org.ostrichbat2k.usbdac.api.UsbDacPreferences
 import timber.log.Timber as L
 
 /**

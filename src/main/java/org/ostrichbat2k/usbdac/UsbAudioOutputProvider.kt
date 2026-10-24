@@ -22,6 +22,8 @@ import android.media.AudioFormat
 import androidx.media3.common.C
 import androidx.media3.exoplayer.audio.AudioOutput
 import androidx.media3.exoplayer.audio.AudioOutputProvider
+import org.ostrichbat2k.usbdac.api.UsbAudioManager
+import org.ostrichbat2k.usbdac.api.UsbDacPreferences
 import timber.log.Timber as L
 
 /**

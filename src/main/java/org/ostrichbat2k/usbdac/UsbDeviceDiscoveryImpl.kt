@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2026 libusbdac Project
- * UsbDeviceDiscovery.kt is part of libusbdac.
+ * UsbDeviceDiscoveryImpl.kt is part of libusbdac.
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -31,6 +31,8 @@ import android.widget.Toast
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import org.ostrichbat2k.usbdac.api.UsbDacPreferences
+import org.ostrichbat2k.usbdac.api.UsbDeviceDiscovery
 import timber.log.Timber as L
 
 /**
@@ -54,16 +56,16 @@ import timber.log.Timber as L
  * attachment" bookkeeping needs pruning whenever the attached-device set changes, same timing as
  * before extraction -- synchronously, right after [devices] itself updates.
  */
-class UsbDeviceDiscovery(
+class UsbDeviceDiscoveryImpl(
     private val context: Context,
     private val usbManager: UsbManager,
     private val usbSettings: UsbDacPreferences,
     private val actionUsbPermission: String,
     private val onDeviceDetached: () -> Unit,
     private val onRefreshed: (List<UsbAudioDevice>) -> Unit = {},
-) {
+) : UsbDeviceDiscovery {
     private val _devices = MutableStateFlow<List<UsbAudioDevice>>(emptyList())
-    val devices: StateFlow<List<UsbAudioDevice>> = _devices.asStateFlow()
+    override val devices: StateFlow<List<UsbAudioDevice>> = _devices.asStateFlow()
 
     private var started = false
     private var knownDeviceNames = emptySet<String>()
@@ -118,7 +120,7 @@ class UsbDeviceDiscovery(
         }
 
     /** Begins listening for USB device attach/detach/permission events. Call once at startup. */
-    fun start() {
+    override fun start() {
         if (started) return
         started = true
 
@@ -138,7 +140,7 @@ class UsbDeviceDiscovery(
     }
 
     /** Requests permission to use [device]. The result arrives asynchronously via broadcast. */
-    fun requestPermission(device: UsbDevice) {
+    override fun requestPermission(device: UsbDevice) {
         val permissionIntent =
             PendingIntent.getBroadcast(
                 context,

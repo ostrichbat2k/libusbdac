@@ -90,7 +90,7 @@ object UsbAudioController {
     private const val AC_POWER_DOMAIN_CONTROL = 0x02
 
     /** The CUR request's bRequest byte for [topology]'s UAC version and GET/SET direction. */
-    private fun curRequest(topology: UacPlaybackTopology, get: Boolean): Int =
+    internal fun curRequest(topology: UacPlaybackTopology, get: Boolean): Int =
         if (topology.uacVersion == 1 && get) UAC1_REQUEST_GET_CUR else UAC_REQUEST_CUR
 
     /**
@@ -99,7 +99,7 @@ object UsbAudioController {
      * rate) is one of these, previously hand-rolled with the same bit-shift arithmetic at each
      * call site instead of sharing this.
      */
-    private fun ByteArray.leUInt(offset: Int, len: Int): Int {
+    internal fun ByteArray.leUInt(offset: Int, len: Int): Int {
         var value = 0
         for (i in 0 until len) {
             value = value or ((this[offset + i].toInt() and 0xFF) shl (8 * i))
@@ -108,7 +108,7 @@ object UsbAudioController {
     }
 
     /** Encodes [value] as [len] little-endian bytes (1-4) -- the write-side counterpart of [leUInt]. */
-    private fun leBytes(value: Int, len: Int): ByteArray = ByteArray(len) { i -> ((value shr (8 * i)) and 0xFF).toByte() }
+    internal fun leBytes(value: Int, len: Int): ByteArray = ByteArray(len) { i -> ((value shr (8 * i)) and 0xFF).toByte() }
 
     const val PD_STATE_D0 = 0
     const val PD_STATE_D1 = 1

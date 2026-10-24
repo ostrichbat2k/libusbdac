@@ -41,8 +41,8 @@ object UsbAudioInspector {
             val configCount = device.configurationCount.coerceAtLeast(1)
             L.i("Inspecting ${device.productName ?: device.deviceName}: $configCount configuration(s)")
             for (i in 0 until configCount) {
-                val bytes = UsbAudioDescriptorParser.fetchConfigurationDescriptor(connection, i) ?: continue
-                val found = UsbAudioDescriptorParser.parseUac3Playback(bytes)
+                val bytes = UsbAudioDescriptorHelper.fetchConfigurationDescriptor(connection, i) ?: continue
+                val found = UsbAudioDescriptorParserUac3.parseUac3Playback(bytes)
                 if (found != null) {
                     topology = found
                     L.i("Config index $i: UAC3 playback topology = $found")

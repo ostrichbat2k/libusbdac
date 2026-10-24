@@ -23,9 +23,9 @@ package org.ostrichbat2k.usbdac
  * private constant per class -- timing margins, retry counts, buffer sizing, and the couple of
  * fixed protocol strings that aren't part of the USB Audio Class spec itself (those stay next to
  * the descriptor-parsing/control-transfer code that interprets them, in
- * [UsbAudioDescriptorParser] and [UsbAudioController]). Several of these were independently
- * tuned against the same real hardware over time (see each one's own doc comment for its actual
- * history) and are easiest to find, compare, and re-tune together here.
+ * [UsbAudioDescriptorHelper], the UAC1/2/3 parsers, and [UsbAudioController]). Several of these
+ * were independently tuned against the same real hardware over time (see each one's own doc
+ * comment for its actual history) and are easiest to find, compare, and re-tune together here.
  */
 internal object UsbAudioTuning {
     /**

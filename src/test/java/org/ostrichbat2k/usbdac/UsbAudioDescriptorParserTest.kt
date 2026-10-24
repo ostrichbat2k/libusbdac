@@ -26,10 +26,10 @@ import org.junit.Test
 
 /**
  * Builds raw USB (standard + UAC class-specific) descriptor bytes for test fixtures, mirroring
- * exactly the byte offsets [UsbAudioDescriptorParser] itself reads (see that file's own doc
+ * exactly the byte offsets the various UAC1/2/3 parsers themselves read (see each one's own doc
  * comments for which real device each offset was confirmed against). Every builder here produces
  * a descriptor exactly as long as the fields it sets require -- not a realistic full-length
- * descriptor -- since the parser never reads past what it uses and [UsbAudioDescriptorParser.walk]
+ * descriptor -- since the parser never reads past what it uses and [UsbAudioDescriptorHelper.walk]
  * only cares about each entry's own declared `bLength`.
  */
 // File-scoped (not members of [D]) so a fixture call's trailing `{ setU8(...) }` lambda --
@@ -115,7 +115,7 @@ private object D {
     fun uac3AsGeneral(terminalLink: Int, clusterId: Int, subslotSize: Int, bitResolution: Int) =
         cs(20, 0x01) {
             setU8(3, terminalLink)
-            // bmFormats bit 0 (offset 10) -- Type I PCM. Without this, UsbAudioDescriptorParser's
+            // bmFormats bit 0 (offset 10) -- Type I PCM. Without this, UsbAudioDescriptorParserUac3's
             // own FORMAT_BIT_PCM check (added for DSD/non-PCM support) treats this alt setting as
             // non-PCM and skips recording bitResolution/subslotSize/clusterId entirely, which is
             // not what any of this file's tests building a "normal" UAC3 alt setting want.
@@ -142,7 +142,7 @@ private object D {
             sources.forEachIndexed { i, s -> setU8(5 + i, s) }
         }
 
-    // 10 bytes, not 4 -- UsbAudioDescriptorParser's FORMAT_BIT_PCM check reads bmFormats at
+    // 10 bytes, not 4 -- UsbAudioDescriptorParserUac2's FORMAT_BIT_PCM check reads bmFormats at
     // offset 6, which only exists once this descriptor is long enough to carry it. Bit 0 there
     // declares Type I PCM; without it the parser treats this as a non-PCM alt setting and skips
     // recording bitResolution/subslotSize, which is not what a "normal" UAC2 alt setting is.
@@ -190,7 +190,7 @@ class UsbAudioDescriptorParserWalkTest {
     fun `splits sequential entries by their declared bLength`() {
         val a = D.configuration(1)
         val b = D.iface(0, 0, 1, 1, 0x30)
-        val entries = UsbAudioDescriptorParser.walk(a + b)
+        val entries = UsbAudioDescriptorHelper.walk(a + b)
         assertEquals(2, entries.size)
         assertEquals(0x02, entries[0].first)
         assertEquals(0x04, entries[1].first)
@@ -202,7 +202,7 @@ class UsbAudioDescriptorParserWalkTest {
     fun `stops without throwing on a malformed zero-length entry`() {
         val a = D.configuration(1)
         val malformed = byteArrayOf(0, 0x04)
-        val entries = UsbAudioDescriptorParser.walk(a + malformed)
+        val entries = UsbAudioDescriptorHelper.walk(a + malformed)
         assertEquals(1, entries.size)
     }
 
@@ -210,13 +210,13 @@ class UsbAudioDescriptorParserWalkTest {
     fun `stops without throwing on a truncated final entry`() {
         val a = D.configuration(1)
         val truncated = byteArrayOf(20, 0x04, 1, 2, 3) // claims length 20, only 5 bytes remain
-        val entries = UsbAudioDescriptorParser.walk(a + truncated)
+        val entries = UsbAudioDescriptorHelper.walk(a + truncated)
         assertEquals(1, entries.size)
     }
 
     @Test
     fun `empty input yields an empty list`() {
-        assertTrue(UsbAudioDescriptorParser.walk(ByteArray(0)).isEmpty())
+        assertTrue(UsbAudioDescriptorHelper.walk(ByteArray(0)).isEmpty())
     }
 }
 
@@ -232,7 +232,7 @@ class UsbAudioDescriptorParserDumpAcTopologyTest {
     fun `does not crash on a UAC2 entity whose subtype collides with UAC3's SELECTOR_UNIT`() {
         val iface = D.iface(number = 0, altSetting = 0, interfaceClass = 1, subClass = 1, protocol = 0x20)
         val featureUnit = D.cs(length = 18, subtype = 0x06) { setU8(4, 20) }
-        UsbAudioDescriptorParser.dumpAcTopology(iface + featureUnit)
+        UsbAudioDescriptorParserUac3.dumpAcTopology(iface + featureUnit)
     }
 
     @Test
@@ -243,7 +243,7 @@ class UsbAudioDescriptorParserDumpAcTopologyTest {
         val mixer = D.uac3MixerUnit(id = 3, sources = listOf(1, 9))
         val output = D.outputTerminal(terminalType = 0x0301, sourceId = 4)
         val power = D.uac3PowerDomain(id = 5, d1RawUnits = 10, d2RawUnits = 20, entities = listOf(1, 3))
-        UsbAudioDescriptorParser.dumpAcTopology(iface + input + clock + mixer + output + power)
+        UsbAudioDescriptorParserUac3.dumpAcTopology(iface + input + clock + mixer + output + power)
     }
 }
 
@@ -263,7 +263,7 @@ class UsbAudioDescriptorParserUac3Test {
 
     @Test
     fun `extracts full UAC3 playback topology`() {
-        val topology = UsbAudioDescriptorParser.parseUac3Playback(earPodsLikeConfig())
+        val topology = UsbAudioDescriptorParserUac3.parseUac3Playback(earPodsLikeConfig())
         assertNotNull(topology)
         topology!!
         assertEquals(1, topology.configurationValue)
@@ -290,16 +290,16 @@ class UsbAudioDescriptorParserUac3Test {
         val config = D.configuration(1)
         val asIface = D.iface(1, 0, 1, 2, 0x30)
         val asGeneral = D.uac3AsGeneral(terminalLink = 1, clusterId = 32, subslotSize = 4, bitResolution = 24)
-        assertNull(UsbAudioDescriptorParser.parseUac3Playback(config + asIface + asGeneral))
+        assertNull(UsbAudioDescriptorParserUac3.parseUac3Playback(config + asIface + asGeneral))
     }
 
     @Test
     fun `mixer unit at pin 0 resolves a channel base, any other pin does not`() {
-        val pin0 = UsbAudioDescriptorParser.parseUac3Playback(earPodsLikeConfig(mixerSources = listOf(1, 9)))!!
+        val pin0 = UsbAudioDescriptorParserUac3.parseUac3Playback(earPodsLikeConfig(mixerSources = listOf(1, 9)))!!
         assertEquals(6, pin0.mixerUnitId)
         assertEquals(1, pin0.mixerInputChannelBase)
 
-        val pin1 = UsbAudioDescriptorParser.parseUac3Playback(earPodsLikeConfig(mixerSources = listOf(9, 1)))!!
+        val pin1 = UsbAudioDescriptorParserUac3.parseUac3Playback(earPodsLikeConfig(mixerSources = listOf(9, 1)))!!
         assertEquals(6, pin1.mixerUnitId)
         assertEquals(-1, pin1.mixerInputChannelBase) // needs a Cluster Descriptor fetch, not parsed here
     }
@@ -316,7 +316,7 @@ class UsbAudioDescriptorParserUac3Test {
         val asGeneral = D.uac3AsGeneral(1, 32, 4, 24)
         val endpoint = D.endpoint(0x83, 0x05, 196)
         val topology =
-            UsbAudioDescriptorParser.parseUac3Playback(
+            UsbAudioDescriptorParserUac3.parseUac3Playback(
                 config + acIface + input + clock + output + power + asIface + asGeneral + endpoint)!!
         assertEquals(9, topology.powerDomainId)
         assertEquals(500, topology.powerDomainD1RecoveryUs) // 10 raw units * 50us
@@ -340,7 +340,7 @@ class UsbAudioDescriptorParserUac2Test {
 
     @Test
     fun `extracts full UAC2 playback topology including channel count from the input terminal`() {
-        val topology = UsbAudioDescriptorParser.parseUac2Playback(fiioLikeConfig(channelCount = 2))
+        val topology = UsbAudioDescriptorParserUac2.parseUac2Playback(fiioLikeConfig(channelCount = 2))
         assertNotNull(topology)
         topology!!
         assertEquals(2, topology.uacVersion)
@@ -357,7 +357,7 @@ class UsbAudioDescriptorParserUac2Test {
 
     @Test
     fun `returns null without a clock source`() {
-        assertNull(UsbAudioDescriptorParser.parseUac2Playback(fiioLikeConfig(withClock = false)))
+        assertNull(UsbAudioDescriptorParserUac2.parseUac2Playback(fiioLikeConfig(withClock = false)))
     }
 
     @Test
@@ -374,7 +374,7 @@ class UsbAudioDescriptorParserUac2Test {
         val formatType = D.uac2FormatType(2, 16)
         val endpoint = D.endpoint(0x07, 0x05, 196)
         val topology =
-            UsbAudioDescriptorParser.parseUac2Playback(
+            UsbAudioDescriptorParserUac2.parseUac2Playback(
                 config + acIface + analogInput + usbInput + clock + mixer + output + asIface + asGeneral +
                     formatType + endpoint)!!
         assertEquals(20, topology.mixerUnitId)
@@ -397,7 +397,7 @@ class UsbAudioDescriptorParserUac1Test {
 
     @Test
     fun `extracts UAC1 topology with no clock source and discrete sample rates from the format descriptor`() {
-        val topology = UsbAudioDescriptorParser.parseUac1Playback(ab13xLikeConfig())
+        val topology = UsbAudioDescriptorParserUac1.parseUac1Playback(ab13xLikeConfig())
         assertNotNull(topology)
         topology!!
         assertEquals(1, topology.uacVersion)
@@ -416,12 +416,12 @@ class UsbAudioDescriptorParserUac1Test {
         val acIface = D.iface(0, 0, 1, 1, 0x00)
         val input = D.uac1InputTerminal(1, 0x0101, 2)
         val output = D.outputTerminal(0x0301, 8)
-        assertNull(UsbAudioDescriptorParser.parseUac1Playback(config + acIface + input + output))
+        assertNull(UsbAudioDescriptorParserUac1.parseUac1Playback(config + acIface + input + output))
     }
 
     @Test
     fun `a continuous (non-discrete) sample rate range is left unparsed, not misread`() {
-        val topology = UsbAudioDescriptorParser.parseUac1Playback(ab13xLikeConfig(sampleRates = emptyList()))!!
+        val topology = UsbAudioDescriptorParserUac1.parseUac1Playback(ab13xLikeConfig(sampleRates = emptyList()))!!
         assertTrue(topology.formats.single().sampleRates.isEmpty())
     }
 
@@ -438,7 +438,7 @@ class UsbAudioDescriptorParserUac1Test {
         val formatType = D.uac1FormatType(2, 16, listOf(48000))
         val endpoint = D.endpoint(0x01, 0x05, 192)
         val topology =
-            UsbAudioDescriptorParser.parseUac1Playback(
+            UsbAudioDescriptorParserUac1.parseUac1Playback(
                 config + acIface + micInput + usbInput + mixer + output + asIface + asGeneral + formatType +
                     endpoint)!!
         assertEquals(7, topology.mixerUnitId)

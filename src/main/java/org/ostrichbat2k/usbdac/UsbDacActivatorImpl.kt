@@ -52,19 +52,19 @@ internal class UsbDacActivatorImpl(
             }
             try {
                 for (i in 0 until device.configurationCount.coerceAtLeast(1)) {
-                    val bytes = UsbAudioDescriptorParser.fetchConfigurationDescriptor(connection, i) ?: continue
+                    val bytes = UsbAudioDescriptorHelper.fetchConfigurationDescriptor(connection, i) ?: continue
                     // Walk once, reuse the result across all four calls below -- each
                     // independently re-walking the same bytes was a real, pointless 4x linear
-                    // pass per configuration index (see UsbAudioDescriptorParser.walk's doc
+                    // pass per configuration index (see UsbAudioDescriptorHelper.walk's doc
                     // comment).
-                    val entries = UsbAudioDescriptorParser.walk(bytes)
-                    UsbAudioDescriptorParser.dumpAcTopology(entries)
-                    UsbAudioDescriptorParser.parseUac3Playback(entries)?.let { topology = it }
+                    val entries = UsbAudioDescriptorHelper.walk(bytes)
+                    UsbAudioDescriptorParserUac3.dumpAcTopology(entries)
+                    UsbAudioDescriptorParserUac3.parseUac3Playback(entries)?.let { topology = it }
                     if (topology == null) {
-                        UsbAudioDescriptorParser.parseUac2Playback(entries)?.let { topology = it }
+                        UsbAudioDescriptorParserUac2.parseUac2Playback(entries)?.let { topology = it }
                     }
                     if (topology == null) {
-                        UsbAudioDescriptorParser.parseUac1Playback(entries)?.let { topology = it }
+                        UsbAudioDescriptorParserUac1.parseUac1Playback(entries)?.let { topology = it }
                     }
                 }
             } finally {
@@ -119,7 +119,7 @@ internal class UsbDacActivatorImpl(
         }
 
         // UAC 3.0 pushes the real channel count into a separate Cluster Descriptor fetch that
-        // UsbAudioDescriptorParser can't do during pure descriptor parsing -- there's no live
+        // UsbAudioDescriptorParserUac3 can't do during pure descriptor parsing -- there's no live
         // session yet at that point (see UacPlaybackTopology.channelCount's doc comment). Do it
         // now that we have one, before anything below reads found.channelCount (the volume/mixer
         // loops) or publishes it (Capabilities screen, UsbAudioOutputProvider.channels via
@@ -223,7 +223,7 @@ internal class UsbDacActivatorImpl(
 
         // Our USB input doesn't feed the output Feature Unit directly on every device -- on
         // this one it's first summed into a Mixer Unit alongside a second source (the hardware
-        // mic path), discovered via UsbAudioDescriptorParser.dumpAcTopology. The Feature Unit
+        // mic path), discovered via UsbAudioDescriptorParserUac3.dumpAcTopology. The Feature Unit
         // being correctly unmuted at unity means nothing if the mixer's own per-channel gain for
         // our input defaults to silence, independent of and upstream from everything above.
         val mixerUnitId = found.mixerUnitId

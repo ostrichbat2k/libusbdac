@@ -42,7 +42,7 @@
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 extern "C" JNIEXPORT jboolean JNICALL
-Java_org_ostrichbat2k_usbdac_UsbNative_disconnectKernelDriver(
+Java_org_ostrichbat2k_usbdac_streaming_UsbNative_disconnectKernelDriver(
         JNIEnv* /*env*/, jobject /*thiz*/, jint fd, jint interfaceNumber) {
     if (fd < 0) {
         LOGE("disconnectKernelDriver called with invalid fd %d", fd);
@@ -67,7 +67,7 @@ Java_org_ostrichbat2k_usbdac_UsbNative_disconnectKernelDriver(
 // crackle that would never show up as a USBDEVFS_SUBMITURB/REAPURB-level error, since the
 // *aggregate* transfer still completes successfully either way.
 extern "C" JNIEXPORT jint JNICALL
-Java_org_ostrichbat2k_usbdac_UsbNative_getUsbSpeed(JNIEnv* /*env*/, jobject /*thiz*/, jint fd) {
+Java_org_ostrichbat2k_usbdac_streaming_UsbNative_getUsbSpeed(JNIEnv* /*env*/, jobject /*thiz*/, jint fd) {
     if (fd < 0) {
         LOGE("getUsbSpeed called with invalid fd %d", fd);
         return -1;
@@ -147,7 +147,7 @@ static void freeStream(IsoStream* stream) {
 }
 
 extern "C" JNIEXPORT jlong JNICALL
-Java_org_ostrichbat2k_usbdac_UsbNative_openIsoStream(
+Java_org_ostrichbat2k_usbdac_streaming_UsbNative_openIsoStream(
         JNIEnv* /*env*/, jobject /*thiz*/, jint fd, jint endpointAddress, jint maxPacketSize,
         jint packetsPerUrb, jint numUrbs) {
     if (fd < 0) {
@@ -251,7 +251,7 @@ Java_org_ostrichbat2k_usbdac_UsbNative_openIsoStream(
 // schedule: the caller distributes 44 or 45 samples per packet (see IsoPacketScheduler.kt) to
 // average out to exactly 44100/sec over time.
 extern "C" JNIEXPORT jboolean JNICALL
-Java_org_ostrichbat2k_usbdac_UsbNative_submitIso(
+Java_org_ostrichbat2k_usbdac_streaming_UsbNative_submitIso(
         JNIEnv* env, jobject /*thiz*/, jlong handle, jint slot, jbyteArray data,
         jintArray packetLengths) {
     IsoStream* stream = lookupStream(handle);
@@ -330,7 +330,7 @@ Java_org_ostrichbat2k_usbdac_UsbNative_submitIso(
 // thread), returning its slot index so the caller can refill and resubmit it. Returns -1
 // on error/cancellation.
 extern "C" JNIEXPORT jint JNICALL
-Java_org_ostrichbat2k_usbdac_UsbNative_reapIso(JNIEnv* /*env*/, jobject /*thiz*/, jlong handle) {
+Java_org_ostrichbat2k_usbdac_streaming_UsbNative_reapIso(JNIEnv* /*env*/, jobject /*thiz*/, jlong handle) {
     IsoStream* stream = lookupStream(handle);
     if (!stream) return -1;
 
@@ -406,7 +406,7 @@ static void discardAllUrbs(IsoStream* stream) {
 // streaming loop's reapIso() returns -1 for a cancelled urb). Does NOT touch memory -- it's safe
 // to call concurrently with reapIso()/submitIso() on another thread, unlike closeIsoStream.
 extern "C" JNIEXPORT void JNICALL
-Java_org_ostrichbat2k_usbdac_UsbNative_cancelIso(JNIEnv* /*env*/, jobject /*thiz*/, jlong handle) {
+Java_org_ostrichbat2k_usbdac_streaming_UsbNative_cancelIso(JNIEnv* /*env*/, jobject /*thiz*/, jlong handle) {
     IsoStream* stream = lookupStream(handle);
     if (!stream) return;
     discardAllUrbs(stream);
@@ -416,7 +416,7 @@ Java_org_ostrichbat2k_usbdac_UsbNative_cancelIso(JNIEnv* /*env*/, jobject /*thiz
 // (e.g. via Thread.join() after cancelIso()) that no other thread is still calling reapIso() or
 // submitIso() on this handle -- this frees the same memory those functions read and write.
 extern "C" JNIEXPORT void JNICALL
-Java_org_ostrichbat2k_usbdac_UsbNative_closeIsoStream(JNIEnv* /*env*/, jobject /*thiz*/, jlong handle) {
+Java_org_ostrichbat2k_usbdac_streaming_UsbNative_closeIsoStream(JNIEnv* /*env*/, jobject /*thiz*/, jlong handle) {
     IsoStream* stream;
     {
         std::lock_guard<std::mutex> lock(g_streamsMutex);

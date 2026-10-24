@@ -360,6 +360,47 @@ class UsbAudioOutput(
         // every HAL->DAC switch, which UsbVolumeProvider.applyRange() then read back as "the
         // current volume", computing every subsequent adjustment from a wrong (maxed) baseline.
         // Confirmed, reproduced: "switch to DAC, press volume down once, volume jumps to max".
+        restoreVolumeAfterRelock()
+
+        // Only unmute now that the clock is confirmed (or assumed, if unreadable) locked, and the
+        // volume reapply above has had a settled device to work with -- see the setMute(true)
+        // call above for why this has to bracket the whole relock sequence rather than just being
+        // corrected once, after the fact.
+        UsbAudioController.setMute(session, muted = false)
+
+        startStreamingThread()
+        activated = true
+        hasConfiguredHardware = true
+        // Tells UsbAudioManager's Settings-screen mutators (setMuted/setVolume/setMixerGain)
+        // not to release the claim out from under this still-running stream just because their
+        // own one-off control write finished -- see notifyStreamingStarted's doc comment.
+        usbAudioManager.notifyStreamingStarted()
+        return true
+    }
+
+    /**
+     * Restores every channel's Feature Unit volume to [initialVolumeDb] (or, failing that, the
+     * midpoint of the device's own reported range -- see [UsbAudioController.defaultVolumeTarget])
+     * after a clock relock -- pulled out of [activateAndStream] so a test can call it directly
+     * without ever reaching [startStreamingThread]'s [UsbNative] reference. Pure extraction, same
+     * behavior as before -- see [activateAndStream]'s own call site for why this has to start at
+     * channel 0 and run after the clock/power-domain settle.
+     *
+     * internal, not private: lets a test construct a real [UsbAudioOutput] and call this one
+     * piece of [activateAndStream] in isolation, same seam pattern as [UsbAudioManagerImpl][
+     * org.ostrichbat2k.usbdac.UsbAudioManagerImpl]'s `internal var dacActivator`/`deviceDiscovery`.
+     *
+     * [initialVolumeDb] is captured once, at this instance's construction (see
+     * [UsbAudioOutputProvider.getAudioOutput]'s own doc comment on why it reads
+     * [UsbDacPreferences.volumeDb] fresh for every *new* instance) -- it is NOT re-read if the
+     * user adjusts the volume keys while this same instance stays alive across a pause/resume
+     * that never built a new instance (no track/format change). Whether that's a real, currently
+     * unfixed "volume reverts to a stale level after a real release+reclaim resume" bug, distinct
+     * from the channel-0 bug this function's own history is about, is exactly what a test calling
+     * this directly after simulating that sequence is meant to answer -- not yet confirmed either
+     * way as of this comment.
+     */
+    internal fun restoreVolumeAfterRelock() {
         for (channel in 0..channels) {
             val volume = UsbAudioController.getVolume(session, channel)
             // Prefer the user's last explicitly-set volume (persisted in UsbDacPreferences, see
@@ -377,21 +418,6 @@ class UsbAudioOutput(
                 UsbAudioController.setVolume(session, value = target, channel = channel)
             }
         }
-
-        // Only unmute now that the clock is confirmed (or assumed, if unreadable) locked, and the
-        // volume reapply above has had a settled device to work with -- see the setMute(true)
-        // call above for why this has to bracket the whole relock sequence rather than just being
-        // corrected once, after the fact.
-        UsbAudioController.setMute(session, muted = false)
-
-        startStreamingThread()
-        activated = true
-        hasConfiguredHardware = true
-        // Tells UsbAudioManager's Settings-screen mutators (setMuted/setVolume/setMixerGain)
-        // not to release the claim out from under this still-running stream just because their
-        // own one-off control write finished -- see notifyStreamingStarted's doc comment.
-        usbAudioManager.notifyStreamingStarted()
-        return true
     }
 
     override fun play() {

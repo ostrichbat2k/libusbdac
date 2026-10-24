@@ -162,31 +162,32 @@ class UsbAudioOutputProvider(
         }
 
     /**
-     * The best integer device format to convert *float* PCM down to -- `FfmpegAudioRenderer`'s
-     * decoder can only ever natively output 16-bit integer or 32-bit float (confirmed against the
-     * live upstream `androidx/media` source: no version of it has native 24-bit integer output),
-     * so a genuinely higher-bit-depth source (e.g. 24-bit FLAC) could never get anything better
-     * than silently-truncated 16-bit through this app at all otherwise -- confirmed, reproduced:
-     * a real 24-bit/96kHz FLAC (ffprobe: bits_per_raw_sample=24) was decoded to 16-bit PCM before
-     * it ever reached this provider or [UsbAudioOutput], independent of USB vs. speaker output,
-     * since 16-bit is the only integer encoding that decoder will ever produce. 32-bit float has
-     * ~24 bits of mantissa precision -- exactly enough to round-trip real 24-bit integer audio
-     * losslessly -- so this picks the device's own *smallest* integer bit depth that's still
-     * wide enough to hold it (24-bit when the device offers it, 32-bit only as a fallback):
-     * both are an equally lossless, exact round-trip for real 24-bit content (a 24-bit target
-     * reconstructs the original integer directly; a 32-bit one reconstructs it scaled up by a
-     * fixed power-of-two factor -- float32's mantissa represents either exactly), so there's no
-     * fidelity reason to prefer the wider one, only a real cost: 33% more bytes over USB for
-     * identical information. [getFormatSupport] reporting
-     * that we accept [C.ENCODING_PCM_FLOAT] directly is what makes
-     * `FfmpegAudioRenderer.shouldOutputFloat()` (its own existing, unmodified decision logic)
-     * prefer float decode over 16-bit for every track, not just high-res ones. [UsbAudioOutput]
-     * does the actual float-to-integer conversion, in `write()`, once per sample -- this was
-     * tried once before without that conversion ever being implemented (raw float bytes shoved
-     * at the device as integer PCM) and deliberately removed rather than shipped half-wired; see
-     * [UsbAudioOutput]'s own doc comment on `write()` for the real conversion.
+     * The best integer device format to convert *float* PCM down to. ExoPlayer never actually
+     * hands a custom `AudioOutputProvider` real 32-bit integer PCM, no matter what the decoder
+     * produced or what this provider claims to accept: `DefaultAudioSink.configure()`
+     * unconditionally funnels every `MimeTypes.AUDIO_RAW` input through exactly one of two fixed
+     * internal processors -- `ToInt16PcmAudioProcessor` or `ToFloatPcmAudioProcessor` -- *before*
+     * this provider ever sees the format (confirmed by reading `DefaultAudioSink.configure()`
+     * and `shouldUseFloatOutput()` directly; there is no custom-provider escape hatch from this).
+     * So a 32-bit source that `FfmpegAudioDecoder.OUTPUT_MODE_NATIVE_INTEGER` decoded exactly
+     * (see that mode's doc comment: FFmpeg's own FLAC/ALAC/PCM decoders pick 16- or 32-bit based
+     * on the real source bps) always arrives here as float -- `shouldUseFloatOutput()` is keyed
+     * on the *decoder's* reported encoding being wider than 16-bit, and the USB sink is built
+     * with `enableFloatOutput = true` specifically so that rewrite lands on float, not a forced
+     * 16-bit truncation. (An earlier version of this method matched on
+     * `C.ENCODING_PCM_32BIT` instead, on the wrong assumption that the real 32-bit decode would
+     * reach this provider unmodified -- confirmed, reproduced: it silently forced every >16-bit
+     * source, including a genuine 24-bit FLAC, down to 16-bit with no warning, since that
+     * encoding can structurally never arrive here to match against.)
+     *
+     * This picks the device's own *smallest* integer bit depth that's still wide enough to hold
+     * real 24-bit content (24-bit when the device offers it, 32-bit only as a fallback): both are
+     * an equally lossless, exact round-trip for it (a 24-bit target reconstructs the original
+     * integer directly; a 32-bit one reconstructs it scaled up by a fixed power-of-two factor --
+     * float32's mantissa represents either exactly), so there's no fidelity reason to prefer the
+     * wider one, only a real cost: 33% more bytes over USB for identical information.
      */
-    private fun floatTargetFormat(targetChannels: Int, sampleRate: Int): UacStreamFormat? =
+    private fun wideIntTargetFormat(targetChannels: Int, sampleRate: Int): UacStreamFormat? =
         allFormats
             .filter { it.subslotSize >= 3 && targetChannels == channels && sampleRate in acceptedSampleRates(it) }
             .minByOrNull { it.subslotSize }
@@ -195,7 +196,7 @@ class UsbAudioOutputProvider(
         val format = formatConfig.format
         val match =
             if (format.pcmEncoding == C.ENCODING_PCM_FLOAT) {
-                floatTargetFormat(format.channelCount, format.sampleRate)
+                wideIntTargetFormat(format.channelCount, format.sampleRate)
             } else {
                 matchingFormat(format)
             }
@@ -220,8 +221,8 @@ class UsbAudioOutputProvider(
         val format = formatConfig.format
         // getFormatSupport already gated on a match existing for this exact format/encoding --
         // this just has to agree with it. Float input stays float all the way to UsbAudioOutput
-        // (which converts it to whatever floatTargetFormat picked); everything else requests the
-        // matched device format's own real integer encoding.
+        // (which converts it to whatever wideIntTargetFormat picked); everything else requests
+        // the matched device format's own real integer encoding.
         val encoding =
             if (format.pcmEncoding == C.ENCODING_PCM_FLOAT) {
                 C.ENCODING_PCM_FLOAT
@@ -246,7 +247,7 @@ class UsbAudioOutputProvider(
         val isFloatInput = config.encoding == C.ENCODING_PCM_FLOAT
         val target =
             if (isFloatInput) {
-                floatTargetFormat(channels, config.sampleRate)
+                wideIntTargetFormat(channels, config.sampleRate)
                     ?: allFormats.first().also {
                         L.w("UsbAudioOutputProvider: no float conversion target at ${config.sampleRate}Hz, using ${it.bitResolution}-bit")
                     }
@@ -267,7 +268,7 @@ class UsbAudioOutputProvider(
         // is wrong whenever this is the float-conversion path (pcmEncoding is PCM_FLOAT, not a
         // real bit depth at all) -- confirmed, reproduced: the Now Playing screen showed blank,
         // then (after routing that through controlState.activeFormat instead) a stale leftover
-        // 16-bit, because configure() reports before this function -- the only place that
+        // value, because configure() reports before this function -- the only place that
         // actually knows the real [target] -- has run for this specific track at all
         // (DefaultAudioSink defers building the AudioOutput until the first handleBuffer call).
         // This report, right here with the real target this call just resolved, supersedes it.

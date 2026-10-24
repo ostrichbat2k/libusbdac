@@ -207,7 +207,7 @@ class UsbAudioManagerImpl(private val context: Context, private val usbSettings:
             getActiveRateHz = { activeRateHz },
             requestClaim = { requestClaim() },
             releaseClaim = {
-                releaseClaim(delayMs = UsbAudioManager.RELEASE_GRACE_MS, awaitAndroidTakeover = false, deactivateOnTimeout = false)
+                releaseClaim(delayMs = UsbAudioTuning.RELEASE_GRACE_MS, awaitAndroidTakeover = false, deactivateOnTimeout = false)
             },
             getControlState = { _controlState.value },
             publishControlState = { _controlState.value = it },
@@ -280,7 +280,7 @@ class UsbAudioManagerImpl(private val context: Context, private val usbSettings:
 
     /**
      * Schedules handing the interface back to the kernel's own driver after [delayMs] (see
-     * [UsbAudioManager.RELEASE_GRACE_MS]), canceling any release already pending -- so a
+     * [UsbAudioTuning.RELEASE_GRACE_MS]), canceling any release already pending -- so a
      * [requestClaim] call before the delay elapses is a pure no-op cancellation, not a real
      * reclaim. Pass 0 to release immediately (used when something -- a pause, a track that can't
      * use the DAC, the player itself -- is definitely, not just momentarily, done with it).
@@ -333,7 +333,7 @@ class UsbAudioManagerImpl(private val context: Context, private val usbSettings:
     // Only ever meaningful once a session is Active -- see SessionState.Active.rateHz's own doc
     // comment for why nothing outside that state ever needs to read this.
     private val activeRateHz: Int
-        get() = (sessionState as? SessionState.Active)?.rateHz ?: SUPPORTED_SAMPLE_RATE_HZ
+        get() = (sessionState as? SessionState.Active)?.rateHz ?: UsbAudioTuning.SUPPORTED_SAMPLE_RATE_HZ
 
     // A host app building more than one audio renderer (e.g. a preferred decoder plus a
     // fallback), each wrapping its own RoutingAudioSink -- both get queried
@@ -447,14 +447,14 @@ class UsbAudioManagerImpl(private val context: Context, private val usbSettings:
     // doesn't retry on every single track's resolveActiveSink() call.
     private var activationAttemptedFor: String? = null
 
-    // Only ACTION_VOLUME_CHANGED -- device attach/detach/permission broadcasts are
+    // Only UsbAudioTuning.ACTION_VOLUME_CHANGED -- device attach/detach/permission broadcasts are
     // UsbDeviceDiscovery's own receiver now (see its class doc comment for why this one stayed
     // separate rather than folding into it).
     private val volumeChangeReceiver =
         object : BroadcastReceiver() {
             override fun onReceive(ctx: Context, intent: Intent) {
-                if (intent.action == ACTION_VOLUME_CHANGED &&
-                    intent.getIntExtra(EXTRA_VOLUME_STREAM_TYPE, -1) == AudioManager.STREAM_MUSIC) {
+                if (intent.action == UsbAudioTuning.ACTION_VOLUME_CHANGED &&
+                    intent.getIntExtra(UsbAudioTuning.EXTRA_VOLUME_STREAM_TYPE, -1) == AudioManager.STREAM_MUSIC) {
                     volumeController.onStreamMusicChanged(
                         audioManager.getStreamVolume(AudioManager.STREAM_MUSIC))
                 }
@@ -468,7 +468,7 @@ class UsbAudioManagerImpl(private val context: Context, private val usbSettings:
         usbSettings.registerListener(this)
         deviceDiscovery.start()
 
-        val filter = IntentFilter(ACTION_VOLUME_CHANGED)
+        val filter = IntentFilter(UsbAudioTuning.ACTION_VOLUME_CHANGED)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             context.registerReceiver(volumeChangeReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
         } else {
@@ -849,14 +849,5 @@ class UsbAudioManagerImpl(private val context: Context, private val usbSettings:
     /** [UsbDacPreferences.Listener] callback: see [blockPlayback]'s doc comment. */
     override fun onBitPerfectModeChanged() {
         updateBlockPlayback()
-    }
-
-    private companion object {
-        // AudioManager.VOLUME_CHANGED_ACTION/EXTRA_VOLUME_STREAM_TYPE: long-standing, widely used
-        // broadcast and extra, but not actually part of the public SDK stub (hence not
-        // referenceable as AudioManager.* here) -- a protected system broadcast, so registering
-        // for it with RECEIVER_NOT_EXPORTED (see start()) still receives it normally.
-        const val ACTION_VOLUME_CHANGED = "android.media.VOLUME_CHANGED_ACTION"
-        const val EXTRA_VOLUME_STREAM_TYPE = "android.media.EXTRA_VOLUME_STREAM_TYPE"
     }
 }

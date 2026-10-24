@@ -36,10 +36,6 @@ internal class UsbDiagnosticLogImpl : UsbDiagnosticLog {
     override fun log(message: String) {
         val stamp = timeFormatter.format(Date())
         L.i(message)
-        _entries.value = (listOf("$stamp  $message") + _entries.value).take(LOG_CAPACITY)
-    }
-
-    private companion object {
-        const val LOG_CAPACITY = 50
+        _entries.value = (listOf("$stamp  $message") + _entries.value).take(UsbAudioTuning.LOG_CAPACITY)
     }
 }

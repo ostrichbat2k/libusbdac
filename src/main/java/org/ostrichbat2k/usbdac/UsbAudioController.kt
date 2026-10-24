@@ -60,21 +60,6 @@ data class UsbAudioSession(
  * so [getClockFrequency] is meant to be tried first as a safe, read-only check of the addressing
  * before any SET_CUR write is attempted.
  */
-/**
- * How long to wait after a clock-frequency or alternate-setting change before streaming to this
- * device: both were observed to sometimes complete (readback confirms the new rate, iso
- * transfers report zero errors) before the DAC's own clock/output stage has actually locked onto
- * it, producing clean, error-free, but silent transfers for however long it stays unlocked.
- *
- * Was 300ms; bumped after reproducing audible distortion at the very start of a track whose rate
- * differs from the previous one (e.g. 44.1kHz <-> 96kHz) despite [UsbAudioController.getClockValid]
- * reporting locked immediately (0 retries) every time -- consistent with this device's CLOCK_VALID
- * control register not being a reliable signal of real analog PLL settling (same caveat already
- * noted above: a clean, zero-error transfer doesn't guarantee the clock has actually locked), so a
- * bigger fixed margin is the only lever available for it specifically.
- */
-const val DAC_SETTLE_DELAY_MS = 600L
-
 object UsbAudioController {
     private const val REQ_TYPE_CLASS_INTERFACE_GET = 0xA1 // Device-to-host, Class, Interface
     private const val REQ_TYPE_CLASS_INTERFACE_SET = 0x21 // Host-to-device, Class, Interface

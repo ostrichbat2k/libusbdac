@@ -24,13 +24,6 @@ import android.hardware.usb.UsbManager
 import org.ostrichbat2k.usbdac.api.UsbDacActivator
 import org.ostrichbat2k.usbdac.api.UsbDacDescriptorCache
 
-// The real sample rate this library asks every UAC2/3 device's Clock Source for, and the
-// fallback used whenever a UAC1 device's own declared rates don't include it or 44.1kHz. Also
-// read by UsbAudioManagerImpl's own activeRateHz fallback default -- a bare top-level internal
-// const rather than a companion-object one specifically so both can see it without an import
-// (same package).
-internal const val SUPPORTED_SAMPLE_RATE_HZ = 48000
-
 internal class UsbDacActivatorImpl(
     private val context: Context,
     private val usbManager: UsbManager,
@@ -197,8 +190,8 @@ internal class UsbDacActivatorImpl(
         // further below, after selectFormat has made that endpoint active (see there for why).
         val clockOk =
             if (found.uacVersion != 1) {
-                UsbAudioController.setClockFrequency(session, SUPPORTED_SAMPLE_RATE_HZ).also {
-                    log("Clock set to $SUPPORTED_SAMPLE_RATE_HZ Hz: ok=$it")
+                UsbAudioController.setClockFrequency(session, UsbAudioTuning.SUPPORTED_SAMPLE_RATE_HZ).also {
+                    log("Clock set to ${UsbAudioTuning.SUPPORTED_SAMPLE_RATE_HZ} Hz: ok=$it")
                 }
             } else {
                 true
@@ -276,11 +269,11 @@ internal class UsbDacActivatorImpl(
         // offered.
         val rateHz =
             if (found.uacVersion == 1) {
-                format.sampleRates.firstOrNull { it == SUPPORTED_SAMPLE_RATE_HZ }
+                format.sampleRates.firstOrNull { it == UsbAudioTuning.SUPPORTED_SAMPLE_RATE_HZ }
                     ?: format.sampleRates.firstOrNull { it == 44100 }
                     ?: format.sampleRates.firstOrNull()
             } else {
-                SUPPORTED_SAMPLE_RATE_HZ
+                UsbAudioTuning.SUPPORTED_SAMPLE_RATE_HZ
             }
         val rateOk =
             if (found.uacVersion == 1) {
@@ -315,12 +308,12 @@ internal class UsbDacActivatorImpl(
         // finishes, exactly what was observed (tracks playing through the tablet speaker). The
         // settings screen's "Retry activation" + its live controls now cover manual diagnosis
         // instead.
-        Thread.sleep(DAC_SETTLE_DELAY_MS)
+        Thread.sleep(UsbAudioTuning.DAC_SETTLE_DELAY_MS)
         // No Clock Source entity exists to query on UAC 1.0.
         if (found.uacVersion != 1) {
             log("Clock valid: ${UsbAudioController.getClockValid(session)}")
         }
 
-        return UsbDacActivator.Result(session, format, rateHz ?: SUPPORTED_SAMPLE_RATE_HZ)
+        return UsbDacActivator.Result(session, format, rateHz ?: UsbAudioTuning.SUPPORTED_SAMPLE_RATE_HZ)
     }
 }

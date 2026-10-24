@@ -23,6 +23,7 @@ import androidx.media3.exoplayer.audio.AudioSink
 import kotlinx.coroutines.flow.StateFlow
 import org.ostrichbat2k.usbdac.UacStreamFormat
 import org.ostrichbat2k.usbdac.UsbAudioDevice
+import org.ostrichbat2k.usbdac.UsbAudioTuning
 import org.ostrichbat2k.usbdac.UsbControlState
 import org.ostrichbat2k.usbdac.UsbDeviceCapabilities
 import org.ostrichbat2k.usbdac.UsbPipelineStats
@@ -163,7 +164,11 @@ interface UsbAudioManager : UsbDacPreferences.Listener {
      * genuinely needs HAL to reach this device right now, so a timeout fully deactivates instead
      * of just reclaiming the interface back -- every other caller should leave it `false`.
      */
-    fun releaseClaim(delayMs: Long = RELEASE_GRACE_MS, awaitAndroidTakeover: Boolean = false, deactivateOnTimeout: Boolean = false)
+    fun releaseClaim(
+        delayMs: Long = UsbAudioTuning.RELEASE_GRACE_MS,
+        awaitAndroidTakeover: Boolean = false,
+        deactivateOnTimeout: Boolean = false,
+    )
 
     /**
      * True whenever a host UI's play control should hold off starting playback rather than let it
@@ -247,13 +252,4 @@ interface UsbAudioManager : UsbDacPreferences.Listener {
      * the user wants to inspect without first pressing play).
      */
     fun retryActivation()
-
-    companion object {
-        /**
-         * Default grace period before [releaseClaim] actually hands the interface back to the
-         * kernel -- long enough that a quick pause/resume never pays the real hand-off cost, short
-         * enough that genuinely idle playback frees the device for every other app promptly.
-         */
-        const val RELEASE_GRACE_MS = 3000L
-    }
 }

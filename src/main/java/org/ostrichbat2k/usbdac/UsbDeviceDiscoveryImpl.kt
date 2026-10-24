@@ -45,7 +45,7 @@ import timber.log.Timber as L
  *
  * Registers its own [BroadcastReceiver] for exactly the three USB-specific actions this concern
  * needs (attach, detach, our own permission-result broadcast) -- deliberately not
- * `ACTION_VOLUME_CHANGED` too, even though the pre-extraction code shared one receiver for all
+ * `UsbAudioTuning.ACTION_VOLUME_CHANGED` too, even though the pre-extraction code shared one receiver for all
  * four: that broadcast is a volume/control concern with nothing to do with device presence, and
  * [UsbAudioManager] keeps its own separate, smaller receiver for it instead of this class having
  * to know anything about volume routing.

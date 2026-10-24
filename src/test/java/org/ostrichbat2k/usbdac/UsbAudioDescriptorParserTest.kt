@@ -115,6 +115,11 @@ private object D {
     fun uac3AsGeneral(terminalLink: Int, clusterId: Int, subslotSize: Int, bitResolution: Int) =
         cs(20, 0x01) {
             setU8(3, terminalLink)
+            // bmFormats bit 0 (offset 10) -- Type I PCM. Without this, UsbAudioDescriptorParser's
+            // own FORMAT_BIT_PCM check (added for DSD/non-PCM support) treats this alt setting as
+            // non-PCM and skips recording bitResolution/subslotSize/clusterId entirely, which is
+            // not what any of this file's tests building a "normal" UAC3 alt setting want.
+            setU8(10, 0x01)
             setU16(8, clusterId)
             setU8(18, subslotSize)
             setU8(19, bitResolution)
@@ -137,7 +142,11 @@ private object D {
             sources.forEachIndexed { i, s -> setU8(5 + i, s) }
         }
 
-    fun uac2AsGeneral(terminalLink: Int) = cs(4, 0x01) { setU8(3, terminalLink) }
+    // 10 bytes, not 4 -- UsbAudioDescriptorParser's FORMAT_BIT_PCM check reads bmFormats at
+    // offset 6, which only exists once this descriptor is long enough to carry it. Bit 0 there
+    // declares Type I PCM; without it the parser treats this as a non-PCM alt setting and skips
+    // recording bitResolution/subslotSize, which is not what a "normal" UAC2 alt setting is.
+    fun uac2AsGeneral(terminalLink: Int) = cs(10, 0x01) { setU8(3, terminalLink); setU8(6, 0x01) }
 
     fun uac2FormatType(subslotSize: Int, bitResolution: Int) =
         cs(6, 0x02) {

@@ -86,6 +86,15 @@ class UsbClaimController(
     // reconfigure/reclaim.
     @Volatile private var activeStreamCount = 0
 
+    // Latches a deactivateOnTimeout=true request that arrived while activeStreamCount > 0 (see
+    // releaseClaim's early-return branch) so it isn't silently lost. The caller that lost that
+    // race never gets to run doReleaseClaim itself -- the active stream's own eventual
+    // pause()/release() is what actually triggers the real release later, with its own default
+    // (false) -- so without latching here, a caller's genuine "a concrete track needs HAL to see
+    // this device right now" intent would silently downgrade back to the cheap reclaim-and-remute
+    // path, reintroducing the exact HAL-recognition bug this parameter exists to fix.
+    @Volatile private var pendingDeactivateOnTimeout = false
+
     /** Called by [UsbAudioOutput] once it's actually claimed and streaming -- see [releaseClaim]. */
     fun notifyStreamingStarted() {
         activeStreamCount++
@@ -208,22 +217,33 @@ class UsbClaimController(
             // here (a Settings-screen mutator, most likely) just wanted it briefly for its own
             // one-off write and is in no position to know that. Not even worth scheduling: the
             // active UsbAudioOutput's own pause()/release() is what will actually call this once
-            // it's really done.
+            // it's really done -- but see pendingDeactivateOnTimeout's own doc comment for why
+            // this caller's deactivateOnTimeout still has to be remembered rather than dropped.
+            pendingDeactivateOnTimeout = pendingDeactivateOnTimeout || deactivateOnTimeout
             pendingRelease = null
             return
         }
+        val effectiveDeactivateOnTimeout = deactivateOnTimeout || pendingDeactivateOnTimeout
+        pendingDeactivateOnTimeout = false
         pendingRelease =
             if (delayMs <= 0) {
-                doReleaseClaim(awaitAndroidTakeover, deactivateOnTimeout)
+                doReleaseClaim(awaitAndroidTakeover, effectiveDeactivateOnTimeout)
                 null
             } else {
                 claimScheduler.schedule(
-                    { doReleaseClaim(awaitAndroidTakeover, deactivateOnTimeout) }, delayMs, TimeUnit.MILLISECONDS)
+                    { doReleaseClaim(awaitAndroidTakeover, effectiveDeactivateOnTimeout) }, delayMs, TimeUnit.MILLISECONDS)
             }
     }
 
     private fun doReleaseClaim(awaitAndroidTakeover: Boolean, deactivateOnTimeout: Boolean) {
-        if (activeStreamCount > 0) return
+        if (activeStreamCount > 0) {
+            // The race can still be lost a second time between releaseClaim scheduling this and
+            // it actually firing (a new stream started in the meantime) -- re-latch for the same
+            // reason releaseClaim's own early-return branch does, rather than silently dropping
+            // an already-escalated request here.
+            pendingDeactivateOnTimeout = pendingDeactivateOnTimeout || deactivateOnTimeout
+            return
+        }
         // Resolved live, right now -- not a parameter frozen back when releaseClaim() was first
         // called -- since this can run after a real delay (see releaseClaim's own doc comment on
         // why that distinction matters).

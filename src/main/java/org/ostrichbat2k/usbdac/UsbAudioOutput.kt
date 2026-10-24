@@ -23,7 +23,6 @@ import androidx.media3.common.C
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.exoplayer.audio.AudioOutput
 import java.nio.ByteBuffer
-import java.nio.ByteOrder
 import timber.log.Timber as L
 
 /**
@@ -108,11 +107,22 @@ class UsbAudioOutput(
         // to be inaudible as an added gap at any real sample rate (well under 1ms even at 44.1kHz)
         // but enough samples to smooth over the discontinuity a hard cut produces.
         const val UNDERRUN_FADE_FRAMES = 32
+
+        // factor(i) = 1.0 - (i+1)/UNDERRUN_FADE_FRAMES for the common case where a short read's
+        // fade window is the full UNDERRUN_FADE_FRAMES (true whenever the read has at least that
+        // many real frames in it, the overwhelming majority of underruns) -- computed once here
+        // rather than with a floating-point division per frame per channel on every single
+        // underrun on the real-time native streaming thread. Only the rare case where the read
+        // itself is shorter than UNDERRUN_FADE_FRAMES still computes its own (necessarily
+        // differently-shaped) factors on the fly -- see fadeTailToSilence.
+        val UNDERRUN_FADE_FACTORS = DoubleArray(UNDERRUN_FADE_FRAMES) { i ->
+            1.0 - (i + 1).toDouble() / UNDERRUN_FADE_FRAMES
+        }
     }
 
     private val bytesPerFrame = channels * format.subslotSize
     // Computed in Long first -- confirmed, reproduced: at 32-bit/2ch/96000Hz (the float-decode
-    // conversion target now reachable via UsbAudioOutputProvider.floatTargetFormat preferring
+    // conversion target now reachable via UsbAudioOutputProvider.wideIntTargetFormat preferring
     // 32-bit over 24-bit), bytesPerFrame(8) * sampleRateHz(96000) * RING_BUFFER_MS(5000) is
     // 3.84 billion, which overflows Int (max ~2.147 billion) to a negative value before the
     // /1000 ever runs, crashing PcmRingBuffer's ByteArray allocation with
@@ -453,17 +463,22 @@ class UsbAudioOutput(
      * existed).
      *
      * When [isFloatInput] is true, [buffer] instead holds 32-bit float PCM (one 4-byte float per
-     * channel sample, nominal range -1.0..1.0, native byte order) -- `FfmpegAudioRenderer`'s only
-     * way to decode a source bit depth it can't represent as integer (see
-     * [UsbAudioOutputProvider.floatTargetFormat]'s doc comment for why). This is the one place
-     * that ever has to convert it: each float sample is scaled to [format]'s real full-scale
-     * integer range and packed down to its actual `subslotSize`, so what lands in [ringBuffer] --
-     * and therefore what the native streaming thread submits -- is genuine integer PCM at the
-     * device's own bit depth either way, never raw float bytes. A prior attempt at this exact
-     * feature declared [isFloatInput]/[floatConversionBuffer] but never implemented this
-     * conversion at all, so a 24/32-bit-capable device would get raw float bytes shoved at it as
-     * if they were already integer PCM -- audible noise/garbage, not silent truncation -- and
-     * was deliberately removed rather than shipped half-wired. This is that conversion, finished.
+     * channel sample, nominal range -1.0..1.0, native byte order) -- the only way wide (>16-bit)
+     * content can ever reach this class at all, since `DefaultAudioSink.configure()`
+     * unconditionally converts any raw PCM input to either plain 16-bit or float before an
+     * `AudioOutputProvider` ever sees it (confirmed by reading `DefaultAudioSink.configure()`/
+     * `shouldUseFloatOutput()` directly -- there is no way for a custom provider like ours to
+     * receive real 32-bit integer PCM through it, no matter what the decoder itself produced).
+     * `FfmpegAudioDecoder.OUTPUT_MODE_NATIVE_INTEGER` decodes a >16-bit source to exact integer
+     * PCM internally so no earlier, *unnecessary* float round-trip happens for a merely-16-bit
+     * source -- but once the real source genuinely is wider than 16 bits, this one float stage
+     * (ExoPlayer's own standard, exact int32<->float32 conversion) is unavoidable, and is a
+     * lossless round-trip for real ≤24-bit content either way (float32's mantissa has enough
+     * bits to represent it exactly). This is the one place that ever has to convert it back:
+     * each float sample is scaled to [format]'s real full-scale integer range and packed down to
+     * its actual `subslotSize`, so what lands in [ringBuffer] -- and therefore what the native
+     * streaming thread submits -- is genuine integer PCM at the device's own bit depth either
+     * way, never raw float bytes.
      *
      * Converts (and attempts to buffer) everything [buffer] currently offers in one call rather
      * than clamping up front to how much room [ringBuffer] actually has -- simpler, and this
@@ -492,21 +507,25 @@ class UsbAudioOutput(
             floatConversionBuffer = ByteArray(neededBytes)
         }
 
-        val littleEndian = buffer.order() == ByteOrder.LITTLE_ENDIAN
+        // ByteBuffer.getFloat(index) already reads in whatever order() the buffer is actually
+        // in -- there's no need to (and, critically, no correct way to) force a specific order
+        // first. An earlier version of this forced LITTLE_ENDIAN before reading when the buffer's
+        // real order was BIG_ENDIAN, which doesn't convert anything: it just re-reads the same
+        // big-endian bytes as if they were little-endian, byte-swapping every sample into
+        // garbage. Reading directly in the buffer's own order is both simpler and correct for
+        // either order.
         val maxValue = (1L shl (subslot * 8 - 1)) - 1
         val minValue = -(1L shl (subslot * 8 - 1))
         var outIdx = 0
         for (i in 0 until availableFloats) {
             val floatPos = pos + i * 4
-            val raw =
-                if (littleEndian) buffer.getFloat(floatPos) else buffer.order(ByteOrder.LITTLE_ENDIAN).getFloat(floatPos)
+            val raw = buffer.getFloat(floatPos)
             val sample = (raw * (maxValue + 1)).toLong().coerceIn(minValue, maxValue)
             for (b in 0 until subslot) {
                 floatConversionBuffer[outIdx + b] = ((sample shr (8 * b)) and 0xFF).toByte()
             }
             outIdx += subslot
         }
-        if (!littleEndian) buffer.order(ByteOrder.BIG_ENDIAN)
 
         val writtenBytes = ringBuffer.write(ByteBuffer.wrap(floatConversionBuffer, 0, neededBytes))
         // Maps bytes actually accepted by ringBuffer back to how many whole input floats that
@@ -698,8 +717,16 @@ class UsbAudioOutput(
                 val frameIndex = totalFrames - fadeFrames + i
                 // Reaches exactly 0 at the last faded frame, right where the zero-padded region
                 // -- already silent -- begins, so the two halves meet smoothly instead of at a
-                // sudden edge.
-                val factor = 1.0 - (i + 1).toDouble() / fadeFrames
+                // sudden edge. Uses the precomputed table whenever fadeFrames is the usual full
+                // UNDERRUN_FADE_FRAMES window; only the rare shorter-read case (fadeFrames <
+                // UNDERRUN_FADE_FRAMES) still divides on the fly, since that shape isn't in the
+                // table.
+                val factor =
+                    if (fadeFrames == UNDERRUN_FADE_FRAMES) {
+                        UNDERRUN_FADE_FACTORS[i]
+                    } else {
+                        1.0 - (i + 1).toDouble() / fadeFrames
+                    }
                 val frameOffset = frameIndex * frameBytes
                 for (ch in 0 until channels) {
                     val sampleOffset = frameOffset + ch * subslot

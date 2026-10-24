@@ -109,6 +109,65 @@ object UsbAudioDescriptorParser {
     // USB Endpoint Descriptor bmAttributes synchronization-type field (bits 3:2).
     private const val SYNC_TYPE_ASYNC = 0x1
 
+    /**
+     * Shared by [parseUac2Playback] and [parseUac3Playback]'s own `flushPendingFormat` closures:
+     * decides, from one alt setting's accumulated pending descriptor fields, whether it's a real
+     * selectable PCM format, a real non-PCM (e.g. DSD) alt setting on our own streaming interface
+     * (see [UacNonPcmFormat]), or neither -- and appends the right constructed object into
+     * whichever of [formatsByInterface]/[nonPcmFormatsByInterface] applies. The two parsers'
+     * pending-state variables themselves stay local to each (different descriptor layouts feed
+     * them), only this decide-and-construct step was ever near-identical between the two.
+     *
+     * [isDeclaredPcm] lets UAC2's caller preserve its own extra guard against a malformed alt
+     * setting whose AS_GENERAL declared PCM (bmFormats) but whose AS_FORMAT_TYPE never actually
+     * arrived to supply a bit resolution -- without it, that incomplete record would otherwise be
+     * wrongly recorded as non-PCM here instead of dropped entirely. UAC3's caller has no such flag
+     * to track (it has nothing else from the walk to set it from) and passes `false` always, which
+     * leaves its own non-PCM condition exactly as unrestricted as before this extraction.
+     */
+    private fun recordPendingFormat(
+        interfaceNumber: Int,
+        altSetting: Int,
+        endpointAddress: Int,
+        endpointSync: Int,
+        maxPacketSize: Int,
+        bitResolution: Int,
+        subslotSize: Int,
+        clusterDescriptorId: Int,
+        isTerminalLinked: Boolean,
+        isDeclaredPcm: Boolean,
+        isRawData: Boolean,
+        formatsByInterface: MutableMap<Int, MutableList<UacStreamFormat>>,
+        nonPcmFormatsByInterface: MutableMap<Int, MutableList<UacNonPcmFormat>>,
+    ) {
+        if (altSetting < 0 || endpointAddress < 0) return
+        if (bitResolution > 0) {
+            formatsByInterface
+                .getOrPut(interfaceNumber) { mutableListOf() }
+                .add(
+                    UacStreamFormat(
+                        alternateSetting = altSetting,
+                        bitResolution = bitResolution,
+                        subslotSize = subslotSize,
+                        clusterDescriptorId = clusterDescriptorId,
+                        endpointAddress = endpointAddress,
+                        maxPacketSize = maxPacketSize,
+                        isAsync = endpointSync == SYNC_TYPE_ASYNC))
+        } else if (isTerminalLinked && !isDeclaredPcm) {
+            // A real alt setting on our own streaming interface (not some other, e.g. capture,
+            // interface that merely shares this AudioStreaming subclass/protocol) -- just not one
+            // this codebase will ever select for playback. See UacNonPcmFormat.
+            nonPcmFormatsByInterface
+                .getOrPut(interfaceNumber) { mutableListOf() }
+                .add(
+                    UacNonPcmFormat(
+                        alternateSetting = altSetting,
+                        endpointAddress = endpointAddress,
+                        maxPacketSize = maxPacketSize,
+                        isRawData = isRawData))
+        }
+    }
+
     /** Fetches a full configuration descriptor (standard + class-specific) by its 0-based index. */
     fun fetchConfigurationDescriptor(connection: UsbDeviceConnection, configIndex: Int): ByteArray? {
         val header = ByteArray(9)
@@ -302,30 +361,20 @@ object UsbAudioDescriptorParser {
         var pendingIsRawData = false
 
         fun flushPendingFormat(interfaceNumber: Int) {
-            if (pendingAltSetting >= 0 && pendingEndpointAddress >= 0 && pendingBitResolution > 0) {
-                formatsByInterface
-                    .getOrPut(interfaceNumber) { mutableListOf() }
-                    .add(
-                        UacStreamFormat(
-                            alternateSetting = pendingAltSetting,
-                            bitResolution = pendingBitResolution,
-                            subslotSize = pendingSubslotSize,
-                            clusterDescriptorId = pendingClusterId,
-                            endpointAddress = pendingEndpointAddress,
-                            maxPacketSize = pendingMaxPacketSize,
-                            isAsync = pendingEndpointSync == SYNC_TYPE_ASYNC))
-            } else if (pendingAltSetting >= 0 && pendingEndpointAddress >= 0 && isPendingTerminalLinked) {
-                // A real alt setting on our own streaming interface -- just not one this codebase
-                // will ever select for playback. See UacNonPcmFormat.
-                nonPcmFormatsByInterface
-                    .getOrPut(interfaceNumber) { mutableListOf() }
-                    .add(
-                        UacNonPcmFormat(
-                            alternateSetting = pendingAltSetting,
-                            endpointAddress = pendingEndpointAddress,
-                            maxPacketSize = pendingMaxPacketSize,
-                            isRawData = pendingIsRawData))
-            }
+            recordPendingFormat(
+                interfaceNumber = interfaceNumber,
+                altSetting = pendingAltSetting,
+                endpointAddress = pendingEndpointAddress,
+                endpointSync = pendingEndpointSync,
+                maxPacketSize = pendingMaxPacketSize,
+                bitResolution = pendingBitResolution,
+                subslotSize = pendingSubslotSize,
+                clusterDescriptorId = pendingClusterId,
+                isTerminalLinked = isPendingTerminalLinked,
+                isDeclaredPcm = false,
+                isRawData = pendingIsRawData,
+                formatsByInterface = formatsByInterface,
+                nonPcmFormatsByInterface = nonPcmFormatsByInterface)
             pendingAltSetting = -1
             pendingEndpointAddress = -1
             pendingEndpointSync = -1
@@ -536,31 +585,20 @@ object UsbAudioDescriptorParser {
         var pendingIsRawData = false
 
         fun flushPendingFormat(interfaceNumber: Int) {
-            if (pendingAltSetting >= 0 && pendingEndpointAddress >= 0 && pendingBitResolution > 0) {
-                formatsByInterface
-                    .getOrPut(interfaceNumber) { mutableListOf() }
-                    .add(
-                        UacStreamFormat(
-                            alternateSetting = pendingAltSetting,
-                            bitResolution = pendingBitResolution,
-                            subslotSize = pendingSubslotSize,
-                            clusterDescriptorId = -1,
-                            endpointAddress = pendingEndpointAddress,
-                            maxPacketSize = pendingMaxPacketSize,
-                            isAsync = pendingEndpointSync == SYNC_TYPE_ASYNC))
-            } else if (pendingAltSetting >= 0 && pendingEndpointAddress >= 0 && isPendingTerminalLinked && !pendingFormatIsPcm) {
-                // A real alt setting on our own streaming interface (not some other, e.g.
-                // capture, interface that merely shares this AudioStreaming subclass/protocol) --
-                // just not one this codebase will ever select for playback. See UacNonPcmFormat.
-                nonPcmFormatsByInterface
-                    .getOrPut(interfaceNumber) { mutableListOf() }
-                    .add(
-                        UacNonPcmFormat(
-                            alternateSetting = pendingAltSetting,
-                            endpointAddress = pendingEndpointAddress,
-                            maxPacketSize = pendingMaxPacketSize,
-                            isRawData = pendingIsRawData))
-            }
+            recordPendingFormat(
+                interfaceNumber = interfaceNumber,
+                altSetting = pendingAltSetting,
+                endpointAddress = pendingEndpointAddress,
+                endpointSync = pendingEndpointSync,
+                maxPacketSize = pendingMaxPacketSize,
+                bitResolution = pendingBitResolution,
+                subslotSize = pendingSubslotSize,
+                clusterDescriptorId = -1,
+                isTerminalLinked = isPendingTerminalLinked,
+                isDeclaredPcm = pendingFormatIsPcm,
+                isRawData = pendingIsRawData,
+                formatsByInterface = formatsByInterface,
+                nonPcmFormatsByInterface = nonPcmFormatsByInterface)
             pendingAltSetting = -1
             pendingEndpointAddress = -1
             pendingEndpointSync = -1

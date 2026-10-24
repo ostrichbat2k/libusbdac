@@ -279,6 +279,7 @@ class RoutingAudioSink(private val usbAudioManager: UsbAudioManager, private val
 
     @Deprecated("Deprecated in AudioSink interface itself; this is still the signature callers use.")
     override fun configure(inputFormat: Format, specifiedBufferSize: Int, outputChannels: IntArray?) {
+        val previousFormat = lastConfiguredFormat
         lastConfiguredFormat = inputFormat
         lastConfiguredBufferSize = specifiedBufferSize
         lastConfiguredOutputChannels = outputChannels
@@ -314,18 +315,32 @@ class RoutingAudioSink(private val usbAudioManager: UsbAudioManager, private val
                 fallbackRoute(inputFormat)
             } else {
                 UsbAudioManager.PlaybackRoute.Direct(
-                    // Prefer the DAC's own real active alt-setting (already updated by
-                    // UsbAudioOutputProvider.getAudioOutput -> ensureFormatActive ->
-                    // refreshControlState, moments before this call) over deriving it from
-                    // inputFormat.pcmEncoding -- that guess is wrong whenever the decoder is
-                    // feeding float PCM for the bit-perfect-via-float-conversion path (see
-                    // UsbAudioOutputProvider.floatTargetFormat): bitDepthFor(PCM_FLOAT) has no
-                    // mapping and returns null, which showed as a blank bit depth on the Now
-                    // Playing screen despite the DAC genuinely streaming real (24-bit-sourced)
-                    // 32-bit integer PCM. Falls back to the old guess only if controlState
-                    // somehow isn't populated yet.
-                    bitDepth = usbAudioManager.controlState.value?.activeFormat?.bitResolution
-                        ?: bitDepthFor(inputFormat.pcmEncoding),
+                    // controlState.activeFormat is only trustworthy here when this track's
+                    // encoding/rate match the previous configure() call: in that case
+                    // DefaultAudioSink reuses the existing AudioOutput and never calls
+                    // UsbAudioOutputProvider.getAudioOutput() again (see
+                    // AudioOutput.canReuseAudioOutput's default contract), so activeFormat still
+                    // genuinely describes this track, not a leftover. It also covers the
+                    // bit-perfect-via-float-conversion path correctly (where inputFormat.pcmEncoding
+                    // is PCM_FLOAT, not a real bit depth at all).
+                    //
+                    // When the format actually changed (or this is the very first track),
+                    // getAudioOutput() -> ensureFormatActive() -- the only place that resolves the
+                    // real target format -- hasn't run yet at this point: DefaultAudioSink defers
+                    // building/replacing the AudioOutput until the first handleBuffer() call, well
+                    // after configure() returns. Confirmed, reproduced: trusting
+                    // controlState.activeFormat unconditionally here showed the *previous* track's
+                    // bit depth for a moment on any track whose format differs. Reporting null
+                    // instead of guessing lets getAudioOutput()'s own authoritative report --
+                    // posted moments later once it actually resolves the real target -- be the
+                    // first thing the user sees.
+                    bitDepth = if (previousFormat != null &&
+                            previousFormat.pcmEncoding == inputFormat.pcmEncoding &&
+                            previousFormat.sampleRate == inputFormat.sampleRate) {
+                        usbAudioManager.controlState.value?.activeFormat?.bitResolution
+                    } else {
+                        null
+                    },
                     sampleRateHz = inputFormat.sampleRate,
                     channels = inputFormat.channelCount)
             })

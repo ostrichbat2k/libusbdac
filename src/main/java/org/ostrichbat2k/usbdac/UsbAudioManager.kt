@@ -43,6 +43,19 @@ import kotlin.random.Random
 import timber.log.Timber as L
 
 /**
+ * Everything that decides whether [UsbAudioManager.ensureFormatActive] needs to reassert the
+ * interface, bundled into one comparable value rather than separately-named booleans. A future
+ * addition to what "active" means here (a clock source selection, a DSD marker, anything else
+ * that affects what's actually streaming) only has to be added to this class's fields to be
+ * covered by the single equality check in [UsbAudioManager.ensureFormatActive] -- the previous
+ * `formatChanged || rateChanged` shape required separately remembering to OR in a new named
+ * boolean at both of that function's call sites, which is exactly the kind of gap that let a
+ * same-alt rate-only change go unnoticed before `rateChanged` itself was added (see
+ * [UsbAudioManager.ensureFormatActive]'s own doc comment for that history).
+ */
+private data class ActiveStreamConfig(val format: UacStreamFormat, val sampleRateHz: Int)
+
+/**
  * Detects attached USB Audio Class devices (candidate DACs), manages permission requests, and
  * once permitted, activates a persistent [UsbAudioSession] configured and ready for playback.
  * [resolveActiveSink] hands out an [AudioSink] wired to that session for the player to use in place
@@ -673,10 +686,11 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
         // UsbAudioOutput's own construction (right after this returns) needs it held too, so
         // this must succeed before selectFormat, not be left for later.
         if (requestClaim() == ClaimOutcome.FAILED) return false
-        val formatChanged = format != activeFormat
-        val rateChanged = sampleRateHz != activeRateHz
+        val previousConfig = activeFormat?.let { ActiveStreamConfig(it, activeRateHz) }
+        val newConfig = ActiveStreamConfig(format, sampleRateHz)
+        val configChanged = previousConfig != newConfig
         var ok = true
-        if (formatChanged || rateChanged) {
+        if (configChanged) {
             // Re-selecting the alt-setting -- even to the *same* alternateSetting value when
             // only the sample rate changed, not the bit depth -- always issues a real
             // SET_INTERFACE request (UsbDeviceConnection.setInterface never short-circuits a
@@ -702,7 +716,7 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
                 logEvent("Failed to switch to ${format.bitResolution}-bit (alt=${format.alternateSetting}) for upcoming track")
             }
         }
-        if (formatChanged || rateChanged) {
+        if (configChanged) {
             activeRateHz = sampleRateHz
             refreshControlState(session, activeFormat ?: format, session.device.productName ?: session.device.deviceName)
         }

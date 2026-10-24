@@ -16,8 +16,10 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-package org.ostrichbat2k.usbdac
+package org.ostrichbat2k.usbdac.control
 
+import org.ostrichbat2k.usbdac.protocol.UacStreamFormat
+import org.ostrichbat2k.usbdac.protocol.UsbAudioSession
 /**
  * A live, read-back snapshot of the active [UsbAudioSession]'s adjustable controls, built
  * entirely from what the *current* device actually reports (available formats, its real

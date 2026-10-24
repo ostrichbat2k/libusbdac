@@ -18,6 +18,7 @@
 
 package org.ostrichbat2k.usbdac
 
+import org.ostrichbat2k.usbdac.streaming.UsbAudioOutput
 /**
  * User configuration specific to direct USB DAC output. The host app provides its own
  * implementation (persisted however fits its own settings architecture) and wires it in via

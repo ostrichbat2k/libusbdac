@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2026 libusbdac Project
- * UsbDacDescriptorCache.kt is part of libusbdac.
+ * UsbDacDescriptorCacheImpl.kt is part of libusbdac.
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -16,8 +16,12 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-package org.ostrichbat2k.usbdac
+package org.ostrichbat2k.usbdac.activation
 
+import org.ostrichbat2k.usbdac.UsbAudioManager
+import org.ostrichbat2k.usbdac.protocol.UacPlaybackTopology
+import org.ostrichbat2k.usbdac.protocol.UacStreamFormat
+import org.ostrichbat2k.usbdac.protocol.UsbAudioSession
 import android.content.Context
 import androidx.room.Dao
 import androidx.room.Database
@@ -55,7 +59,7 @@ internal data class CachedUsbDacDescriptor(
  * fresh topology from the device itself and overwrites whatever was cached, so a bad/stale entry
  * from a device swap is a one-tap fix, not a silent permanent wrong state.
  */
-internal class UsbDacDescriptorCache(context: Context) {
+internal class UsbDacDescriptorCacheImpl(context: Context) : UsbDacDescriptorCache {
     private val db =
         Room.databaseBuilder(
                 context.applicationContext,
@@ -66,7 +70,7 @@ internal class UsbDacDescriptorCache(context: Context) {
             .build()
 
     /** Blocking; callers already run this off the main thread (see [UsbAudioManager.activateDac]). */
-    fun get(vendorId: Int, productId: Int): CachedUsbDacDescriptor? {
+    override fun get(vendorId: Int, productId: Int): CachedUsbDacDescriptor? {
         val key = keyFor(vendorId, productId)
         val dao = db.dao()
         val cachedTopology = dao.getTopology(key) ?: return null
@@ -78,7 +82,7 @@ internal class UsbDacDescriptorCache(context: Context) {
     }
 
     /** Blocking; callers already run this off the main thread (see [UsbAudioManager.activateDac]). */
-    fun put(
+    override fun put(
         vendorId: Int,
         productId: Int,
         topology: UacPlaybackTopology,

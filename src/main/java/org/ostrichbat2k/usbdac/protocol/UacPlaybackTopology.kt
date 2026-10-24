@@ -16,8 +16,9 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-package org.ostrichbat2k.usbdac
+package org.ostrichbat2k.usbdac.protocol
 
+import org.ostrichbat2k.usbdac.UsbAudioManager
 /** One selectable PCM format on a UAC streaming interface: one alternate setting. */
 data class UacStreamFormat(
     val alternateSetting: Int,
@@ -38,7 +39,7 @@ data class UacStreamFormat(
 /**
  * A non-PCM alt setting found on the streaming interface (e.g. raw DSD) -- excluded from
  * [UacPlaybackTopology.formats] since nothing in this codebase ever selects it for playback (see
- * [UsbAudioDescriptorParser]'s `FORMAT_BIT_PCM` doc comment), but still surfaced here so it isn't
+ * [UsbAudioDescriptorHelper]'s `FORMAT_BIT_PCM` doc comment), but still surfaced here so it isn't
  * simply invisible on a capabilities/diagnostics screen.
  */
 data class UacNonPcmFormat(
@@ -47,7 +48,7 @@ data class UacNonPcmFormat(
     val maxPacketSize: Int,
     /**
      * True if bmFormats bit 31 ("raw data") is set -- the real-world convention for DSD-over-USB,
-     * confirmed on a real device (see [UsbAudioDescriptorParser]'s `RAW_DATA_BYTE_MASK` doc
+     * confirmed on a real device (see [UsbAudioDescriptorHelper]'s `RAW_DATA_BYTE_MASK` doc
      * comment). False means "non-PCM for some other declared reason" (e.g. a genuinely compressed
      * Type II/III format), which this parser doesn't otherwise distinguish.
      */
@@ -141,10 +142,12 @@ data class UsbInterfaceInfo(
 }
 
 /**
- * Everything [UsbAudioDescriptorParser] found on a device's descriptors, bundled for read-only
- * display in a host app's UI -- published as soon as a topology is parsed, independent of
- * whether the control-transfer setup that follows (clock, mute, volume, mixer gain) ends up
- * succeeding, since it describes what the device *declares*, not what the host managed to
+ * Everything the UAC1/2/3 descriptor parsers ([UsbAudioDescriptorParserUac1],
+ * [UsbAudioDescriptorParserUac2], [UsbAudioDescriptorParserUac3]) found on a device's
+ * descriptors, bundled for read-only display in a host app's UI -- published as soon as a
+ * topology is parsed, independent of whether the control-transfer setup that follows (clock,
+ * mute, volume, mixer gain) ends up succeeding, since it describes what the device *declares*,
+ * not what the host managed to
  * configure.
  */
 data class UsbDeviceCapabilities(

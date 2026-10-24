@@ -16,7 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-package org.ostrichbat2k.usbdac
+package org.ostrichbat2k.usbdac.streaming
 
 import java.nio.ByteBuffer
 

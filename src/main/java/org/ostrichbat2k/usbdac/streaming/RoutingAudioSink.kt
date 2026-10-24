@@ -16,8 +16,10 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-package org.ostrichbat2k.usbdac
+package org.ostrichbat2k.usbdac.streaming
 
+import org.ostrichbat2k.usbdac.UsbAudioManager
+import org.ostrichbat2k.usbdac.protocol.UsbAudioController
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.AuxEffectInfo
 import androidx.media3.common.C

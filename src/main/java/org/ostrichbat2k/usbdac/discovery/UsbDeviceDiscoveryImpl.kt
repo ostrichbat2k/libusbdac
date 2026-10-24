@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2026 libusbdac Project
- * UsbDeviceDiscovery.kt is part of libusbdac.
+ * UsbDeviceDiscoveryImpl.kt is part of libusbdac.
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -16,8 +16,13 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-package org.ostrichbat2k.usbdac
+package org.ostrichbat2k.usbdac.discovery
 
+import org.ostrichbat2k.usbdac.UsbAudioManager
+import org.ostrichbat2k.usbdac.UsbAudioTuning
+import org.ostrichbat2k.usbdac.UsbDacPreferences
+import org.ostrichbat2k.usbdac.claim.UsbClaimController
+import org.ostrichbat2k.usbdac.control.UsbVolumeController
 import android.app.PendingIntent
 import android.content.BroadcastReceiver
 import android.content.Context
@@ -43,7 +48,7 @@ import timber.log.Timber as L
  *
  * Registers its own [BroadcastReceiver] for exactly the three USB-specific actions this concern
  * needs (attach, detach, our own permission-result broadcast) -- deliberately not
- * `ACTION_VOLUME_CHANGED` too, even though the pre-extraction code shared one receiver for all
+ * `UsbAudioTuning.ACTION_VOLUME_CHANGED` too, even though the pre-extraction code shared one receiver for all
  * four: that broadcast is a volume/control concern with nothing to do with device presence, and
  * [UsbAudioManager] keeps its own separate, smaller receiver for it instead of this class having
  * to know anything about volume routing.
@@ -54,16 +59,16 @@ import timber.log.Timber as L
  * attachment" bookkeeping needs pruning whenever the attached-device set changes, same timing as
  * before extraction -- synchronously, right after [devices] itself updates.
  */
-class UsbDeviceDiscovery(
+internal class UsbDeviceDiscoveryImpl(
     private val context: Context,
     private val usbManager: UsbManager,
     private val usbSettings: UsbDacPreferences,
     private val actionUsbPermission: String,
     private val onDeviceDetached: () -> Unit,
     private val onRefreshed: (List<UsbAudioDevice>) -> Unit = {},
-) {
+) : UsbDeviceDiscovery {
     private val _devices = MutableStateFlow<List<UsbAudioDevice>>(emptyList())
-    val devices: StateFlow<List<UsbAudioDevice>> = _devices.asStateFlow()
+    override val devices: StateFlow<List<UsbAudioDevice>> = _devices.asStateFlow()
 
     private var started = false
     private var knownDeviceNames = emptySet<String>()
@@ -118,7 +123,7 @@ class UsbDeviceDiscovery(
         }
 
     /** Begins listening for USB device attach/detach/permission events. Call once at startup. */
-    fun start() {
+    override fun start() {
         if (started) return
         started = true
 
@@ -138,7 +143,7 @@ class UsbDeviceDiscovery(
     }
 
     /** Requests permission to use [device]. The result arrives asynchronously via broadcast. */
-    fun requestPermission(device: UsbDevice) {
+    override fun requestPermission(device: UsbDevice) {
         val permissionIntent =
             PendingIntent.getBroadcast(
                 context,

@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2026 libusbdac Project
- * UsbClaimController.kt is part of libusbdac.
+ * UsbClaimControllerImpl.kt is part of libusbdac.
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -16,8 +16,15 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-package org.ostrichbat2k.usbdac
+package org.ostrichbat2k.usbdac.claim
 
+import org.ostrichbat2k.usbdac.UsbAudioManager
+import org.ostrichbat2k.usbdac.UsbAudioTuning
+import org.ostrichbat2k.usbdac.control.UsbVolumeController
+import org.ostrichbat2k.usbdac.protocol.UsbAudioController
+import org.ostrichbat2k.usbdac.protocol.UsbAudioSession
+import org.ostrichbat2k.usbdac.streaming.RoutingAudioSink
+import org.ostrichbat2k.usbdac.streaming.UsbAudioOutput
 import android.hardware.usb.UsbDevice
 import android.media.AudioDeviceCallback
 import android.media.AudioDeviceInfo
@@ -53,14 +60,14 @@ import timber.log.Timber as L
  * effects (invalidating its `activeFormat` cache, tearing the session down) -- they stay
  * [UsbAudioManager]'s responsibility, just invoked from here via callback rather than inlined.
  */
-class UsbClaimController(
+internal class UsbClaimControllerImpl(
     private val audioManager: AudioManager,
     private val volumeController: UsbVolumeController,
     private val getActiveSession: () -> UsbAudioSession?,
     private val onReclaimed: () -> Unit,
     private val onClaimFailed: () -> Unit,
     private val onTakeoverTimeout: () -> Unit,
-) {
+) : UsbClaimController {
     private val claimScheduler =
         Executors.newSingleThreadScheduledExecutor { r ->
             Thread(r, "UsbAudioControl-Claim").apply { isDaemon = true }
@@ -80,7 +87,7 @@ class UsbClaimController(
     // confirmed, reproduced, a real multi-second dropout -- a volume key press during active
     // playback ran a Settings-style mutator's background write, which unconditionally called
     // releaseClaim() afterward on the assumption nothing else needed the claim. With a track
-    // genuinely streaming, that scheduled release fired ~RELEASE_GRACE_MS later and yanked the
+    // genuinely streaming, that scheduled release fired ~UsbAudioTuning.RELEASE_GRACE_MS later and yanked the
     // interface out from under the still-running native thread, which only recovered once
     // DefaultAudioSink's own stall detection eventually noticed and forced a fresh
     // reconfigure/reclaim.
@@ -96,17 +103,17 @@ class UsbClaimController(
     @Volatile private var pendingDeactivateOnTimeout = false
 
     /** Called by [UsbAudioOutput] once it's actually claimed and streaming -- see [releaseClaim]. */
-    fun notifyStreamingStarted() {
+    override fun notifyStreamingStarted() {
         activeStreamCount++
     }
 
     /** The inverse of [notifyStreamingStarted] -- call before, not after, releasing anything. */
-    fun notifyStreamingStopped() {
+    override fun notifyStreamingStopped() {
         activeStreamCount = (activeStreamCount - 1).coerceAtLeast(0)
     }
 
     /** Whether we currently hold the raw interface claim -- see [interfaceClaimed]. */
-    fun isClaimed(): Boolean = interfaceClaimed
+    override fun isClaimed(): Boolean = interfaceClaimed
 
     /**
      * For [UsbAudioManager.activateDac]'s tail: its own `UsbAudioController.activate()` call
@@ -114,7 +121,7 @@ class UsbClaimController(
      * discovery/setup, outside of [requestClaim] -- this just records that fact so later
      * [releaseClaim]/[requestClaim] calls agree with reality.
      */
-    fun markAlreadyClaimed() {
+    override fun markAlreadyClaimed() {
         interfaceClaimed = true
     }
 
@@ -123,12 +130,12 @@ class UsbClaimController(
      * hand-back to the kernel) and needs to mark the claim gone without going through the normal
      * [releaseClaim] dance.
      */
-    fun markReleased() {
+    override fun markReleased() {
         interfaceClaimed = false
     }
 
     /** For [UsbAudioManager.deactivateDac], canceling any release scheduled before a teardown. */
-    fun cancelPendingRelease() {
+    override fun cancelPendingRelease() {
         pendingRelease?.cancel(false)
         pendingRelease = null
     }
@@ -137,7 +144,7 @@ class UsbClaimController(
      * For [UsbAudioManager.deactivateDac] to record which device to wait for -- see
      * [awaitAndroidOutputTakeover]'s own comment on why.
      */
-    fun recordDeactivatedDevice(device: UsbDevice?) {
+    override fun recordDeactivatedDevice(device: UsbDevice?) {
         lastDeactivatedDevice = device
     }
 
@@ -155,7 +162,7 @@ class UsbClaimController(
      * why that distinction, not just success/failure, decides whether a resume needs to redo its
      * whole clock/mute/volume relock dance.
      */
-    fun requestClaim(session: UsbAudioSession?): UsbAudioManager.ClaimOutcome {
+    override fun requestClaim(session: UsbAudioSession?): UsbAudioManager.ClaimOutcome {
         pendingRelease?.cancel(false)
         pendingRelease = null
         if (interfaceClaimed) return UsbAudioManager.ClaimOutcome.ALREADY_CLAIMED
@@ -182,7 +189,7 @@ class UsbClaimController(
 
     /**
      * Schedules handing the interface back to the kernel's own driver after [delayMs] (see
-     * `RELEASE_GRACE_MS`), canceling any release already pending -- so a [requestClaim] call
+     * `UsbAudioTuning.RELEASE_GRACE_MS`), canceling any release already pending -- so a [requestClaim] call
      * before the delay elapses is a pure no-op cancellation, not a real reclaim. Pass 0 to
      * release immediately (used when something -- a pause, a track that can't use the DAC, the
      * player itself -- is definitely, not just momentarily, done with it).
@@ -210,7 +217,7 @@ class UsbClaimController(
      * activation, including activateDac's own tail release where nothing was actually trying to
      * use the device via HAL at all.
      */
-    fun releaseClaim(delayMs: Long, awaitAndroidTakeover: Boolean, deactivateOnTimeout: Boolean = false) {
+    override fun releaseClaim(delayMs: Long, awaitAndroidTakeover: Boolean, deactivateOnTimeout: Boolean) {
         pendingRelease?.cancel(false)
         if (activeStreamCount > 0) {
             // Something is genuinely streaming right now and still needs the claim -- a caller
@@ -267,7 +274,7 @@ class UsbClaimController(
 
     /**
      * Blocks (briefly, bounded) until Android's own audio framework reports this device as an
-     * available output, or [AWAIT_TAKEOVER_TIMEOUT_MS] elapses.
+     * available output, or [UsbAudioTuning.AWAIT_TAKEOVER_TIMEOUT_MS] elapses.
      *
      * The kernel-side decision (will snd-usb-audio actually bind and create a playback PCM
      * substream) is already synchronous by the time [UsbAudioController.releaseToKernel]'s
@@ -313,7 +320,7 @@ class UsbClaimController(
         // device that was either already confirmed as an output on the very first attempt, or
         // (a genuine physical unplug) is never coming back at all -- confirmed, reproduced: after
         // any one deactivation, *every* subsequent track blocked the configure()-calling thread
-        // for up to AWAIT_TAKEOVER_TIMEOUT_MS, forever, until the process restarted, even though
+        // for up to UsbAudioTuning.AWAIT_TAKEOVER_TIMEOUT_MS, forever, until the process restarted, even though
         // there was no USB DAC in the picture anymore.
         lastDeactivatedDevice = null
         val targetName = device.productName?.toString() ?: device.deviceName
@@ -347,7 +354,7 @@ class UsbClaimController(
             // onAudioDevicesAdded alone would never report (it only fires for future additions).
             val took =
                 audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS).any(::matches) ||
-                    latch.await(AWAIT_TAKEOVER_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+                    latch.await(UsbAudioTuning.AWAIT_TAKEOVER_TIMEOUT_MS, TimeUnit.MILLISECONDS)
             if (took) {
                 L.i(
                     "UsbAudioManager: kernel reclaimed $targetName as an Android output after " +
@@ -397,12 +404,5 @@ class UsbClaimController(
         } finally {
             audioManager.unregisterAudioDeviceCallback(callback)
         }
-    }
-
-    private companion object {
-        // How long awaitAndroidOutputTakeover() will wait before giving up -- confirmed via
-        // logcat that real recognition landed in ~100-300ms on the one device tested, so this
-        // is a generous multiple of that, not a tight bound.
-        const val AWAIT_TAKEOVER_TIMEOUT_MS = 1500L
     }
 }

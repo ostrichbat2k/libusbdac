@@ -16,8 +16,9 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-package org.ostrichbat2k.usbdac
+package org.ostrichbat2k.usbdac.streaming
 
+import org.ostrichbat2k.usbdac.UsbAudioManager
 /**
  * A live snapshot of the active [UsbAudioOutput]'s ring-buffer/USB-transfer state, reported
  * periodically (not on every single URB -- see where it's sent from) while a stream is genuinely

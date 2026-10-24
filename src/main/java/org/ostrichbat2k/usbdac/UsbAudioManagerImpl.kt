@@ -182,7 +182,9 @@ class UsbAudioManagerImpl(private val context: Context, private val usbSettings:
     // class doc comment for why. onDeviceDetached tears down any active session the same as the
     // pre-extraction receiver did inline; onRefreshed prunes activationAttemptedFor at the exact
     // same point (synchronously, right after devices itself updates) the pre-extraction code did.
-    private val deviceDiscovery: UsbDeviceDiscovery =
+    // internal var, not private val, so a test can substitute a fake for the activation/discovery
+    // seam -- see UsbAudioManagerImplTest's own doc comment for why those two specifically.
+    internal var deviceDiscovery: UsbDeviceDiscovery =
         UsbDeviceDiscoveryImpl(
             context,
             usbManager,
@@ -202,7 +204,7 @@ class UsbAudioManagerImpl(private val context: Context, private val usbSettings:
 
     // Descriptor discovery + session activation -- see its own class doc comment for why this
     // is self-contained enough to not need to know about SessionState at all.
-    private val dacActivator: UsbDacActivator =
+    internal var dacActivator: UsbDacActivator =
         UsbDacActivatorImpl(
             context,
             usbManager,

@@ -65,7 +65,11 @@ class UsbAudioOutput(
     private val format: UacStreamFormat,
     private val channels: Int,
     private val sampleRateHz: Int,
-    private val initialVolumeDb: Int?,
+    // Read fresh (not captured once) by restoreVolumeAfterRelock -- see that function's own doc
+    // comment for the real, confirmed bug a one-time capture caused: a volume-key change made
+    // mid-track, with this same instance still alive (no format change), was silently reverted
+    // to whatever was persisted back when this instance was first built.
+    private val usbSettings: UsbDacPreferences,
     // True when UsbAudioOutputProvider picked this device format as a *conversion target* for
     // 32-bit float PCM (FfmpegAudioRenderer's only way to get real higher-than-16-bit precision
     // out of a device whose own Feature Unit works in integer, not float) rather than ExoPlayer
@@ -379,26 +383,28 @@ class UsbAudioOutput(
     }
 
     /**
-     * Restores every channel's Feature Unit volume to [initialVolumeDb] (or, failing that, the
-     * midpoint of the device's own reported range -- see [UsbAudioController.defaultVolumeTarget])
-     * after a clock relock -- pulled out of [activateAndStream] so a test can call it directly
-     * without ever reaching [startStreamingThread]'s [UsbNative] reference. Pure extraction, same
-     * behavior as before -- see [activateAndStream]'s own call site for why this has to start at
-     * channel 0 and run after the clock/power-domain settle.
+     * Restores every channel's Feature Unit volume to [UsbDacPreferences.volumeDb] (or, failing
+     * that, the midpoint of the device's own reported range -- see
+     * [UsbAudioController.defaultVolumeTarget]) after a clock relock -- pulled out of
+     * [activateAndStream] so a test can call it directly without ever reaching
+     * [startStreamingThread]'s [UsbNative] reference. Pure extraction, same behavior as before --
+     * see [activateAndStream]'s own call site for why this has to start at channel 0 and run
+     * after the clock/power-domain settle.
      *
      * internal, not private: lets a test construct a real [UsbAudioOutput] and call this one
      * piece of [activateAndStream] in isolation, same seam pattern as [UsbAudioManagerImpl][
      * org.ostrichbat2k.usbdac.UsbAudioManagerImpl]'s `internal var dacActivator`/`deviceDiscovery`.
      *
-     * [initialVolumeDb] is captured once, at this instance's construction (see
-     * [UsbAudioOutputProvider.getAudioOutput]'s own doc comment on why it reads
-     * [UsbDacPreferences.volumeDb] fresh for every *new* instance) -- it is NOT re-read if the
-     * user adjusts the volume keys while this same instance stays alive across a pause/resume
-     * that never built a new instance (no track/format change). Whether that's a real, currently
-     * unfixed "volume reverts to a stale level after a real release+reclaim resume" bug, distinct
-     * from the channel-0 bug this function's own history is about, is exactly what a test calling
-     * this directly after simulating that sequence is meant to answer -- not yet confirmed either
-     * way as of this comment.
+     * Reads [usbSettings] (via [UsbDacPreferences.volumeDb]) fresh on every call, not a value
+     * captured once at construction -- confirmed, reproduced: capturing it once meant a volume-key
+     * change made mid-track (no format change, so no new [UsbAudioOutput] instance -- see
+     * [UsbAudioOutputProvider.getAudioOutput]'s own doc comment on when a fresh instance, and so a
+     * fresh read, actually happens) was silently discarded and reverted to the stale
+     * construction-time value the next time this same instance survived a real release+reclaim
+     * resume (e.g. a pause that outlasted the release grace period) and re-ran this function --
+     * a second, distinct "volume jumps" mechanism from the channel-0-skipped bug this function's
+     * own history is otherwise about. See [org.ostrichbat2k.usbdac.streaming.UsbAudioOutputVolumeRestoreTest]
+     * for the test that caught this.
      */
     internal fun restoreVolumeAfterRelock() {
         for (channel in 0..channels) {
@@ -408,10 +414,10 @@ class UsbAudioOutput(
             // (app restart, DAC reconnect, new track that triggers a clock change) reset
             // whatever the user had it at back to this fixed point, which is exactly what was
             // reported as "volume resets after reinstall". Only a genuinely first-ever-seen
-            // device (initialVolumeDb null) falls back to the midpoint of its own reported range
-            // (not its max/unity gain) -- see UsbAudioController.defaultVolumeTarget.
+            // device (volumeDb null) falls back to the midpoint of its own reported range (not
+            // its max/unity gain) -- see UsbAudioController.defaultVolumeTarget.
             val target =
-                initialVolumeDb
+                usbSettings.volumeDb
                     ?: UsbAudioController.defaultVolumeTarget(UsbAudioController.getVolumeRange(session, channel))
             L.i("UsbAudioOutput: post-clock-change channel $channel volume=$volume target=$target")
             if (volume == null || volume != target) {

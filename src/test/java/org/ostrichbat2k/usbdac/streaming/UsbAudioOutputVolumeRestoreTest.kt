@@ -25,6 +25,7 @@ import io.mockk.mockk
 import org.junit.Assert.assertEquals
 import org.junit.Test
 import org.ostrichbat2k.usbdac.UsbAudioManager
+import org.ostrichbat2k.usbdac.UsbDacPreferences
 import org.ostrichbat2k.usbdac.protocol.UacPlaybackTopology
 import org.ostrichbat2k.usbdac.protocol.UacStreamFormat
 import org.ostrichbat2k.usbdac.protocol.UsbAudioController
@@ -42,11 +43,9 @@ import org.ostrichbat2k.usbdac.testutil.FakeFeatureUnit
  * throws `UnsatisfiedLinkError` in a plain JVM test; this is exactly the Scope B blocker on
  * record, and testing through the real [UsbAudioOutput.activateAndStream] end to end still
  * requires giving [UsbNative] a seam, which is deliberately not done here) -- restores every
- * channel to [UsbAudioOutput]'s own `initialVolumeDb`, captured once at *construction*. That
- * constructor argument is [org.ostrichbat2k.usbdac.UsbDacPreferences.volumeDb] read fresh only
- * when a *new* instance is built, i.e. on a track/format change (see
- * [UsbAudioOutputProvider.getAudioOutput]'s own doc comment) -- never while the same instance
- * stays alive across a same-track pause/resume.
+ * channel to [UsbDacPreferences.volumeDb], read fresh on every call (fixed here -- it used to be
+ * a value captured once at construction, see the second test below for the regression that
+ * caught).
  */
 class UsbAudioOutputVolumeRestoreTest {
 
@@ -90,13 +89,21 @@ class UsbAudioOutputVolumeRestoreTest {
         )
     }
 
-    private fun output(session: UsbAudioSession, initialVolumeDb: Int?) =
+    private fun fakeUsbSettings(initialVolumeDb: Int?): UsbDacPreferences {
+        var backing = initialVolumeDb
+        return mockk(relaxed = true) {
+            every { volumeDb } answers { backing }
+            every { volumeDb = any() } answers { backing = it.invocation.args[0] as Int? }
+        }
+    }
+
+    private fun output(session: UsbAudioSession, usbSettings: UsbDacPreferences) =
         UsbAudioOutput(
             session = session,
             format = testFormat,
             channels = testTopology.channelCount,
             sampleRateHz = 44100,
-            initialVolumeDb = initialVolumeDb,
+            usbSettings = usbSettings,
             usbAudioManager = mockk(relaxed = true),
         )
 
@@ -108,7 +115,7 @@ class UsbAudioOutputVolumeRestoreTest {
         // to undo on the way back to a direct track -- every channel starts at unity (0).
         for (channel in 0..2) UsbAudioController.setVolume(session, 0, channel)
 
-        output(session, initialVolumeDb = -2000).restoreVolumeAfterRelock()
+        output(session, fakeUsbSettings(initialVolumeDb = -2000)).restoreVolumeAfterRelock()
 
         assertEquals(-2000, featureUnit.volumeOf(0))
         assertEquals(-2000, featureUnit.volumeOf(1))
@@ -116,50 +123,54 @@ class UsbAudioOutputVolumeRestoreTest {
     }
 
     @Test
-    fun `a stale initialVolumeDb silently overwrites a live volume-key change made after construction`() {
+    fun `restoreVolumeAfterRelock picks up a volume-key change made after construction, not a stale snapshot`() {
         val featureUnit = FakeFeatureUnit(unitId = 7, controlInterfaceId = 0)
         val session = sessionWith(featureUnit)
         // This UsbAudioOutput instance was built when the session started, at -2000 (the dB
         // persisted in UsbDacPreferences.volumeDb at that moment) -- see
-        // UsbAudioOutputProvider.getAudioOutput's own doc comment on when a *new* instance (and so
-        // a fresh initialVolumeDb read) actually happens: only on a track/format change, not here.
-        val usbAudioOutput = output(session, initialVolumeDb = -2000)
+        // UsbAudioOutputProvider.getAudioOutput's own doc comment on when a *new* instance (and
+        // so a fresh read) actually happens: only on a track/format change, not here.
+        val usbSettings = fakeUsbSettings(initialVolumeDb = -2000)
+        val usbAudioOutput = output(session, usbSettings)
 
         // The user then genuinely lowers the volume via the physical keys, mid-track, with no
-        // format change -- the real live write path (UsbControlWriterImpl.setVolume ->
-        // UsbAudioController.setVolume), reaching the same hardware this same UsbAudioOutput
-        // instance is still alive for.
-        for (channel in 0..2) UsbAudioController.setVolume(session, -6000, channel)
-        assertEquals(-6000, featureUnit.volumeOf(0))
+        // format change -- the real live write path (UsbControlWriterImpl.setVolume) updates
+        // usbSettings.volumeDb synchronously; simulated directly here since this test is only
+        // about what restoreVolumeAfterRelock reads, not that write path itself (already covered
+        // by UsbControlWriterImplTest).
+        usbSettings.volumeDb = -6000
 
-        // ...and sometime later, this instance survives a real release+reclaim (a pause that sat
-        // past the grace period -- a stoplight, a nav prompt, a phone call -- is exactly this,
-        // per UsbAudioOutput.play()'s own "redo the whole clock/mute dance... if !activated"
-        // comment) and activateAndStream() re-runs its relock dance, including this call.
+        // ...and sometime later, this instance survives a real release+reclaim -- which is
+        // exactly what forces the Feature Unit to unity first (UsbVolumeControllerImpl.
+        // prepareForHalHandoff, see UsbAudioManagerFunctionalTest), leaving the hardware here at
+        // 0 right before activateAndStream() re-runs its relock dance (e.g. a pause that sat past
+        // the release grace period -- a stoplight, a nav prompt, a phone call -- then resuming;
+        // see UsbAudioOutput.play()'s own "redo the whole clock/mute dance... if !activated"
+        // comment). Starting from unity here, not from -6000 already written, is what makes this
+        // assertion actually depend on which target restoreVolumeAfterRelock computes -- starting
+        // from the live value already in place would pass vacuously even with the bug still live.
+        for (channel in 0..2) UsbAudioController.setVolume(session, 0, channel)
+
         usbAudioOutput.restoreVolumeAfterRelock()
 
-        // If this is -6000 (what the user actually, deliberately set last), the hypothesis is
-        // wrong. It isn't: this instance never learned about that live change, so it restores to
-        // its own stale construction-time value instead, silently discarding the user's own most
-        // recent adjustment -- a second, distinct "volume jumps" mechanism from the already-fixed
-        // channel-0 bug, real and reachable through this exact, ordinary driving-session sequence
-        // (volume adjustment, then any pause long enough to actually release the claim).
-        assertEquals(-2000, featureUnit.volumeOf(0))
+        // Confirms the fix: this reads usbSettings.volumeDb fresh, so it restores to -6000 (what
+        // the user actually, deliberately set last), not -2000 (this instance's own
+        // construction-time snapshot) -- before the fix, this assertion failed with -2000,
+        // demonstrating the real, now-fixed "volume jumps" mechanism this test is named for.
+        assertEquals(-6000, featureUnit.volumeOf(0))
+        assertEquals(-6000, featureUnit.volumeOf(1))
+        assertEquals(-6000, featureUnit.volumeOf(2))
     }
 
     @Test
-    fun `a brand-new instance after a real track change does read the live volume correctly`() {
+    fun `falls back to the device's own reported midpoint when no volume has ever been persisted`() {
         val featureUnit = FakeFeatureUnit(unitId = 7, controlInterfaceId = 0)
+        featureUnit.range = -12800 to 0 // midpoint -6400.
         val session = sessionWith(featureUnit)
-        for (channel in 0..2) UsbAudioController.setVolume(session, -6000, channel)
+        for (channel in 0..2) UsbAudioController.setVolume(session, 0, channel)
 
-        // UsbAudioOutputProvider.getAudioOutput() builds a *new* UsbAudioOutput per track/format
-        // change, reading UsbDacPreferences.volumeDb fresh at that point -- simulated here by
-        // simply constructing with the now-current value, the same thing a real track change
-        // would do. This is the one path that already works correctly; included as a contrast to
-        // the test above, which is what the mid-track pause/resume path above lacks.
-        output(session, initialVolumeDb = -6000).restoreVolumeAfterRelock()
+        output(session, fakeUsbSettings(initialVolumeDb = null)).restoreVolumeAfterRelock()
 
-        assertEquals(-6000, featureUnit.volumeOf(0))
+        assertEquals(-6400, featureUnit.volumeOf(0))
     }
 }

@@ -154,7 +154,7 @@ internal class UsbDeviceDiscoveryImpl(
         usbManager.requestPermission(device, permissionIntent)
     }
 
-    private fun refresh() {
+    internal fun refresh() {
         val found =
             usbManager.deviceList.values.filter { it.isAudioDevice() }.map {
                 UsbAudioDevice(it, usbManager.hasPermission(it))

@@ -56,7 +56,7 @@ import timber.log.Timber as L
  * attachment" bookkeeping needs pruning whenever the attached-device set changes, same timing as
  * before extraction -- synchronously, right after [devices] itself updates.
  */
-class UsbDeviceDiscoveryImpl(
+internal class UsbDeviceDiscoveryImpl(
     private val context: Context,
     private val usbManager: UsbManager,
     private val usbSettings: UsbDacPreferences,

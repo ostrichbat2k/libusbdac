@@ -41,7 +41,7 @@ import org.ostrichbat2k.usbdac.api.UsbVolumeController
  * both of these silently, since the invariant they rely on was only ever documented as scattered
  * comments pointing at a function in a different file.
  */
-class UsbVolumeControllerImpl(
+internal class UsbVolumeControllerImpl(
     private val audioManager: AudioManager,
     private val usbSettings: UsbDacPreferences,
     private val controlState: StateFlow<UsbControlState?>,

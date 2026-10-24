@@ -56,7 +56,7 @@ import timber.log.Timber as L
  * effects (invalidating its `activeFormat` cache, tearing the session down) -- they stay
  * [UsbAudioManager]'s responsibility, just invoked from here via callback rather than inlined.
  */
-class UsbClaimControllerImpl(
+internal class UsbClaimControllerImpl(
     private val audioManager: AudioManager,
     private val volumeController: UsbVolumeController,
     private val getActiveSession: () -> UsbAudioSession?,
@@ -213,7 +213,7 @@ class UsbClaimControllerImpl(
      * activation, including activateDac's own tail release where nothing was actually trying to
      * use the device via HAL at all.
      */
-    override fun releaseClaim(delayMs: Long, awaitAndroidTakeover: Boolean, deactivateOnTimeout: Boolean = false) {
+    override fun releaseClaim(delayMs: Long, awaitAndroidTakeover: Boolean, deactivateOnTimeout: Boolean) {
         pendingRelease?.cancel(false)
         if (activeStreamCount > 0) {
             // Something is genuinely streaming right now and still needs the claim -- a caller

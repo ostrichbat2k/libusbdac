@@ -56,6 +56,44 @@ import timber.log.Timber as L
 private data class ActiveStreamConfig(val format: UacStreamFormat, val sampleRateHz: Int)
 
 /**
+ * Everything [UsbAudioManager] knows about the current DAC-activation attempt, as one value
+ * instead of several independently-mutable fields. This file's own history is full of bugs
+ * caused by exactly that kind of drift (a format cache cleared without clearing the session it
+ * belonged to, an "is activating" flag that could disagree with whether a session actually
+ * existed, a cached sink that could outlive the session it was built for) -- modeling the three
+ * real states explicitly makes an illegal combination (e.g. "activating" while a session already
+ * exists) unrepresentable instead of merely undocumented.
+ */
+private sealed class SessionState {
+    /** No device activated, and nothing currently trying to activate one. */
+    data object Idle : SessionState()
+
+    /** [UsbAudioManager.activateDac] is running for [device] on its background thread right now. */
+    data class Activating(val device: UsbDevice, val settled: CompletableDeferred<Unit>) : SessionState()
+
+    /**
+     * A real [UsbAudioSession] exists and is ready (or was) for playback.
+     *
+     * [format] is null exactly when [UsbClaimController] has just reclaimed the interface back
+     * from the kernel (see [UsbAudioManager.clearActiveFormatOnReclaim]) -- the kernel driver may
+     * have reset the alt-setting as a side effect, invalidating any cached "this is already
+     * selected" assumption without invalidating the session itself. See
+     * [UsbAudioManager.ensureFormatActive] for where that distinction is actually load-bearing.
+     *
+     * [sink] is the lazily-built, session-wide-cached [AudioSink] -- see
+     * [UsbAudioManager.resolveActiveSink]'s doc comment for why one instance is deliberately
+     * shared across every [RoutingAudioSink]. Living inside this state instead of its own field
+     * means a cached sink can no longer outlive the session it was built against.
+     */
+    data class Active(
+        val session: UsbAudioSession,
+        val format: UacStreamFormat?,
+        val rateHz: Int,
+        val sink: AudioSink? = null,
+    ) : SessionState()
+}
+
+/**
  * Detects attached USB Audio Class devices (candidate DACs), manages permission requests, and
  * once permitted, activates a persistent [UsbAudioSession] configured and ready for playback.
  * [resolveActiveSink] hands out an [AudioSink] wired to that session for the player to use in place
@@ -146,7 +184,7 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
             audioManager,
             volumeController,
             getActiveSession = { activeSession },
-            onReclaimed = { activeFormat = null },
+            onReclaimed = { clearActiveFormatOnReclaim() },
             onClaimFailed = {
                 logEvent("Failed to reclaim USB interface from kernel -- deactivating session")
                 deactivateDac()
@@ -244,7 +282,7 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
             // resolveActiveSink()'s activeSink?.let { return it } check runs before it ever
             // consults this trial's result -- without clearing it here, a track secretly
             // assigned to fallback would still get handed back a live, cached bit-perfect sink.
-            activeSink = null
+            (sessionState as? SessionState.Active)?.let { sessionState = it.copy(sink = null) }
         }
     }
 
@@ -376,20 +414,56 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
     // started) is still around to show the effect.
     @Volatile private var preferredBitResolution: Int = 16
 
-    @Volatile private var activeSession: UsbAudioSession? = null
-    @Volatile private var activeFormat: UacStreamFormat? = null
-    // Completed (regardless of success/failure) when the most recently started activateDac()
-    // call returns. Lets a caller about to start playback (see awaitActivation) give it a bounded
-    // chance to finish first, rather than racing it on its own background thread and permanently
-    // committing that track to the fallback sink -- RoutingAudioSink.resolveForConfigure only
-    // re-checks resolveActiveSink() on the *next* configure() call (next track), not this one, so
-    // losing this race once means that whole track plays on fallback with no recovery short of
-    // the user manually changing tracks. Confirmed, reproduced on real hardware: autoplay-resume
-    // on a cold app launch calling configure() before a freshly-granted permission's activateDac()
-    // thread had finished.
-    @Volatile private var activationSettled: CompletableDeferred<Unit>? = null
+    /**
+     * The single source of truth for where this device's activation is at -- see [SessionState]'s
+     * own doc comment for the three states. [activeSession]/[activeFormat]/[activeRateHz]/
+     * [activeSink]/[isActivating] below are read-only views derived from this one field, not
+     * separately-mutable fields of their own. Written by [activateDac] (success path),
+     * [settleActivation] (failure path, or a concurrent [deactivateDac] already settled it),
+     * [deactivateDac] itself, and a handful of single-field `copy()` updates
+     * ([ensureFormatActive], [clearActiveFormatOnReclaim], [resolveActiveSink], [rollAbxTrial])
+     * that only make sense while already [SessionState.Active].
+     */
+    @Volatile private var sessionState: SessionState = SessionState.Idle
 
-    private val _isActivating = MutableStateFlow(false)
+    private val activeSession: UsbAudioSession?
+        get() = (sessionState as? SessionState.Active)?.session
+
+    private val activeFormat: UacStreamFormat?
+        get() = (sessionState as? SessionState.Active)?.format
+
+    // Only ever meaningful once a session is Active -- see SessionState.Active.rateHz's own doc
+    // comment for why nothing outside that state ever needs to read this.
+    private val activeRateHz: Int
+        get() = (sessionState as? SessionState.Active)?.rateHz ?: SUPPORTED_SAMPLE_RATE_HZ
+
+    // A host app building more than one audio renderer (e.g. a preferred decoder plus a
+    // fallback), each wrapping its own RoutingAudioSink -- both get queried
+    // (supportsFormat/getFormatSupport, and apparently position) by ExoPlayer's renderer
+    // machinery, not just whichever one actually ends up streaming. resolveActiveSink() returning
+    // a *fresh* UsbAudioSink per call meant each RoutingAudioSink got its own, separate instance:
+    // one got genuinely configured and streamed correctly, but the other sat forever unconfigured
+    // (sampleRateHz=0), and its getCurrentPositionUs() dutifully reporting
+    // AudioSink.CURRENT_POSITION_NOT_SET (Long.MIN_VALUE) seems to be exactly what corrupted the
+    // player's overall position tracking -- observed as it jumping to nonsense values like
+    // -999999475 before stalling. Caching a single instance per session, shared across both
+    // RoutingAudioSinks, means whichever one actually gets used reports real progress to *both*
+    // callers.
+    private val activeSink: AudioSink?
+        get() = (sessionState as? SessionState.Active)?.sink
+
+    private val isActivating: Boolean
+        get() = sessionState is SessionState.Activating
+
+    /**
+     * Clears a stale cached alt-setting selection after [UsbClaimController] reclaims the
+     * interface back from the kernel -- see [SessionState.Active.format]'s doc comment. A no-op
+     * if nothing is [SessionState.Active] right now.
+     */
+    private fun clearActiveFormatOnReclaim() {
+        (sessionState as? SessionState.Active)?.let { sessionState = it.copy(format = null) }
+    }
+
     private val _blockPlayback = MutableStateFlow(false)
     /**
      * True whenever a host UI's play control should hold off starting playback rather than let
@@ -413,13 +487,13 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
 
     /** Recomputes [blockPlayback] from current settings and activation state. */
     private fun updateBlockPlayback() {
-        _blockPlayback.value = usbSettings.enabled && usbSettings.bitPerfectMode && _isActivating.value
+        _blockPlayback.value = usbSettings.enabled && usbSettings.bitPerfectMode && isActivating
     }
 
     /**
-     * Runs [activateDac] on a dedicated background daemon thread, tracking both
-     * [activationSettled] (an awaitable deferred, see [awaitActivation]) and [blockPlayback]'s
-     * underlying activation flag around it -- the single place both [ensureActivated] and
+     * Runs [activateDac] on a dedicated background daemon thread, moving [sessionState] into
+     * [SessionState.Activating] (carrying the awaitable deferred -- see [awaitActivation]) around
+     * it and back out via [settleActivation] -- the single place both [ensureActivated] and
      * [retryActivation] dispatch activation from, so neither signal can drift out of sync with
      * whether a background activation is actually running.
      *
@@ -439,15 +513,13 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
     private fun runActivation(device: UsbDevice) {
         activationAttemptedFor = device.deviceName
         val deferred = CompletableDeferred<Unit>()
-        activationSettled = deferred
-        _isActivating.value = true
+        sessionState = SessionState.Activating(device, deferred)
         updateBlockPlayback()
         Thread {
                 try {
                     activateDac(device)
                 } finally {
-                    _isActivating.value = false
-                    updateBlockPlayback()
+                    settleActivation()
                     deferred.complete(Unit)
                 }
             }
@@ -456,13 +528,18 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
                 start()
             }
     }
-    // Only reflects SUPPORTED_SAMPLE_RATE_HZ (UAC 2.0/3.0) or whatever activateDac negotiated for
-    // UAC 1.0 until the first track actually plays -- after that, ensureFormatActive keeps this
-    // in sync with whatever rate each track genuinely streams at, since different tracks can (and
-    // do) use different rates within the same DAC session. Purely for display (UsbControlState,
-    // the Settings screen) and the Capabilities probe before any track has played; actual
-    // playback never consults this, it uses each track's own real rate directly.
-    @Volatile private var activeRateHz: Int = SUPPORTED_SAMPLE_RATE_HZ
+
+    /**
+     * Called when a background [activateDac] call returns, success or failure. If it already
+     * transitioned [sessionState] to [SessionState.Active], leave it alone -- this only has to
+     * recover from the failure case (still [SessionState.Activating]) or a concurrent
+     * [deactivateDac] that already reset to [SessionState.Idle] in the meantime (checking first
+     * avoids implying this call is what decided we're idle, when it wasn't).
+     */
+    private fun settleActivation() {
+        if (sessionState is SessionState.Activating) sessionState = SessionState.Idle
+        updateBlockPlayback()
+    }
 
     private var started = false
     // The device name [ensureActivated] has already tried activation for during its current
@@ -504,24 +581,10 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
     /** Requests permission to use [device]. The result arrives asynchronously via broadcast. */
     fun requestPermission(device: UsbDevice) = deviceDiscovery.requestPermission(device)
 
-    // A host app building more than one audio renderer (e.g. a preferred decoder plus a
-    // fallback), each wrapping its own RoutingAudioSink -- both get queried
-    // (supportsFormat/getFormatSupport, and apparently position) by ExoPlayer's renderer
-    // machinery, not just whichever one actually ends up streaming. resolveActiveSink() returning
-    // a *fresh* UsbAudioSink per call meant each
-    // RoutingAudioSink got its own, separate instance: one got genuinely configured and streamed
-    // correctly, but the other sat forever unconfigured (sampleRateHz=0), and its
-    // getCurrentPositionUs() dutifully reporting AudioSink.CURRENT_POSITION_NOT_SET
-    // (Long.MIN_VALUE) seems to be exactly what corrupted the player's overall position
-    // tracking -- observed as it jumping to nonsense values like -999999475 before stalling.
-    // Caching a single instance per session, shared across both RoutingAudioSinks, means
-    // whichever one actually gets used reports real progress to *both* callers.
-    @Volatile private var activeSink: AudioSink? = null
-
     /**
      * Waits, bounded by [timeoutMs], for the most recently started [activateDac] to finish --
-     * see [activationSettled]'s doc comment for why a caller about to start playback would want
-     * this. A no-op (returns immediately) if nothing's currently activating, so this costs
+     * see [SessionState.Activating]'s doc comment for why a caller about to start playback would
+     * want this. A no-op (returns immediately) if nothing's currently activating, so this costs
      * nothing outside the actual race window (right after a permission grant, a device
      * reattachment, or anything else that re-triggers [activateDac]). Deliberately doesn't
      * report success/failure -- the caller should just proceed with playback either way;
@@ -544,7 +607,7 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
      * inconsistency; 8000ms gives real margin over the measured worst case.
      */
     suspend fun awaitActivation(timeoutMs: Long = 8000L) {
-        val deferred = activationSettled ?: return
+        val deferred = (sessionState as? SessionState.Activating)?.settled ?: return
         withTimeoutOrNull(timeoutMs) { deferred.await() }
     }
 
@@ -574,7 +637,7 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
      * gap now -- this function itself didn't change, only who's allowed to reach it.
      */
     private fun ensureActivated() {
-        if (activeSession != null || _isActivating.value) return
+        if (sessionState != SessionState.Idle) return
         if (!usbSettings.enabled) return
         val device = deviceDiscovery.devices.value.firstOrNull { it.hasPermission } ?: return
         if (device.device.deviceName == activationAttemptedFor) return
@@ -661,7 +724,7 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
             // shouldUseFloatOutput() check.
             .setEnableFloatOutput(true)
             .build()
-            .also { activeSink = it }
+            .also { sink -> (sessionState as? SessionState.Active)?.let { sessionState = it.copy(sink = sink) } }
     }
 
     /**
@@ -710,14 +773,14 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
             UsbAudioController.reassertKernelEviction(session)
             ok = UsbAudioController.selectFormat(session, format)
             if (ok) {
-                activeFormat = format
+                (sessionState as? SessionState.Active)?.let { sessionState = it.copy(format = format) }
                 logEvent("Switched to ${format.bitResolution}-bit (alt=${format.alternateSetting}) for upcoming track")
             } else {
                 logEvent("Failed to switch to ${format.bitResolution}-bit (alt=${format.alternateSetting}) for upcoming track")
             }
         }
         if (configChanged) {
-            activeRateHz = sampleRateHz
+            (sessionState as? SessionState.Active)?.let { sessionState = it.copy(rateHz = sampleRateHz) }
             refreshControlState(session, activeFormat ?: format, session.device.productName ?: session.device.deviceName)
         }
         return ok
@@ -1041,9 +1104,7 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
             logEvent("Clock valid: ${UsbAudioController.getClockValid(session)}")
         }
 
-        activeSession = session
-        activeFormat = format
-        activeRateHz = rateHz ?: SUPPORTED_SAMPLE_RATE_HZ
+        sessionState = SessionState.Active(session, format, rateHz ?: SUPPORTED_SAMPLE_RATE_HZ)
         refreshControlState(session, format, device.productName ?: device.deviceName)
         logEvent("DAC session ready: $format at ${activeRateHz} Hz")
 
@@ -1285,9 +1346,7 @@ class UsbAudioManager(private val context: Context, private val usbSettings: Usb
         // one that triggered the switch to fallback rather than a per-track liveness check.
         claimController.recordDeactivatedDevice(session?.device)
         session?.let { UsbAudioController.release(it) }
-        activeSession = null
-        activeFormat = null
-        activeSink = null
+        sessionState = SessionState.Idle
         _controlState.value = null
         _capabilities.value = null
     }

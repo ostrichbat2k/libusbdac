@@ -18,14 +18,18 @@
 
 package org.ostrichbat2k.usbdac.streaming
 
+import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.Format
+import androidx.media3.common.AuxEffectInfo
+import androidx.media3.common.PlaybackParameters
 import androidx.media3.exoplayer.audio.AudioSink
 import io.mockk.every
 import io.mockk.mockk
 import io.mockk.verify
 import io.mockk.verifyOrder
 import kotlinx.coroutines.flow.MutableStateFlow
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -336,5 +340,122 @@ class RoutingAudioSinkTest {
             usbAudioManager.reportPlaybackRoute(
                 UsbAudioManager.PlaybackRoute.Fallback(bitDepth = 24, sampleRateHz = 44100, channels = 2))
         }
+    }
+
+    @Test
+    fun `configure reports a 32-bit Fallback bitDepth for a 32-bit PCM track`() {
+        every { usbAudioManager.resolveActiveSink(any()) } returns null
+
+        sink.configure(format(sampleRate = 44100, channels = 2, pcmEncoding = C.ENCODING_PCM_32BIT), 0, null)
+
+        verify {
+            usbAudioManager.reportPlaybackRoute(
+                UsbAudioManager.PlaybackRoute.Fallback(bitDepth = 32, sampleRateHz = 44100, channels = 2))
+        }
+    }
+
+    @Test
+    fun `configure reports a Fallback route with a null bitDepth for a non-PCM encoding`() {
+        every { usbAudioManager.resolveActiveSink(any()) } returns null
+
+        sink.configure(format(sampleRate = 44100, channels = 2, pcmEncoding = C.ENCODING_AC3), 0, null)
+
+        verify {
+            usbAudioManager.reportPlaybackRoute(
+                UsbAudioManager.PlaybackRoute.Fallback(bitDepth = null, sampleRateHz = 44100, channels = 2))
+        }
+    }
+
+    @Test
+    fun `configure reports a Fallback route and rethrows when the chosen delegate's configure throws`() {
+        every { usbAudioManager.resolveActiveSink(any()) } returns null
+        val boom = RuntimeException("boom")
+        every { fallback.configure(any(), any(), isNull()) } throws boom
+        val fmt = format(sampleRate = 44100)
+
+        val thrown = try {
+            sink.configure(fmt, 0, null)
+            null
+        } catch (e: RuntimeException) {
+            e
+        }
+
+        assertTrue(thrown === boom)
+        verify {
+            usbAudioManager.reportPlaybackRoute(
+                UsbAudioManager.PlaybackRoute.Fallback(bitDepth = 16, sampleRateHz = 44100, channels = 2))
+        }
+    }
+
+    // ---- plain one-line delegations to current() ----
+
+    @Test
+    fun `setListener forwards to the current delegate and remembers it for a later switch`() {
+        every { usbAudioManager.resolveActiveSink(any()) } returns usbSink
+        supporting(usbSink)
+        sink.configure(format(), 0, null)
+        val listener = mockk<AudioSink.Listener>(relaxed = true)
+
+        sink.setListener(listener)
+
+        verify { usbSink.setListener(listener) }
+    }
+
+    @Test
+    fun `getCurrentPositionUs, handleBuffer, playToEndOfStream, isEnded, and hasPendingData forward to the current delegate`() {
+        every { usbAudioManager.resolveActiveSink(any()) } returns usbSink
+        supporting(usbSink)
+        sink.configure(format(), 0, null)
+        every { usbSink.getCurrentPositionUs(any()) } returns 12345L
+        every { usbSink.isEnded() } returns true
+        every { usbSink.hasPendingData() } returns true
+        val buffer = java.nio.ByteBuffer.allocate(4)
+
+        assertEquals(12345L, sink.getCurrentPositionUs(false))
+        sink.handleBuffer(buffer, 0L, 1)
+        sink.playToEndOfStream()
+        assertTrue(sink.isEnded())
+        assertTrue(sink.hasPendingData())
+
+        verify { usbSink.handleBuffer(buffer, 0L, 1) }
+        verify { usbSink.playToEndOfStream() }
+    }
+
+    @Test
+    fun `playback-parameter, skip-silence, audio-attribute, and tunneling getters-setters forward to the current delegate`() {
+        every { usbAudioManager.resolveActiveSink(any()) } returns usbSink
+        supporting(usbSink)
+        sink.configure(format(), 0, null)
+        val params = PlaybackParameters(1.5f)
+        every { usbSink.getPlaybackParameters() } returns params
+        every { usbSink.getSkipSilenceEnabled() } returns true
+        val attributes = AudioAttributes.DEFAULT
+        every { usbSink.getAudioAttributes() } returns attributes
+        every { usbSink.audioTrackBufferSizeUs } returns 9999L
+        val auxEffectInfo = AuxEffectInfo(1, 0.5f)
+
+        sink.setPlaybackParameters(params)
+        assertEquals(params, sink.getPlaybackParameters())
+        sink.setSkipSilenceEnabled(true)
+        assertTrue(sink.getSkipSilenceEnabled())
+        sink.setAudioAttributes(attributes)
+        assertEquals(attributes, sink.getAudioAttributes())
+        sink.setAudioSessionId(7)
+        sink.setAuxEffectInfo(auxEffectInfo)
+        assertEquals(9999L, sink.getAudioTrackBufferSizeUs())
+        sink.enableTunnelingV21()
+        sink.disableTunneling()
+        sink.setVolume(0.5f)
+        sink.flush()
+
+        verify { usbSink.setPlaybackParameters(params) }
+        verify { usbSink.setSkipSilenceEnabled(true) }
+        verify { usbSink.setAudioAttributes(attributes) }
+        verify { usbSink.setAudioSessionId(7) }
+        verify { usbSink.setAuxEffectInfo(auxEffectInfo) }
+        verify { usbSink.enableTunnelingV21() }
+        verify { usbSink.disableTunneling() }
+        verify { usbSink.setVolume(0.5f) }
+        verify { usbSink.flush() }
     }
 }

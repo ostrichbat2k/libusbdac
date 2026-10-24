@@ -20,6 +20,7 @@ package org.ostrichbat2k.usbdac
 
 import android.content.Context
 import android.hardware.usb.UsbDevice
+import android.hardware.usb.UsbInterface
 import android.hardware.usb.UsbManager
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
@@ -118,6 +119,29 @@ class UsbAudioManagerImplTest {
             controlInterface = mockk(relaxed = true),
             streamingAltSettings = emptyMap(),
         )
+
+    /** A real [SessionState.Active] session, built the same way the other tests do (via a mocked
+     * [dacActivator] + [triggerActivation]/[awaitActivation]), but with a [UsbAudioSession] the
+     * caller can both stub (its mocked [UsbAudioSession.connection]) and keep a reference to. */
+    private fun activatedSession(
+        topology: UacPlaybackTopology = testTopology,
+        streamingAltSettings: Map<Int, UsbInterface> = emptyMap(),
+    ): UsbAudioSession {
+        val device = fakeDevice()
+        val session =
+            UsbAudioSession(
+                device = device,
+                connection = mockk(relaxed = true),
+                topology = topology,
+                controlInterface = mockk(relaxed = true),
+                streamingAltSettings = streamingAltSettings,
+            )
+        every { dacActivator.activate(device) } returns UsbDacActivator.Result(session, testFormat, 44100)
+        devicesFlow.value = listOf(UsbAudioDevice(device, hasPermission = true))
+        manager.triggerActivation()
+        runBlocking { manager.awaitActivation() }
+        return session
+    }
 
     private lateinit var context: Context
     private lateinit var usbManager: UsbManager
@@ -436,5 +460,158 @@ class UsbAudioManagerImplTest {
 
         manager.reportPipelineStats(null)
         assertNull(manager.pipelineStats.value)
+    }
+
+    // ---- ensureFormatActive's real body (an active session, not the no-session early return) ----
+
+    private val testFormatAlt2 =
+        UacStreamFormat(
+            alternateSetting = 2,
+            bitResolution = 16,
+            subslotSize = 2,
+            clusterDescriptorId = -1,
+            endpointAddress = 0x02,
+            maxPacketSize = 192,
+            isAsync = true,
+        )
+
+    @Test
+    fun `ensureFormatActive returns false when the kernel reclaim fails`() {
+        val altIface = mockk<UsbInterface>(relaxed = true)
+        val session = activatedSession(streamingAltSettings = mapOf(1 to altIface))
+        every { session.connection.claimInterface(any(), any()) } returns false
+
+        assertFalse(manager.ensureFormatActive(testFormatAlt2, 48000))
+        verify(exactly = 0) { session.connection.setInterface(any()) }
+    }
+
+    @Test
+    fun `ensureFormatActive reissues SET_INTERFACE on a rate-only change, even with the same bit depth`() {
+        val altIface = mockk<UsbInterface>(relaxed = true)
+        val session = activatedSession(streamingAltSettings = mapOf(1 to altIface))
+        every { session.connection.claimInterface(any(), any()) } returns true
+        every { session.connection.setInterface(altIface) } returns true
+
+        assertTrue(manager.ensureFormatActive(testFormat, 44100))
+        assertTrue(manager.ensureFormatActive(testFormat, 96000))
+
+        verify(exactly = 2) { session.connection.setInterface(altIface) }
+    }
+
+    @Test
+    fun `ensureFormatActive does not reissue SET_INTERFACE a second time for the same, already-active format and rate`() {
+        val altIface = mockk<UsbInterface>(relaxed = true)
+        val session = activatedSession(streamingAltSettings = mapOf(1 to altIface))
+        every { session.connection.claimInterface(any(), any()) } returns true
+        every { session.connection.setInterface(altIface) } returns true
+
+        assertTrue(manager.ensureFormatActive(testFormat, 44100))
+        assertTrue(manager.ensureFormatActive(testFormat, 44100))
+
+        verify(exactly = 1) { session.connection.setInterface(altIface) }
+    }
+
+    @Test
+    fun `ensureFormatActive returns false when selectFormat's SET_INTERFACE itself fails`() {
+        val altIface = mockk<UsbInterface>(relaxed = true)
+        val altIface2 = mockk<UsbInterface>(relaxed = true)
+        val session = activatedSession(streamingAltSettings = mapOf(1 to altIface, 2 to altIface2))
+        every { session.connection.claimInterface(any(), any()) } returns true
+        every { session.connection.setInterface(any()) } returns false
+
+        assertFalse(manager.ensureFormatActive(testFormatAlt2, 48000))
+        verify(exactly = 1) { session.connection.setInterface(altIface2) }
+    }
+
+    // ---- getPowerDomainState/getClockInfo's real body (topology actually declares one) ----
+
+    @Test
+    fun `getPowerDomainState issues a real read when the topology declares a Power Domain`() {
+        val topology = testTopology.copy(powerDomainId = 5)
+        val session = activatedSession(topology = topology)
+        every { session.connection.controlTransfer(any(), any(), any(), any(), any(), any(), any()) } answers
+            {
+                val buffer = arg<ByteArray>(4)
+                buffer[0] = 2 // UsbAudioController.PD_STATE_D2
+                1
+            }
+
+        org.junit.Assert.assertEquals(2, manager.getPowerDomainState())
+    }
+
+    @Test
+    fun `getClockInfo issues a real read when the topology declares a Clock Source`() {
+        val topology = testTopology.copy(clockSourceId = 2)
+        val session = activatedSession(topology = topology)
+        every { session.connection.controlTransfer(any(), any(), any(), any(), any(), any(), any()) } answers
+            {
+                val buffer = arg<ByteArray>(4)
+                if (buffer.size == 4) {
+                    // 48000 Hz, little-endian.
+                    buffer[0] = 0x80.toByte(); buffer[1] = 0xBB.toByte(); buffer[2] = 0; buffer[3] = 0
+                    4
+                } else {
+                    buffer[0] = 1 // valid
+                    1
+                }
+            }
+
+        org.junit.Assert.assertEquals(48000 to true, manager.getClockInfo())
+    }
+
+    // ---- retryActivation's no-device branch ----
+
+    @Test
+    fun `retryActivation logs and returns when no USB audio device is attached at all`() {
+        devicesFlow.value = emptyList()
+
+        manager.retryActivation()
+
+        verify(exactly = 0) { dacActivator.activate(any()) }
+        verify(exactly = 0) { discovery.requestPermission(any()) }
+    }
+
+    // ---- simple delegations and property reads, otherwise untouched by the tests above ----
+
+    @Test
+    fun `setMuted, setVolume, and setMixerGain delegate to the control writer`() {
+        manager.setMuted(true)
+        manager.setVolume(-10)
+        manager.setMixerGain(inputChannel = 0, outputChannel = 0, valueDb = -5)
+    }
+
+    @Test
+    fun `notifyStreamingStarted and notifyStreamingStopped delegate to the claim controller`() {
+        manager.notifyStreamingStarted()
+        manager.notifyStreamingStopped()
+    }
+
+    @Test
+    fun `requestClaim fails with no active session`() {
+        org.junit.Assert.assertEquals(UsbAudioManager.ClaimOutcome.FAILED, manager.requestClaim())
+    }
+
+    @Test
+    fun `rollAbxTrial and submitAbxGuess delegate to the ABX tester`() {
+        every { usbSettings.abxTestMode } returns true
+        manager.rollAbxTrial()
+        manager.submitAbxGuess(true)
+    }
+
+    @Test
+    fun `devices is readable and starts out empty`() {
+        // Bound to the real, internally-constructed UsbDeviceDiscoveryImpl's own flow at
+        // construction time, not to the deviceDiscovery seam -- reassigning manager.deviceDiscovery
+        // (as setUp does, for the rest of this file) doesn't retarget an already-captured `val`,
+        // so this deliberately doesn't go through the devicesFlow/discovery mock at all.
+        assertTrue(manager.devices.value.isEmpty())
+    }
+
+    @Test
+    fun `capabilities, abxGroundTruth, abxPendingGuess, and abxStats are readable with no active session`() {
+        assertNull(manager.capabilities.value)
+        assertNull(manager.abxGroundTruth.value)
+        assertNull(manager.abxPendingGuess.value)
+        assertNotNull(manager.abxStats.value)
     }
 }

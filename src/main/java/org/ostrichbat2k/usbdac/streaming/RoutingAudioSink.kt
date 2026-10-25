@@ -195,12 +195,31 @@ class RoutingAudioSink(private val usbAudioManager: UsbAudioManager, private val
                 // Abandoning a live USB delegate -- without this, its UsbAudioOutput keeps its
                 // native thread running and the USB interface claimed forever, since nothing
                 // else here ever calls pause()/release() on a delegate this class has simply
-                // stopped forwarding calls to. pause() is exactly the hook that already hands
-                // the claim back to Android after a grace period (see UsbAudioOutput.pause()),
-                // so reusing it here (rather than a one-off release-only path) is deliberate --
-                // the same session's cached USB sink can come right back for a later compatible
-                // track, same as resuming from a real user pause.
-                existing.pause()
+                // stopped forwarding calls to.
+                //
+                // flush(), not pause() -- confirmed, reproduced, a real bug: this abandonment
+                // happens whenever the *next* track's format can't go out over USB at all (e.g.
+                // a 96kHz file against a 44.1/48kHz-only device), not just a same-track pause.
+                // pause() deliberately leaves UsbAudioOutput's ring buffer untouched (so a real
+                // user pause/resume continues exactly where it left off) -- but that means
+                // whatever was still unplayed in it (up to UsbAudioTuning.RING_BUFFER_MS, 5s)
+                // stayed frozen there, abandoned mid-track, while a fully separate HAL-fallback
+                // track played out in between. Because this same DefaultAudioSink/UsbAudioOutput
+                // instance is cached for the whole DAC session and gets reused verbatim the next
+                // time a format-compatible track comes along (see this function's own `existing
+                // === liveUsbSink` branch above), Media3's own canReuseAudioOutput() fast path
+                // never rebuilds it when the format matches -- so the new track's samples just
+                // got appended behind that stale, never-played leftover in the same ring buffer,
+                // and played out first: the abandoned track's audio cutting off early, then
+                // bleeding into the *next* USB-compatible track's start once resumed. flush()
+                // discards it (and tears down the native thread/claim) instead of leaving it to
+                // resurface later. This does give up the ALREADY_CLAIMED fast resume (see
+                // UsbAudioOutput.activateAndStream()'s own doc comment) if the grace period
+                // hasn't lapsed yet -- but an abandonment like this is specifically triggered by
+                // a *different* track needing fallback, which by construction plays for a while
+                // before anything could switch back, so that grace period has essentially always
+                // already expired by then anyway.
+                existing.flush()
             }
             pendingListener?.let(chosen::setListener)
             // A real hand-off is happening (not just re-confirming the same delegate) -- let the

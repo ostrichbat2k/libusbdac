@@ -19,6 +19,7 @@
 #include <unistd.h>
 
 #include "fake_jni.h"
+#include "log_capture.h"
 
 extern "C" {
 jboolean Java_org_ostrichbat2k_usbdac_streaming_UsbNative_disconnectKernelDriver(
@@ -229,15 +230,25 @@ protected:
     // silently dropped one of these checks, since execution would just fall through to the
     // ioctl call and land on the same false. Capturing the specific LOGE line this check emits
     // is what actually distinguishes "rejected here" from "rejected somewhere else".
+    //
+    // Uses usb_native_test::LogCapture (an in-process buffer our own android/log.h stub writes
+    // to), not testing::internal::CaptureStderr -- CaptureStderr redirects the real fd 2, which
+    // would also swallow AddressSanitizer's own crash report if the wrapped call actually
+    // overruns a buffer instead of hitting a clean validation return, turning a real
+    // memory-safety regression into a silent, undiagnosable `exit 1`. Confirmed this the hard
+    // way: temporarily removing submitIso's packet-count bound produced a genuine ASan
+    // heap-buffer-overflow that printed nothing until CaptureStderr was replaced with this.
     jboolean submitAndExpectLog(jint slot, FakeJavaArray* data, FakeJavaArray* lens,
                                  const char* expectedLogSubstring) {
-        testing::internal::CaptureStderr();
-        jboolean result = submit(slot, data, lens);
-        std::string log = testing::internal::GetCapturedStderr();
-        EXPECT_NE(log.find(expectedLogSubstring), std::string::npos)
-                << "expected log to contain \"" << expectedLogSubstring << "\", actual log: "
-                << log;
-        return result;
+        std::string log;
+        {
+            usb_native_test::LogCapture capture(&log);
+            jboolean result = submit(slot, data, lens);
+            EXPECT_NE(log.find(expectedLogSubstring), std::string::npos)
+                    << "expected log to contain \"" << expectedLogSubstring << "\", actual log: "
+                    << log;
+            return result;
+        }
     }
 
     FakeJni jni_;
@@ -298,15 +309,9 @@ TEST_F(SubmitIso, RejectsPacketTotalExceedingBufferCapacity) {
 }
 
 TEST_F(SubmitIso, WellFormedInputReachesTheIoctlCall) {
-    // A validation rejection and a reached-but-failing ioctl() both return JNI_FALSE on this
-    // /dev/null stand-in fd -- the only way to confirm *which* branch ran is the log line.
     FakeJavaArray data = FakeJavaArray::OfBytes({1, 2, 3, 4});
     FakeJavaArray lens = FakeJavaArray::OfInts({2, 2});
-    testing::internal::CaptureStderr();
-    jboolean result = submit(0, &data, &lens);
-    std::string log = testing::internal::GetCapturedStderr();
-    EXPECT_EQ(result, JNI_FALSE);
-    EXPECT_NE(log.find("SUBMITURB failed"), std::string::npos) << "actual log: " << log;
+    EXPECT_EQ(submitAndExpectLog(0, &data, &lens, "SUBMITURB failed"), JNI_FALSE);
 }
 
 // --- reapIso: the only two branches reachable without a real completed URB. ---

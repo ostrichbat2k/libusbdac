@@ -59,6 +59,18 @@ interface UsbDacPreferences {
     val abxTestMode: Boolean
 
     /**
+     * How much of the DAC's full native volume range (whatever the attached device's own
+     * min..max Feature Unit range happens to be -- it varies per device, see
+     * [UsbDeviceCapabilities]) one physical-volume-key/system-volume-UI press should move,
+     * expressed as a percentage from 1 (finest) to [MAX_VOLUME_STEP_PERCENT] (coarsest). A
+     * percentage rather than a fixed step count because the same raw dB*256 delta means wildly
+     * different perceived jumps on different devices' Feature Unit ranges. Not a hard contract:
+     * implementations should coerce into `1..MAX_VOLUME_STEP_PERCENT` rather than assume a
+     * caller-supplied value is already in range.
+     */
+    val volumeStepPercent: Int
+
+    /**
      * Add a listener to be notified of settings changes.
      *
      * @param listener The listener to add.
@@ -81,5 +93,13 @@ interface UsbDacPreferences {
 
         /** Called when [abxTestMode] has changed. */
         fun onAbxTestModeChanged() {}
+
+        /** Called when [volumeStepPercent] has changed. */
+        fun onVolumeStepPercentChanged() {}
+    }
+
+    companion object {
+        /** The upper bound [volumeStepPercent] may be set to. */
+        const val MAX_VOLUME_STEP_PERCENT = 10
     }
 }

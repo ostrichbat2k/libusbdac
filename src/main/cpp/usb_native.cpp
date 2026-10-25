@@ -326,19 +326,14 @@ Java_org_ostrichbat2k_usbdac_streaming_UsbNative_submitIso(
     return JNI_TRUE;
 }
 
-// Blocks until a submitted URB completes (or is cancelled by closeIsoStream from another
-// thread), returning its slot index so the caller can refill and resubmit it. Returns -1
-// on error/cancellation.
-extern "C" JNIEXPORT jint JNICALL
-Java_org_ostrichbat2k_usbdac_streaming_UsbNative_reapIso(JNIEnv* /*env*/, jobject /*thiz*/, jlong handle) {
-    IsoStream* stream = lookupStream(handle);
-    if (!stream) return -1;
-
-    struct usbdevfs_urb* reaped = nullptr;
-    int ret = ioctl(stream->fd, USBDEVFS_REAPURB, &reaped);
-    if (ret != 0 || !reaped) {
-        return -1;
-    }
+// Scans a just-reaped (completed) URB's per-packet results and returns the slot index to
+// refill/resubmit, or -1 if its usercontext slot is bogus. Pure data processing over an
+// already-completed urb -- no I/O of its own, the real ioctl() that produces one happens in
+// reapIso() below -- split out specifically so this logic is directly testable with a hand-built
+// usbdevfs_urb, without a real USB device ever completing one for real (see
+// native-test/usb_native_test.cpp). External linkage (no `static`/anonymous namespace) so that
+// test binary can call it directly.
+int processReapedUrb(const struct usbdevfs_urb* reaped, int packetsPerUrb, int numUrbs) {
     if (reaped->status != 0) {
         LOGE("Reaped urb slot %ld with status=%d actual_length=%d",
              (long) (intptr_t) reaped->usercontext, reaped->status, reaped->actual_length);
@@ -351,13 +346,13 @@ Java_org_ostrichbat2k_usbdac_streaming_UsbNative_reapIso(JNIEnv* /*env*/, jobjec
     // status is exactly the kind of gap that would make a transfer look completely clean while
     // the device received partial or no usable audio data.
     int numPackets = reaped->number_of_packets;
-    if (numPackets < 0 || numPackets > stream->packetsPerUrb) {
-        // iso_frame_desc[] was allocated for exactly stream->packetsPerUrb entries (see
+    if (numPackets < 0 || numPackets > packetsPerUrb) {
+        // iso_frame_desc[] was allocated for exactly packetsPerUrb entries (see
         // openIsoStream) -- this should never happen since the kernel only ever reaps a urb we
         // ourselves submitted, but trusting number_of_packets blindly as a loop bound would turn
         // any unexpected kernel/driver value into an out-of-bounds read past the array's end.
         LOGE("Reaped urb slot %ld has implausible number_of_packets=%d (max %d), skipping packet scan",
-             (long) (intptr_t) reaped->usercontext, numPackets, stream->packetsPerUrb);
+             (long) (intptr_t) reaped->usercontext, numPackets, packetsPerUrb);
         numPackets = 0;
     }
     int badPackets = 0;
@@ -383,14 +378,30 @@ Java_org_ostrichbat2k_usbdac_streaming_UsbNative_reapIso(JNIEnv* /*env*/, jobjec
     }
 
     intptr_t slot = (intptr_t) reaped->usercontext;
-    if (slot < 0 || slot >= stream->numUrbs) {
+    if (slot < 0 || slot >= numUrbs) {
         // The caller uses this return value directly as an array index to refill/resubmit --
         // an out-of-range value here must never reach it.
         LOGE("Reaped urb has out-of-range usercontext slot=%ld (numUrbs=%d)",
-             (long) slot, stream->numUrbs);
+             (long) slot, numUrbs);
         return -1;
     }
-    return (jint) slot;
+    return (int) slot;
+}
+
+// Blocks until a submitted URB completes (or is cancelled by closeIsoStream from another
+// thread), returning its slot index so the caller can refill and resubmit it. Returns -1
+// on error/cancellation.
+extern "C" JNIEXPORT jint JNICALL
+Java_org_ostrichbat2k_usbdac_streaming_UsbNative_reapIso(JNIEnv* /*env*/, jobject /*thiz*/, jlong handle) {
+    IsoStream* stream = lookupStream(handle);
+    if (!stream) return -1;
+
+    struct usbdevfs_urb* reaped = nullptr;
+    int ret = ioctl(stream->fd, USBDEVFS_REAPURB, &reaped);
+    if (ret != 0 || !reaped) {
+        return -1;
+    }
+    return (jint) processReapedUrb(reaped, stream->packetsPerUrb, stream->numUrbs);
 }
 
 // Shared by cancelIso() and closeIsoStream() -- both need every outstanding URB discarded

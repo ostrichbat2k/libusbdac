@@ -147,7 +147,7 @@ class RoutingAudioSinkTest {
     }
 
     @Test
-    fun `configure falls back and pauses the abandoned delegate when the USB session dies`() {
+    fun `configure falls back and flushes the abandoned delegate when the USB session dies`() {
         every { usbAudioManager.resolveActiveSink(any()) } returns usbSink
         supporting(usbSink)
         val fmt = format()
@@ -156,7 +156,11 @@ class RoutingAudioSinkTest {
         every { usbAudioManager.resolveActiveSink(any()) } returns null
         sink.configure(fmt, 0, null)
 
-        verify { usbSink.pause() }
+        // flush(), not pause() -- a dead session has nothing left worth preserving, and flush()
+        // (unlike pause()) actually tears the native thread/claim down instead of leaving an
+        // already-dead delegate paused forever. See pendingSwitch's and commitDelegateSwitch's
+        // own doc comments for why this specific call changed.
+        verify { usbSink.flush() }
         verify(exactly = 1) { fallback.configure(fmt, 0, null) }
         verify(exactly = 2) { usbAudioManager.reportPlaybackRoute(UsbAudioManager.PlaybackRoute.Switching) }
         verify { usbAudioManager.releaseClaim(delayMs = 0, awaitAndroidTakeover = true, deactivateOnTimeout = true) }
@@ -171,7 +175,7 @@ class RoutingAudioSinkTest {
         unsupporting(usbSink)
         sink.configure(format(sampleRate = 96000), 0, null)
 
-        verify { usbSink.pause() }
+        verify { usbSink.flush() }
         verify(exactly = 1) { fallback.configure(any(), any(), any()) }
 
         // Next track: the device supports it again, and the live session was never torn down --
@@ -179,6 +183,114 @@ class RoutingAudioSinkTest {
         supporting(usbSink)
         sink.configure(format(sampleRate = 44100), 0, null)
         verify(exactly = 2) { usbSink.configure(any(), any(), any()) }
+    }
+
+    // ---- deferred cross-delegate switch: see pendingSwitch's doc comment ----
+    //
+    // Real, reproduced bug: abandoning a live USB delegate the moment the *next* track's
+    // configure() call revealed it needs fallback (e.g. a 96kHz file against a 44.1/48kHz-only
+    // device) cut the *current* track off by however much it still had genuinely unplayed,
+    // already-buffered audio -- confirmed via a live logcat-correlated repro, then reproduced on
+    // real hardware even after switching the abandon call from pause() to flush() (which only
+    // fixed a secondary symptom: the abandoned audio bleeding into a *later* track instead of
+    // vanishing silently). The actual fix is deferring the delegate swap itself until the old
+    // delegate's hasPendingData() genuinely goes false, mirroring exactly how a plain
+    // (non-routing) DefaultAudioSink defers its own internal AudioOutput swap.
+
+    @Test
+    fun `configure defers abandoning a live USB delegate until its pending data drains`() {
+        every { usbAudioManager.resolveActiveSink(any()) } returns usbSink
+        supporting(usbSink)
+        sink.configure(format(sampleRate = 44100), 0, null)
+        every { usbSink.hasPendingData() } returns true
+        every { usbSink.getCurrentPositionUs(any()) } returns 55555L
+
+        unsupporting(usbSink)
+        sink.configure(format(sampleRate = 96000), 0, null)
+
+        // existing still has real, undrained audio from the first track -- nothing abandoned or
+        // switched yet, even though configure() for the second (unsupported) track already ran.
+        verify(exactly = 0) { usbSink.flush() }
+        verify(exactly = 0) { fallback.configure(any(), any(), any()) }
+        // current() still routes to the old delegate during the deferred window, so the first
+        // track keeps reporting its own real, still-advancing position and pending state.
+        assertTrue(sink.hasPendingData())
+        assertEquals(55555L, sink.getCurrentPositionUs(false))
+        // Reported immediately anyway -- this window can last as long as the old track still has
+        // buffered audio, and the Now Playing screen shouldn't look frozen for that whole span.
+        verify { usbAudioManager.reportPlaybackRoute(UsbAudioManager.PlaybackRoute.Switching) }
+    }
+
+    @Test
+    fun `handleBuffer rejects buffers while a deferred switch's old delegate is still draining, then commits once it's done`() {
+        every { usbAudioManager.resolveActiveSink(any()) } returns usbSink
+        supporting(usbSink)
+        sink.configure(format(sampleRate = 44100), 0, null)
+        every { usbSink.hasPendingData() } returns true
+        unsupporting(usbSink)
+        val fmt96k = format(sampleRate = 96000)
+        sink.configure(fmt96k, 0, null)
+        val buffer = java.nio.ByteBuffer.allocate(4)
+
+        // Still draining -- this buffer (already decoded against the *new* track's format)
+        // can't go anywhere yet: not to the old delegate (wrong format), not to the new one
+        // (not configured yet). Rejecting it is ordinary AudioSink backpressure -- the renderer
+        // retries later instead of either dropping it or corrupting anything.
+        assertFalse(sink.handleBuffer(buffer, 0L, 1))
+        verify(exactly = 0) { usbSink.handleBuffer(any(), any(), any()) }
+        verify(exactly = 0) { fallback.handleBuffer(any(), any(), any()) }
+        verify(exactly = 0) { usbSink.flush() }
+        verify(exactly = 0) { fallback.configure(any(), any(), any()) }
+
+        // Now genuinely drained -- the very next handleBuffer() call completes the deferred
+        // switch (flush the old delegate, configure the new one) and forwards this buffer to it.
+        every { usbSink.hasPendingData() } returns false
+        every { fallback.handleBuffer(buffer, 0L, 1) } returns true
+
+        assertTrue(sink.handleBuffer(buffer, 0L, 1))
+        verify { usbSink.flush() }
+        verify { fallback.configure(fmt96k, 0, null) }
+        verify { fallback.handleBuffer(buffer, 0L, 1) }
+    }
+
+    @Test
+    fun `reset clears a pending deferred switch so a later handleBuffer doesn't commit it`() {
+        every { usbAudioManager.resolveActiveSink(any()) } returns usbSink
+        supporting(usbSink)
+        sink.configure(format(sampleRate = 44100), 0, null)
+        every { usbSink.hasPendingData() } returns true
+        unsupporting(usbSink)
+        sink.configure(format(sampleRate = 96000), 0, null)
+
+        sink.reset()
+        verify { usbSink.reset() }
+
+        every { usbAudioManager.resolveActiveSink(any()) } returns null
+        val buffer = java.nio.ByteBuffer.allocate(4)
+        sink.handleBuffer(buffer, 0L, 1)
+
+        // The abandoned switch's own flush()/configure() never run after reset() -- only a
+        // fresh current() resolution (fallback, since no USB sink is live post-reset) handles
+        // this buffer, not the stale plan that was pending when reset() was called.
+        verify(exactly = 0) { usbSink.flush() }
+        verify(exactly = 0) { fallback.configure(any(), any(), any()) }
+        verify { fallback.handleBuffer(buffer, 0L, 1) }
+    }
+
+    @Test
+    fun `release clears a pending deferred switch`() {
+        every { usbAudioManager.resolveActiveSink(any()) } returns usbSink
+        supporting(usbSink)
+        sink.configure(format(sampleRate = 44100), 0, null)
+        every { usbSink.hasPendingData() } returns true
+        unsupporting(usbSink)
+        sink.configure(format(sampleRate = 96000), 0, null)
+
+        sink.release()
+
+        verify { usbSink.release() }
+        verify(exactly = 0) { usbSink.flush() }
+        verify(exactly = 0) { fallback.configure(any(), any(), any()) }
     }
 
     @Test

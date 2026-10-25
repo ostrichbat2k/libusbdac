@@ -59,11 +59,11 @@ interface UsbDacPreferences {
     val abxTestMode: Boolean
 
     /**
-     * How many discrete steps the host app's physical-volume-key/system-volume-UI control should
-     * expose for the DAC's remote volume -- from 1 (a single full-range step) up to
-     * [MAX_VOLUME_STEPS] -- independent of the device's actual native dB resolution. Not a hard
-     * contract: implementations should coerce into `1..MAX_VOLUME_STEPS` rather than assume a
-     * caller-supplied value is already in range.
+     * How large one physical-volume-key/system-volume-UI press should move the DAC's remote
+     * volume, on a scale from 1 (the smallest, finest-grained move) to [MAX_VOLUME_STEPS] (the
+     * largest -- a single press jumps the whole way from min to max) -- independent of the
+     * device's actual native dB resolution. Not a hard contract: implementations should coerce
+     * into `1..MAX_VOLUME_STEPS` rather than assume a caller-supplied value is already in range.
      */
     val volumeSteps: Int
 

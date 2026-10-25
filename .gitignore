@@ -1,4 +1,5 @@
 /build
+native-test/build
 .gradle
 .cxx
 local.properties

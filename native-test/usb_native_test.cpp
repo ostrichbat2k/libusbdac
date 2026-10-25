@@ -16,7 +16,11 @@
 #include <jni.h>
 
 #include <fcntl.h>
+#include <linux/usbdevice_fs.h>
 #include <unistd.h>
+
+#include <cstring>
+#include <vector>
 
 #include "fake_jni.h"
 #include "log_capture.h"
@@ -34,6 +38,11 @@ jint Java_org_ostrichbat2k_usbdac_streaming_UsbNative_reapIso(JNIEnv*, jobject, 
 void Java_org_ostrichbat2k_usbdac_streaming_UsbNative_cancelIso(JNIEnv*, jobject, jlong handle);
 void Java_org_ostrichbat2k_usbdac_streaming_UsbNative_closeIsoStream(JNIEnv*, jobject, jlong handle);
 }
+
+// Not extern "C" -- usb_native.cpp declares this with plain C++ linkage (it's an internal helper
+// with external linkage, never called from Kotlin/JNI directly), so this forward declaration
+// must match that exactly for the linker to resolve it.
+int processReapedUrb(const struct usbdevfs_urb* reaped, int packetsPerUrb, int numUrbs);
 
 namespace {
 
@@ -314,7 +323,8 @@ TEST_F(SubmitIso, WellFormedInputReachesTheIoctlCall) {
     EXPECT_EQ(submitAndExpectLog(0, &data, &lens, "SUBMITURB failed"), JNI_FALSE);
 }
 
-// --- reapIso: the only two branches reachable without a real completed URB. ---
+// --- reapIso itself: the only two branches reachable without a real completed URB (the rest of
+// its logic -- the packet scan -- is covered directly below via processReapedUrb). ---
 
 TEST_F(DummyFd, ReapOnFreshStreamReachesTheIoctlCallAndFails) {
     ASSERT_GE(fd_, 0);
@@ -322,6 +332,105 @@ TEST_F(DummyFd, ReapOnFreshStreamReachesTheIoctlCallAndFails) {
     ASSERT_NE(handle, 0);
     EXPECT_EQ(Java_org_ostrichbat2k_usbdac_streaming_UsbNative_reapIso(nullptr, nullptr, handle), -1);
     Java_org_ostrichbat2k_usbdac_streaming_UsbNative_closeIsoStream(nullptr, nullptr, handle);
+}
+
+// --- processReapedUrb: reapIso's packet-scan logic, extracted so it's testable with a
+// hand-built urb instead of a real completed ioctl(). usbdevfs_urb ends in a flexible array
+// member (iso_frame_desc[]) -- same allocate-raw-bytes-then-placement pattern usb_native.cpp
+// itself uses in openIsoStream, just on the stack/heap here instead of via calloc. ---
+
+class FakeUrb {
+public:
+    explicit FakeUrb(int numPackets) {
+        storage_.resize(sizeof(struct usbdevfs_urb) +
+                         (size_t) numPackets * sizeof(struct usbdevfs_iso_packet_desc));
+        memset(storage_.data(), 0, storage_.size());
+    }
+
+    struct usbdevfs_urb* get() { return reinterpret_cast<struct usbdevfs_urb*>(storage_.data()); }
+
+private:
+    std::vector<unsigned char> storage_;
+};
+
+TEST(ProcessReapedUrb, ReturnsSlotFromUsercontext) {
+    FakeUrb urb(/*numPackets=*/0);
+    urb.get()->number_of_packets = 0;
+    urb.get()->usercontext = (void*) (intptr_t) 2;
+    EXPECT_EQ(processReapedUrb(urb.get(), /*packetsPerUrb=*/4, /*numUrbs=*/4), 2);
+}
+
+TEST(ProcessReapedUrb, RejectsNegativeUsercontextSlot) {
+    FakeUrb urb(0);
+    urb.get()->usercontext = (void*) (intptr_t) -1;
+    EXPECT_EQ(processReapedUrb(urb.get(), 4, 4), -1);
+}
+
+TEST(ProcessReapedUrb, RejectsUsercontextSlotAtOrAboveNumUrbs) {
+    FakeUrb urb(0);
+    urb.get()->usercontext = (void*) (intptr_t) 4;  // numUrbs is 4, so 0-3 are the valid slots.
+    EXPECT_EQ(processReapedUrb(urb.get(), 4, /*numUrbs=*/4), -1);
+}
+
+TEST(ProcessReapedUrb, ClampsImplausibleNumPacketsInsteadOfScanningOutOfBounds) {
+    // packetsPerUrb is 4, so iso_frame_desc[] only has room for 4 entries -- a bogus
+    // number_of_packets above that must never be used as the scan's loop bound.
+    FakeUrb urb(/*numPackets=*/4);
+    urb.get()->number_of_packets = 99;
+    urb.get()->usercontext = (void*) (intptr_t) 1;
+
+    std::string log;
+    usb_native_test::LogCapture capture(&log);
+    int slot = processReapedUrb(urb.get(), /*packetsPerUrb=*/4, /*numUrbs=*/4);
+    EXPECT_EQ(slot, 1);
+    EXPECT_NE(log.find("implausible number_of_packets"), std::string::npos) << "actual log: " << log;
+}
+
+TEST(ProcessReapedUrb, CountsAndLogsShortOrFailedPackets) {
+    FakeUrb urb(/*numPackets=*/3);
+    struct usbdevfs_urb* u = urb.get();
+    u->number_of_packets = 3;
+    u->usercontext = (void*) (intptr_t) 0;
+    u->iso_frame_desc[0] = {/*length=*/100, /*actual_length=*/100, /*status=*/0};  // clean
+    u->iso_frame_desc[1] = {/*length=*/100, /*actual_length=*/40, /*status=*/0};   // short
+    u->iso_frame_desc[2] = {/*length=*/100, /*actual_length=*/0, /*status=*/1};    // failed
+
+    std::string log;
+    usb_native_test::LogCapture capture(&log);
+    int slot = processReapedUrb(u, 4, 4);
+    EXPECT_EQ(slot, 0);
+    EXPECT_NE(log.find("2/3 packets short/failed"), std::string::npos) << "actual log: " << log;
+    EXPECT_NE(log.find("140/300 bytes actually delivered"), std::string::npos) << "actual log: " << log;
+}
+
+TEST(ProcessReapedUrb, AllCleanPacketsLogsNothingAboutBadPackets) {
+    FakeUrb urb(/*numPackets=*/2);
+    struct usbdevfs_urb* u = urb.get();
+    u->number_of_packets = 2;
+    u->usercontext = (void*) (intptr_t) 0;
+    u->iso_frame_desc[0] = {/*length=*/48, /*actual_length=*/48, /*status=*/0};
+    u->iso_frame_desc[1] = {/*length=*/48, /*actual_length=*/48, /*status=*/0};
+
+    std::string log;
+    usb_native_test::LogCapture capture(&log);
+    int slot = processReapedUrb(u, 4, 4);
+    EXPECT_EQ(slot, 0);
+    EXPECT_EQ(log.find("short/failed"), std::string::npos) << "actual log: " << log;
+}
+
+TEST(ProcessReapedUrb, NonzeroAggregateStatusIsLoggedButDoesNotBlockTheSlotReturn) {
+    // The aggregate urb->status only reflects whether the submission as a whole was
+    // accepted/retired -- it's informational here, not a rejection condition on its own (see
+    // this function's own comment on why the per-packet scan exists instead).
+    FakeUrb urb(0);
+    urb.get()->status = -1;
+    urb.get()->usercontext = (void*) (intptr_t) 3;
+
+    std::string log;
+    usb_native_test::LogCapture capture(&log);
+    int slot = processReapedUrb(urb.get(), 4, 4);
+    EXPECT_EQ(slot, 3);
+    EXPECT_NE(log.find("with status=-1"), std::string::npos) << "actual log: " << log;
 }
 
 }  // namespace

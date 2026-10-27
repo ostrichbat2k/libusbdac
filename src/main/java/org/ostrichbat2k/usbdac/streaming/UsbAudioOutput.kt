@@ -212,6 +212,21 @@ class UsbAudioOutput(
      * grace window correctly hits the cheap path, and only a resume after a genuine release, or a
      * fresh instance's first-ever activation, pays the full relock cost.
      *
+     * [UsbAudioManager.consumeHardwareReset] additionally gates the fast path: [requestClaim]'s
+     * [UsbAudioManager.ClaimOutcome.ALREADY_CLAIMED] only means "`interfaceClaimed` didn't just
+     * flip false->true in *this* call" -- it says nothing about whether it flipped true->false
+     * and back again in between, via a caller other than this instance. Confirmed, reproduced:
+     * [UsbAudioManager.releaseClaim]'s own Android-takeover verification can silently reclaim the
+     * interface back to us on a timeout (a device that never gets recognized as an output while
+     * our own connection stays open) after already forcing every channel's gain to max for the
+     * handoff attempt -- leaving the hardware sitting at that forced level, with [requestClaim]
+     * later reporting ALREADY_CLAIMED to this exact resume as if nothing had happened. Without
+     * this check, that resume took the fast path below, never restoring the real volume: heard as
+     * "pause mid-track, leave it idle a few minutes, resume -> volume jumps to max until the next
+     * volume key press." Consumed (read-and-cleared) on every call, not just when [claim] is
+     * ALREADY_CLAIMED, so a genuine RECLAIMED hand-off -- which already pays the full relock cost
+     * below regardless -- doesn't leave this set and force an unnecessary extra one next time.
+     *
      * Returns false on failure instead of throwing -- a failure here, whether on the very first
      * genuine [play] call or a later resume from [pause], shouldn't crash playback, it should
      * just leave this instance non-functional; [isStalled] has a dedicated check for exactly that
@@ -237,7 +252,12 @@ class UsbAudioOutput(
             return false
         }
 
-        if (claim == UsbAudioManager.ClaimOutcome.ALREADY_CLAIMED && hasConfiguredHardware) {
+        // Always consumed, regardless of claim -- see this function's own doc comment.
+        val hardwareWasForcedForHandoff = usbAudioManager.consumeHardwareReset()
+
+        if (claim == UsbAudioManager.ClaimOutcome.ALREADY_CLAIMED &&
+            hasConfiguredHardware &&
+            !hardwareWasForcedForHandoff) {
             // Nothing else could have touched the device since this same instance last set it up
             // -- requestClaim() never actually let go of the interface (the release grace period
             // canceled before it ever fired), so the clock lock, mute state, and volume are

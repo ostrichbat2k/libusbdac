@@ -154,6 +154,13 @@ interface UsbAudioManager : UsbDacPreferences.Listener {
     fun requestClaim(): ClaimOutcome
 
     /**
+     * See [org.ostrichbat2k.usbdac.claim.UsbClaimController.consumeHardwareReset] -- exposed on
+     * this facade so [org.ostrichbat2k.usbdac.streaming.UsbAudioOutput], which only ever talks to
+     * the claim machinery through here, can consume it on every `activateAndStream()` call.
+     */
+    fun consumeHardwareReset(): Boolean
+
+    /**
      * Schedules handing the interface back to the kernel's own driver after [delayMs], canceling
      * any release already pending. Pass 0 to release immediately.
      *

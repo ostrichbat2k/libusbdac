@@ -102,6 +102,17 @@ internal class UsbClaimControllerImpl(
     // path, reintroducing the exact HAL-recognition bug this parameter exists to fix.
     @Volatile private var pendingDeactivateOnTimeout = false
 
+    // See UsbClaimController.consumeHardwareReset's own doc comment. Set wherever
+    // volumeController.prepareForHalHandoff() runs (the only place this hardware's gain gets
+    // forced to a HAL-handoff level outside of a user-initiated change) -- below, in
+    // doReleaseClaim -- and consumed (read-and-clear) by activateAndStream() on every call, not
+    // just once a genuine RECLAIMED hand-off is reported: requestClaim() alone can't distinguish
+    // "never released" from "released, then silently reclaimed back to us by
+    // awaitAndroidOutputTakeover's own timeout handling" -- both report ALREADY_CLAIMED to a
+    // caller resolving the claim *after* that reclaim already happened, even though the latter
+    // left the Feature Unit sitting at prepareForHalHandoff's forced gain, never restored.
+    @Volatile private var hardwareForcedForHandoff = false
+
     /** Called by [UsbAudioOutput] once it's actually claimed and streaming -- see [releaseClaim]. */
     override fun notifyStreamingStarted() {
         activeStreamCount++
@@ -110,6 +121,12 @@ internal class UsbClaimControllerImpl(
     /** The inverse of [notifyStreamingStarted] -- call before, not after, releasing anything. */
     override fun notifyStreamingStopped() {
         activeStreamCount = (activeStreamCount - 1).coerceAtLeast(0)
+    }
+
+    override fun consumeHardwareReset(): Boolean {
+        val was = hardwareForcedForHandoff
+        hardwareForcedForHandoff = false
+        return was
     }
 
     /** Whether we currently hold the raw interface claim -- see [interfaceClaimed]. */
@@ -257,7 +274,11 @@ internal class UsbClaimControllerImpl(
         val session = getActiveSession()
         if (session != null && interfaceClaimed) {
             // See UsbVolumeController.prepareForHalHandoff's doc comment for why this has to
-            // happen, and why it has to happen before releaseToKernel below, not after.
+            // happen, and why it has to happen before releaseToKernel below, not after. Also see
+            // hardwareForcedForHandoff's own doc comment -- this is the one place that flag needs
+            // setting, regardless of whether the takeover below ends up succeeding or getting
+            // silently reclaimed back to us on a timeout.
+            hardwareForcedForHandoff = true
             volumeController.prepareForHalHandoff(session, session.topology.channelCount)
             UsbAudioController.releaseToKernel(session)
             interfaceClaimed = false

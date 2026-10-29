@@ -22,7 +22,12 @@ import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbInterface
 import io.mockk.every
 import io.mockk.mockk
+import io.mockk.verify
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.ostrichbat2k.usbdac.UsbAudioManager
 import org.ostrichbat2k.usbdac.UsbDacPreferences
@@ -97,14 +102,18 @@ class UsbAudioOutputVolumeRestoreTest {
         }
     }
 
-    private fun output(session: UsbAudioSession, usbSettings: UsbDacPreferences) =
+    private fun output(
+        session: UsbAudioSession,
+        usbSettings: UsbDacPreferences,
+        usbAudioManager: UsbAudioManager = mockk(relaxed = true),
+    ) =
         UsbAudioOutput(
             session = session,
             format = testFormat,
             channels = testTopology.channelCount,
             sampleRateHz = 44100,
             usbSettings = usbSettings,
-            usbAudioManager = mockk(relaxed = true),
+            usbAudioManager = usbAudioManager,
         )
 
     @Test
@@ -172,5 +181,79 @@ class UsbAudioOutputVolumeRestoreTest {
         output(session, fakeUsbSettings(initialVolumeDb = null)).restoreVolumeAfterRelock()
 
         assertEquals(-6400, featureUnit.volumeOf(0))
+    }
+
+    /**
+     * [UsbAudioOutput.play] runs [UsbAudioOutput.activateAndStream] in the background now (see
+     * its own doc comment, part of #30) instead of blocking the caller for however long a real
+     * relock takes -- which opens a window where [UsbAudioOutput.pause] can land before that
+     * background attempt finishes. Drives [UsbAudioOutput.onActivationAttemptFinished] directly
+     * (the seam [play]'s background task calls into) rather than the real async [play], for the
+     * same reason [restoreVolumeAfterRelock] is tested directly: the alternative, successful-and-
+     * still-playing branch reaches [UsbNative] via `startStreamingThread()`, which throws
+     * `UnsatisfiedLinkError` in a plain JVM test.
+     */
+    @Test
+    fun `onActivationAttemptFinished hands the claim back instead of streaming when paused by the time activation finished`() {
+        val featureUnit = FakeFeatureUnit(unitId = 7, controlInterfaceId = 0)
+        val session = sessionWith(featureUnit)
+        val usbAudioManager = mockk<UsbAudioManager>(relaxed = true)
+        // paused starts true on a fresh instance (see its own doc comment) -- exactly the state
+        // play() would be in if pause() landed again before the background relock it kicked off
+        // ever got back to onActivationAttemptFinished.
+        val output = output(session, fakeUsbSettings(-2000), usbAudioManager)
+
+        output.onActivationAttemptFinished(succeeded = true)
+
+        verify { usbAudioManager.releaseClaim() }
+        verify(exactly = 0) { usbAudioManager.notifyStreamingStarted() }
+    }
+
+    @Test
+    fun `onActivationAttemptFinished does nothing but log when activation itself failed`() {
+        val featureUnit = FakeFeatureUnit(unitId = 7, controlInterfaceId = 0)
+        val session = sessionWith(featureUnit)
+        val usbAudioManager = mockk<UsbAudioManager>(relaxed = true)
+        val output = output(session, fakeUsbSettings(-2000), usbAudioManager)
+
+        output.onActivationAttemptFinished(succeeded = false)
+
+        verify(exactly = 0) { usbAudioManager.releaseClaim() }
+        verify(exactly = 0) { usbAudioManager.notifyStreamingStarted() }
+    }
+
+    /**
+     * [UsbAudioOutput.isStalled] used to be able to assume `!paused && !activated` was an
+     * instantaneous state -- [UsbAudioOutput.play] ran the whole relock inline, so nothing else
+     * ever got a chance to observe it mid-flight. Now that #30 moved that relock onto
+     * [UsbAudioOutput]'s own background executor, that window can last as long as a real relock
+     * does (1.6-2.9s, observed on real hardware) -- [isStalled] has to know not to report that as
+     * a stall. Blocks the real [play] call's background task inside a mocked
+     * [UsbAudioManager.requestClaim] (not a [UsbAudioController]/[UsbNative] call, so nothing
+     * native gets touched) to deterministically catch it mid-flight, without any sleep-based
+     * polling.
+     */
+    @Test
+    fun `isStalled does not report a stall while play()'s background relock is still in flight`() {
+        val featureUnit = FakeFeatureUnit(unitId = 7, controlInterfaceId = 0)
+        val session = sessionWith(featureUnit)
+        val usbAudioManager = mockk<UsbAudioManager>(relaxed = true)
+        val started = CountDownLatch(1)
+        val proceed = CountDownLatch(1)
+        every { usbAudioManager.requestClaim() } answers {
+            started.countDown()
+            proceed.await()
+            UsbAudioManager.ClaimOutcome.ALREADY_CLAIMED
+        }
+        val output = output(session, fakeUsbSettings(-2000), usbAudioManager)
+
+        output.play()
+        assertTrue("background activation never reached requestClaim()", started.await(2, TimeUnit.SECONDS))
+        assertFalse(output.isStalled())
+
+        // Let the background task finish (whatever it ends up doing from here isn't this test's
+        // concern) and release its executor rather than leaving a thread blocked on nothing.
+        proceed.countDown()
+        output.release()
     }
 }

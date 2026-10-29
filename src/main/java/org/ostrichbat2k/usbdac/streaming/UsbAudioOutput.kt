@@ -30,6 +30,7 @@ import androidx.media3.common.C
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.exoplayer.audio.AudioOutput
 import java.nio.ByteBuffer
+import java.util.concurrent.Executors
 import timber.log.Timber as L
 
 /**
@@ -158,6 +159,25 @@ class UsbAudioOutput(
     // below at least once -- see activateAndStream()'s ALREADY_CLAIMED branch for why this, not
     // just the claim outcome alone, has to gate the fast path.
     @Volatile private var hasConfiguredHardware = false
+    // True from the moment play() hands activateAndStream() off to activationExecutor until that
+    // task finishes (success or failure) -- see play()'s own doc comment for why this exists and
+    // isStalled()'s doc comment for why it has to suppress that check for exactly this window.
+    @Volatile private var activating = false
+    // Set by release() so a background activation that's still running when this instance is
+    // abandoned (e.g. a track skip landing mid-relock) hands back whatever it (re)claimed instead
+    // of starting a stream nothing will ever read from -- see play()'s completion callback.
+    @Volatile private var released = false
+
+    // Runs activateAndStream() off the thread that calls play() -- see play()'s own doc comment
+    // for why. Single-threaded like UsbControlWriterImpl's volumeExecutor/
+    // UsbClaimControllerImpl's claimScheduler, the same pattern elsewhere in this codebase for
+    // "blocking USB I/O that a caller shouldn't have to wait on": a second play() call while one
+    // is already in flight is a no-op (see the `!activating` guard below), so this never actually
+    // queues more than one task at a time in practice.
+    private val activationExecutor =
+        Executors.newSingleThreadExecutor { r ->
+            Thread(r, "UsbAudioOutput-Activation").apply { isDaemon = true }
+        }
 
     // Deliberately no init{} block here anymore. This used to call activateAndStream()
     // unconditionally at construction -- claiming the raw USB interface and starting the native
@@ -212,11 +232,31 @@ class UsbAudioOutput(
      * grace window correctly hits the cheap path, and only a resume after a genuine release, or a
      * fresh instance's first-ever activation, pays the full relock cost.
      *
+     * [UsbAudioManager.consumeHardwareReset] additionally gates the fast path: [requestClaim]'s
+     * [UsbAudioManager.ClaimOutcome.ALREADY_CLAIMED] only means "`interfaceClaimed` didn't just
+     * flip false->true in *this* call" -- it says nothing about whether it flipped true->false
+     * and back again in between, via a caller other than this instance. Confirmed, reproduced:
+     * [UsbAudioManager.releaseClaim]'s own Android-takeover verification can silently reclaim the
+     * interface back to us on a timeout (a device that never gets recognized as an output while
+     * our own connection stays open) after already forcing every channel's gain to max for the
+     * handoff attempt -- leaving the hardware sitting at that forced level, with [requestClaim]
+     * later reporting ALREADY_CLAIMED to this exact resume as if nothing had happened. Without
+     * this check, that resume took the fast path below, never restoring the real volume: heard as
+     * "pause mid-track, leave it idle a few minutes, resume -> volume jumps to max until the next
+     * volume key press." Consumed (read-and-cleared) on every call, not just when [claim] is
+     * ALREADY_CLAIMED, so a genuine RECLAIMED hand-off -- which already pays the full relock cost
+     * below regardless -- doesn't leave this set and force an unnecessary extra one next time.
+     *
      * Returns false on failure instead of throwing -- a failure here, whether on the very first
      * genuine [play] call or a later resume from [pause], shouldn't crash playback, it should
      * just leave this instance non-functional; [isStalled] has a dedicated check for exactly that
      * so [androidx.media3.exoplayer.audio.DefaultAudioSink]'s own stall-recovery eventually
      * notices and flushes, same as any other genuine stall.
+     *
+     * Deliberately does not itself start the streaming thread or set [activated] -- only that the
+     * interface is claimed and the hardware is correctly configured. [play] runs this on
+     * [activationExecutor] and decides, once it returns, whether this instance is still even
+     * supposed to be playing by then -- see [play]'s own doc comment.
      */
     private fun activateAndStream(): Boolean {
         val claim = usbAudioManager.requestClaim()
@@ -237,7 +277,12 @@ class UsbAudioOutput(
             return false
         }
 
-        if (claim == UsbAudioManager.ClaimOutcome.ALREADY_CLAIMED && hasConfiguredHardware) {
+        // Always consumed, regardless of claim -- see this function's own doc comment.
+        val hardwareWasForcedForHandoff = usbAudioManager.consumeHardwareReset()
+
+        if (claim == UsbAudioManager.ClaimOutcome.ALREADY_CLAIMED &&
+            hasConfiguredHardware &&
+            !hardwareWasForcedForHandoff) {
             // Nothing else could have touched the device since this same instance last set it up
             // -- requestClaim() never actually let go of the interface (the release grace period
             // canceled before it ever fired), so the clock lock, mute state, and volume are
@@ -254,9 +299,6 @@ class UsbAudioOutput(
             // function's own doc comment for the real bug it closes (a brand-new instance for a
             // new track also sees ALREADY_CLAIMED, every time, because of its own provider's
             // preparatory ensureFormatActive() call).
-            startStreamingThread()
-            activated = true
-            usbAudioManager.notifyStreamingStarted()
             return true
         }
 
@@ -372,13 +414,7 @@ class UsbAudioOutput(
         // corrected once, after the fact.
         UsbAudioController.setMute(session, muted = false)
 
-        startStreamingThread()
-        activated = true
         hasConfiguredHardware = true
-        // Tells UsbAudioManager's Settings-screen mutators (setMuted/setVolume/setMixerGain)
-        // not to release the claim out from under this still-running stream just because their
-        // own one-off control write finished -- see notifyStreamingStarted's doc comment.
-        usbAudioManager.notifyStreamingStarted()
         return true
     }
 
@@ -426,18 +462,70 @@ class UsbAudioOutput(
         }
     }
 
+    /**
+     * Either this is a fresh instance's very first play() (activated starts false -- see the
+     * comment where init{} used to be), or pause() released the claim (or activateAndStream()
+     * failed outright last time) -- either way redo the whole clock/mute dance from scratch
+     * rather than just starting the thread, since the hardware clock/mute state can't be assumed
+     * to be already correct.
+     *
+     * Runs that dance ([activateAndStream]) on [activationExecutor] rather than inline, so this
+     * call returns immediately instead of blocking the caller (ExoPlayer's playback thread) for
+     * however long a genuine relock takes -- observed on real hardware as 1.6-2.9s once #28's fix
+     * made that relock actually happen whenever it's needed, instead of being silently (and
+     * incorrectly) skipped. [paused] still flips synchronously so [write] starts buffering
+     * immediately either way.
+     *
+     * The background task re-checks [paused] (and [released]) right before it would actually
+     * start the stream thread, not just at the point [play] was first called -- a [pause] (or
+     * [release]) landing anywhere during the relock is otherwise silently overwritten the moment
+     * the relock finishes, audibly starting playback again after the caller already stopped it.
+     * When that re-check fails, this hands back whatever it just (re)claimed instead of leaving
+     * the interface claimed and the hardware configured for a stream that's never going to run.
+     * Rapid play/pause/play toggling during a single relock is safe without any explicit
+     * cancellation: the `!activating` guard below means at most one task is ever in flight, and
+     * that task's own re-check always reflects whichever call was most recent by the time it
+     * finishes.
+     */
     override fun play() {
         L.i("UsbAudioOutput: play()")
         paused = false
-        if (!activated) {
-            // Either this is a fresh instance's very first play() (activated starts false --
-            // see the comment where init{} used to be), or pause() released the claim (or
-            // activateAndStream() failed outright last time) -- either way redo the whole
-            // clock/mute dance from scratch rather than just starting the thread, since the
-            // hardware clock/mute state can't be assumed to be already correct.
-            if (!activateAndStream()) {
-                L.w("UsbAudioOutput: failed to resume streaming -- isStalled() will reflect this")
+        if (!activated && !activating) {
+            activating = true
+            activationExecutor.execute {
+                try {
+                    onActivationAttemptFinished(activateAndStream())
+                } finally {
+                    activating = false
+                }
             }
+        }
+    }
+
+    /**
+     * Decides what to do once a background [activateAndStream] attempt from [play] finishes --
+     * pulled out of [play] itself purely so a test can drive this one decision directly, the same
+     * seam pattern [restoreVolumeAfterRelock] already uses to stay reachable without ever
+     * touching [UsbNative] (the `succeeded = true, still playing` branch below still does, via
+     * [startStreamingThread], so a test exercises the other branches instead).
+     *
+     * internal, not private: see [restoreVolumeAfterRelock]'s own doc comment for why.
+     */
+    internal fun onActivationAttemptFinished(succeeded: Boolean) {
+        if (!succeeded) {
+            L.w("UsbAudioOutput: failed to resume streaming -- isStalled() will reflect this")
+            return
+        }
+        if (!paused && !released) {
+            startStreamingThread()
+            activated = true
+            // Tells UsbAudioManager's Settings-screen mutators (setMuted/setVolume/setMixerGain)
+            // not to release the claim out from under this still-running stream just because
+            // their own one-off control write finished -- see notifyStreamingStarted's doc
+            // comment.
+            usbAudioManager.notifyStreamingStarted()
+        } else {
+            usbAudioManager.releaseClaim()
         }
     }
 
@@ -554,6 +642,10 @@ class UsbAudioOutput(
     }
 
     override fun release() {
+        // See play()'s doc comment: lets a background activation still in flight for this
+        // instance (a track skip landing mid-relock) hand back its claim instead of starting a
+        // stream nothing will ever read from.
+        released = true
         stopStreamingThread()
         if (activated) {
             activated = false
@@ -563,6 +655,12 @@ class UsbAudioOutput(
             // pause/resume that this is specifically not.
             usbAudioManager.releaseClaim(delayMs = 0)
         }
+        // Not shutdownNow(): a task already running (an activation this release() landed in the
+        // middle of) still needs to finish and see [released] itself -- see play()'s doc comment.
+        // shutdown() just stops the (daemon, so harmless either way) thread from idling forever
+        // once it does, since one instance is constructed per sample rate and a long session can
+        // accumulate many.
+        activationExecutor.shutdown()
     }
 
     override fun setVolume(volume: Float) {
@@ -605,6 +703,13 @@ class UsbAudioOutput(
      * back short of the user manually skipping the track.
      */
     override fun isStalled(): Boolean {
+        // play() just handed activateAndStream() off to activationExecutor and hasn't heard back
+        // yet -- this is no longer the instantaneous window it used to be when play() ran that
+        // dance inline (a genuine relock takes 1.6-2.9s on real hardware), so it has to be
+        // excluded here explicitly rather than relying on the check below never having time to
+        // see it. If activation goes on to fail, activating clears with activated still false,
+        // and the check below catches it on the very next call -- same as before.
+        if (activating) return false
         // Not paused, but activateAndStream() never got the claim/clock lock back after the last
         // pause() released it -- nothing will ever make lastUrbSubmittedAtMs move on its own in
         // this state (streaming itself is false), so the check below alone would never catch it.

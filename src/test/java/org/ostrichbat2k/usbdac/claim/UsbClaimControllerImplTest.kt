@@ -209,6 +209,32 @@ class UsbClaimControllerImplTest {
     }
 
     @Test
+    fun `consumeHardwareReset is false until a real release forces the handoff, then true exactly once`() {
+        val device = fakeDevice()
+        val session = fakeSession(device)
+        stubAlreadyRecognized(device)
+        activeSession = session
+        controller.markAlreadyClaimed()
+
+        assertFalse(controller.consumeHardwareReset())
+
+        controller.releaseClaim(delayMs = 0, awaitAndroidTakeover = false)
+
+        assertTrue(controller.consumeHardwareReset())
+        assertFalse(controller.consumeHardwareReset())
+    }
+
+    @Test
+    fun `consumeHardwareReset stays false when releaseClaim never actually touches the device`() {
+        controller.markAlreadyClaimed()
+        activeSession = null // no session -- releaseClaim(0) below is a no-op, see its own test
+
+        controller.releaseClaim(delayMs = 0, awaitAndroidTakeover = false)
+
+        assertFalse(controller.consumeHardwareReset())
+    }
+
+    @Test
     fun `releaseClaim(0) does nothing when there is no active session`() {
         controller.markAlreadyClaimed()
         activeSession = null

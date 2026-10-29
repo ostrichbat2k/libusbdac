@@ -493,9 +493,15 @@ class UsbAudioOutput(
         if (!activated && !activating) {
             activating = true
             activationExecutor.execute {
+                // Brackets the whole attempt, not just requestClaim() itself -- see
+                // UsbClaimController.beginClaimAttempt's own doc comment for why
+                // notifyStreamingStarted() alone (only called below once this succeeds) isn't
+                // early enough a guard against a concurrent releaseClaim() mid-relock.
+                usbAudioManager.beginClaimAttempt()
                 try {
                     onActivationAttemptFinished(activateAndStream())
                 } finally {
+                    usbAudioManager.endClaimAttempt()
                     activating = false
                 }
             }

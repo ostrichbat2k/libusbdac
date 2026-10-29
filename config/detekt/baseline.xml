@@ -197,6 +197,7 @@
     <ID>TooManyFunctions:UsbAudioManagerImpl.kt$UsbAudioManagerImpl : UsbAudioManager</ID>
     <ID>TooManyFunctions:UsbAudioOutput.kt$UsbAudioOutput : AudioOutput</ID>
     <ID>TooManyFunctions:UsbAudioOutputProvider.kt$UsbAudioOutputProvider : AudioOutputProvider</ID>
+    <ID>TooManyFunctions:UsbClaimController.kt$UsbClaimController</ID>
     <ID>TooManyFunctions:UsbClaimControllerImpl.kt$UsbClaimControllerImpl : UsbClaimController</ID>
   </CurrentIssues>
 </SmellBaseline>

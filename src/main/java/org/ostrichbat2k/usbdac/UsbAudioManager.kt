@@ -129,6 +129,17 @@ interface UsbAudioManager : UsbDacPreferences.Listener {
     fun notifyStreamingStopped()
 
     /**
+     * See [org.ostrichbat2k.usbdac.claim.UsbClaimController.beginClaimAttempt] -- exposed on this
+     * facade so [org.ostrichbat2k.usbdac.streaming.UsbAudioOutput] can bracket its whole
+     * `activateAndStream()` attempt with this and [endClaimAttempt], not just [requestClaim]
+     * itself.
+     */
+    fun beginClaimAttempt()
+
+    /** The inverse of [beginClaimAttempt] -- call exactly once per [beginClaimAttempt], always. */
+    fun endClaimAttempt()
+
+    /**
      * Reports live pipeline stats, called periodically (not per-buffer) by whatever is actively
      * streaming, and with `null` the moment it genuinely stops -- see [pipelineStats].
      */

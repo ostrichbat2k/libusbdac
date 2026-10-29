@@ -290,6 +290,58 @@ class UsbClaimControllerImplTest {
     }
 
     @Test
+    fun `releaseClaim is suppressed entirely while a claim attempt is in flight`() {
+        // Regression test for the race this pair closes: without it, a releaseClaim() landing
+        // between requestClaim() succeeding and the attempt's eventual notifyStreamingStarted()
+        // (e.g. UsbAudioOutput.activateAndStream() still mid-relock) ran concurrently with that
+        // attempt, handing the interface back and forcing hardware gain to a HAL-handoff level
+        // out from under it -- reintroducing the exact stale-max-volume bug a prior fix here
+        // tried to close.
+        val device = fakeDevice()
+        val session = fakeSession(device)
+        stubAlreadyRecognized(device)
+        activeSession = session
+        controller.markAlreadyClaimed()
+        controller.beginClaimAttempt()
+
+        controller.releaseClaim(delayMs = 0, awaitAndroidTakeover = false)
+
+        assertTrue(controller.isClaimed())
+        verify(exactly = 0) { UsbAudioController.releaseToKernel(any()) }
+    }
+
+    @Test
+    fun `releaseClaim proceeds once the in-flight claim attempt ends`() {
+        val device = fakeDevice()
+        val session = fakeSession(device)
+        stubAlreadyRecognized(device)
+        activeSession = session
+        controller.markAlreadyClaimed()
+        controller.beginClaimAttempt()
+        controller.endClaimAttempt()
+
+        controller.releaseClaim(delayMs = 0, awaitAndroidTakeover = false)
+
+        assertFalse(controller.isClaimed())
+        verify { UsbAudioController.releaseToKernel(session) }
+    }
+
+    @Test
+    fun `endClaimAttempt never drives the in-flight count below zero`() {
+        val device = fakeDevice()
+        val session = fakeSession(device)
+        stubAlreadyRecognized(device)
+        activeSession = session
+        controller.markAlreadyClaimed()
+        controller.endClaimAttempt() // no matching beginClaimAttempt() -- must not go negative
+
+        controller.releaseClaim(delayMs = 0, awaitAndroidTakeover = false)
+
+        assertFalse(controller.isClaimed())
+        verify { UsbAudioController.releaseToKernel(session) }
+    }
+
+    @Test
     fun `notifyStreamingStopped never drives the active count below zero`() {
         val device = fakeDevice()
         val session = fakeSession(device)

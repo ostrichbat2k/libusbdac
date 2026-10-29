@@ -93,6 +93,13 @@ internal class UsbClaimControllerImpl(
     // reconfigure/reclaim.
     @Volatile private var activeStreamCount = 0
 
+    // How many beginClaimAttempt()/endClaimAttempt()-bracketed activation attempts are currently
+    // in progress -- see releaseClaim's own doc comment on why this, not just activeStreamCount,
+    // has to gate a concurrent release. Distinct from activeStreamCount because an attempt that's
+    // still claiming/relocking hasn't called notifyStreamingStarted() yet (and may never, if it
+    // fails), so activeStreamCount alone leaves exactly that window unguarded.
+    @Volatile private var claimAttemptsInFlight = 0
+
     // Latches a deactivateOnTimeout=true request that arrived while activeStreamCount > 0 (see
     // releaseClaim's early-return branch) so it isn't silently lost. The caller that lost that
     // race never gets to run doReleaseClaim itself -- the active stream's own eventual
@@ -121,6 +128,14 @@ internal class UsbClaimControllerImpl(
     /** The inverse of [notifyStreamingStarted] -- call before, not after, releasing anything. */
     override fun notifyStreamingStopped() {
         activeStreamCount = (activeStreamCount - 1).coerceAtLeast(0)
+    }
+
+    override fun beginClaimAttempt() {
+        claimAttemptsInFlight++
+    }
+
+    override fun endClaimAttempt() {
+        claimAttemptsInFlight = (claimAttemptsInFlight - 1).coerceAtLeast(0)
     }
 
     override fun consumeHardwareReset(): Boolean {
@@ -236,13 +251,16 @@ internal class UsbClaimControllerImpl(
      */
     override fun releaseClaim(delayMs: Long, awaitAndroidTakeover: Boolean, deactivateOnTimeout: Boolean) {
         pendingRelease?.cancel(false)
-        if (activeStreamCount > 0) {
-            // Something is genuinely streaming right now and still needs the claim -- a caller
-            // here (a Settings-screen mutator, most likely) just wanted it briefly for its own
-            // one-off write and is in no position to know that. Not even worth scheduling: the
-            // active UsbAudioOutput's own pause()/release() is what will actually call this once
-            // it's really done -- but see pendingDeactivateOnTimeout's own doc comment for why
-            // this caller's deactivateOnTimeout still has to be remembered rather than dropped.
+        if (activeStreamCount > 0 || claimAttemptsInFlight > 0) {
+            // Something is genuinely streaming right now (or an activation attempt is still
+            // claiming/relocking -- see beginClaimAttempt's own doc comment) and still needs the
+            // claim -- a caller here (a Settings-screen mutator, most likely) just wanted it
+            // briefly for its own one-off write and is in no position to know that. Not even
+            // worth scheduling: the active UsbAudioOutput's own pause()/release() -- or, for an
+            // in-flight attempt that fails outright, its next real activation/pause -- is what
+            // will actually call this once it's really done -- but see
+            // pendingDeactivateOnTimeout's own doc comment for why this caller's
+            // deactivateOnTimeout still has to be remembered rather than dropped.
             pendingDeactivateOnTimeout = pendingDeactivateOnTimeout || deactivateOnTimeout
             pendingRelease = null
             return

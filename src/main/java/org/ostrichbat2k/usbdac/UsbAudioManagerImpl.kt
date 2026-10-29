@@ -273,6 +273,10 @@ class UsbAudioManagerImpl(private val context: Context, private val usbSettings:
     /** The inverse of [notifyStreamingStarted] -- call before, not after, releasing anything. */
     override fun notifyStreamingStopped() = claimController.notifyStreamingStopped()
 
+    override fun beginClaimAttempt() = claimController.beginClaimAttempt()
+
+    override fun endClaimAttempt() = claimController.endClaimAttempt()
+
     /**
      * Called periodically (not per-URB -- see the call site) by the actively-streaming
      * [UsbAudioOutput]'s own streaming thread, and with `null` the moment it genuinely stops --

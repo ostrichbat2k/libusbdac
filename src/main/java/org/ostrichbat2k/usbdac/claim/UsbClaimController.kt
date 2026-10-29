@@ -43,6 +43,19 @@ internal interface UsbClaimController {
     /** Whether we currently hold the raw interface claim right now. */
     fun isClaimed(): Boolean
 
+    /**
+     * True, exactly once, if the Feature Unit's hardware mute/volume was forced to a HAL-handoff
+     * state (see [org.ostrichbat2k.usbdac.control.UsbVolumeController.prepareForHalHandoff]) since
+     * the last time this returned true -- regardless of whether the claim came back to us via a
+     * normal [requestClaim] [UsbAudioManager.ClaimOutcome.RECLAIMED] or was silently reclaimed by
+     * [releaseClaim]'s own Android-takeover verification timing out. [UsbAudioOutput]'s
+     * `activateAndStream()` consumes this on every call, forcing its full relock/volume-restore
+     * path even when [requestClaim] alone would otherwise report
+     * [UsbAudioManager.ClaimOutcome.ALREADY_CLAIMED] -- see that call site's own doc comment for
+     * the real, reproduced bug this closes.
+     */
+    fun consumeHardwareReset(): Boolean
+
     /** Records that the interface is already claimed by some other, earlier one-time call. */
     fun markAlreadyClaimed()
 

@@ -19,6 +19,12 @@ plugins {
     id 'com.android.library' version "$agp_version"
     id 'jacoco'
     id "com.google.devtools.ksp" version '2.3.6'
+    id 'io.gitlab.arturbosch.detekt' version '1.23.8'
+}
+
+detekt {
+    buildUponDefaultConfig = true
+    baseline = file("$projectDir/config/detekt/baseline.xml")
 }
 
 jacoco {

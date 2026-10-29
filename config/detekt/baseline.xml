@@ -1,0 +1,202 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<SmellBaseline>
+  <ManuallySuppressedIssues/>
+  <CurrentIssues>
+    <ID>ComplexCondition:RoutingAudioSink.kt$RoutingAudioSink$chosen !== existing &amp;&amp; existing != null &amp;&amp; existing !== fallback &amp;&amp; existing.hasPendingData()</ID>
+    <ID>ComplexCondition:RoutingAudioSink.kt$RoutingAudioSink$existing != null &amp;&amp; existing !== fallback &amp;&amp; existing === liveUsbSink &amp;&amp; existing.reallySupports(format)</ID>
+    <ID>CyclomaticComplexMethod:FakeFeatureUnit.kt$FakeFeatureUnit$fun install(connection: UsbDeviceConnection)</ID>
+    <ID>CyclomaticComplexMethod:UsbAudioController.kt$UsbAudioController$fun activate(context: Context, device: UsbDevice, topology: UacPlaybackTopology): UsbAudioSession?</ID>
+    <ID>CyclomaticComplexMethod:UsbAudioDescriptorParserUac1.kt$UsbAudioDescriptorParserUac1$fun parseUac1Playback(entries: List&lt;Pair&lt;Int, ByteArray>>): UacPlaybackTopology?</ID>
+    <ID>CyclomaticComplexMethod:UsbAudioDescriptorParserUac2.kt$UsbAudioDescriptorParserUac2$fun parseUac2Playback(entries: List&lt;Pair&lt;Int, ByteArray>>): UacPlaybackTopology?</ID>
+    <ID>CyclomaticComplexMethod:UsbAudioDescriptorParserUac3.kt$UsbAudioDescriptorParserUac3$fun dumpAcTopology(entries: List&lt;Pair&lt;Int, ByteArray>>)</ID>
+    <ID>CyclomaticComplexMethod:UsbAudioDescriptorParserUac3.kt$UsbAudioDescriptorParserUac3$fun parseUac3Playback(entries: List&lt;Pair&lt;Int, ByteArray>>): UacPlaybackTopology?</ID>
+    <ID>CyclomaticComplexMethod:UsbAudioOutput.kt$UsbAudioOutput$private fun activateAndStream(): Boolean</ID>
+    <ID>CyclomaticComplexMethod:UsbAudioOutput.kt$UsbAudioOutput$private fun startStreamingThread()</ID>
+    <ID>CyclomaticComplexMethod:UsbClaimControllerImpl.kt$UsbClaimControllerImpl$private fun awaitAndroidOutputTakeover(deactivateOnTimeout: Boolean)</ID>
+    <ID>CyclomaticComplexMethod:UsbDacActivatorImpl.kt$UsbDacActivatorImpl$override fun activate(device: UsbDevice): UsbDacActivator.Result?</ID>
+    <ID>EmptyFunctionBlock:UsbAudioOutput.kt$UsbAudioOutput${}</ID>
+    <ID>EmptyFunctionBlock:UsbAudioOutputProvider.kt$UsbAudioOutputProvider${}</ID>
+    <ID>LongMethod:UsbAudioController.kt$UsbAudioController$fun activate(context: Context, device: UsbDevice, topology: UacPlaybackTopology): UsbAudioSession?</ID>
+    <ID>LongMethod:UsbAudioDescriptorParserUac1.kt$UsbAudioDescriptorParserUac1$fun parseUac1Playback(entries: List&lt;Pair&lt;Int, ByteArray>>): UacPlaybackTopology?</ID>
+    <ID>LongMethod:UsbAudioDescriptorParserUac2.kt$UsbAudioDescriptorParserUac2$fun parseUac2Playback(entries: List&lt;Pair&lt;Int, ByteArray>>): UacPlaybackTopology?</ID>
+    <ID>LongMethod:UsbAudioDescriptorParserUac3.kt$UsbAudioDescriptorParserUac3$fun dumpAcTopology(entries: List&lt;Pair&lt;Int, ByteArray>>)</ID>
+    <ID>LongMethod:UsbAudioDescriptorParserUac3.kt$UsbAudioDescriptorParserUac3$fun parseUac3Playback(entries: List&lt;Pair&lt;Int, ByteArray>>): UacPlaybackTopology?</ID>
+    <ID>LongMethod:UsbAudioOutput.kt$UsbAudioOutput$private fun startStreamingThread()</ID>
+    <ID>LongMethod:UsbDacActivatorImpl.kt$UsbDacActivatorImpl$override fun activate(device: UsbDevice): UsbDacActivator.Result?</ID>
+    <ID>LongParameterList:UsbAudioControllerControlTransferTest.kt$UsbAudioControllerControlTransferTest$(connection: UsbDeviceConnection, type: Int, request: Int, value: Int, index: Int, response: ByteArray, result: Int = response.size)</ID>
+    <ID>LongParameterList:UsbAudioDescriptorHelper.kt$UsbAudioDescriptorHelper$( interfaceNumber: Int, altSetting: Int, endpointAddress: Int, endpointSync: Int, maxPacketSize: Int, bitResolution: Int, subslotSize: Int, clusterDescriptorId: Int, isTerminalLinked: Boolean, isDeclaredPcm: Boolean, isRawData: Boolean, formatsByInterface: MutableMap&lt;Int, MutableList&lt;UacStreamFormat>>, nonPcmFormatsByInterface: MutableMap&lt;Int, MutableList&lt;UacNonPcmFormat>>, )</ID>
+    <ID>LongParameterList:UsbAudioDescriptorHelperTest.kt$UsbAudioDescriptorHelperTest$( interfaceNumber: Int = 1, altSetting: Int = 1, endpointAddress: Int = 0x02, endpointSync: Int = UsbAudioDescriptorHelper.SYNC_TYPE_ASYNC, maxPacketSize: Int = 192, bitResolution: Int = 24, subslotSize: Int = 4, clusterDescriptorId: Int = -1, isTerminalLinked: Boolean = true, isDeclaredPcm: Boolean = true, isRawData: Boolean = false, formats: MutableMap&lt;Int, MutableList&lt;UacStreamFormat>> = mutableMapOf(), nonPcm: MutableMap&lt;Int, MutableList&lt;UacNonPcmFormat>> = mutableMapOf(), )</ID>
+    <ID>LongParameterList:UsbAudioOutput.kt$UsbAudioOutput$( private val session: UsbAudioSession, private val format: UacStreamFormat, private val channels: Int, private val sampleRateHz: Int, // Read fresh (not captured once) by restoreVolumeAfterRelock -- see that function's own doc // comment for the real, confirmed bug a one-time capture caused: a volume-key change made // mid-track, with this same instance still alive (no format change), was silently reverted // to whatever was persisted back when this instance was first built. private val usbSettings: UsbDacPreferences, // True when UsbAudioOutputProvider picked this device format as a *conversion target* for // 32-bit float PCM (FfmpegAudioRenderer's only way to get real higher-than-16-bit precision // out of a device whose own Feature Unit works in integer, not float) rather than ExoPlayer // already producing this format's own native encoding directly. write() branches on this -- // see its own doc comment for the actual conversion. private val isFloatInput: Boolean = false, // So pause()/play() can hand the raw interface back to Android's own USB-audio HAL whenever // this instance genuinely stops being used, and reclaim it when actually needed again -- // see activateAndStream()/pause()'s doc comments. private val usbAudioManager: UsbAudioManager, )</ID>
+    <ID>LongParameterList:UsbControlWriterImpl.kt$UsbControlWriterImpl$( private val usbSettings: UsbDacPreferences, private val volumeController: UsbVolumeController, private val getActiveSession: () -> UsbAudioSession?, private val getActiveFormat: () -> UacStreamFormat?, private val getActiveRateHz: () -> Int, private val requestClaim: () -> ClaimOutcome, // Always the same fixed grace-period/no-wait/no-escalate release -- see UsbAudioManager. // releaseClaim's own doc comment for why every Settings-screen write uses exactly this. private val releaseClaim: () -> Unit, private val getControlState: () -> UsbControlState?, private val publishControlState: (UsbControlState?) -> Unit, private val log: (String) -> Unit, )</ID>
+    <ID>LongParameterList:UsbDacActivatorImplTest.kt$UsbDacActivatorImplTest$( uacVersion: Int = 3, channelCount: Int = 2, mixerUnitId: Int = -1, mixerInputChannelBase: Int = -1, powerDomainId: Int = -1, formats: List&lt;UacStreamFormat> = listOf(format()), )</ID>
+    <ID>LoopWithTooManyJumpStatements:UsbAudioOutput.kt$UsbAudioOutput$while</ID>
+    <ID>MagicNumber:IsoPacketScheduler.kt$IsoPacing.Companion$1000</ID>
+    <ID>MagicNumber:IsoPacketScheduler.kt$IsoPacing.Companion$3</ID>
+    <ID>MagicNumber:IsoPacketScheduler.kt$IsoPacing.Companion$8000</ID>
+    <ID>MagicNumber:RoutingAudioSink.kt$RoutingAudioSink$16</ID>
+    <ID>MagicNumber:RoutingAudioSink.kt$RoutingAudioSink$24</ID>
+    <ID>MagicNumber:RoutingAudioSink.kt$RoutingAudioSink$32</ID>
+    <ID>MagicNumber:UsbAudioController.kt$UsbAudioController$0xFF</ID>
+    <ID>MagicNumber:UsbAudioController.kt$UsbAudioController$1000</ID>
+    <ID>MagicNumber:UsbAudioController.kt$UsbAudioController$1000L</ID>
+    <ID>MagicNumber:UsbAudioController.kt$UsbAudioController$12</ID>
+    <ID>MagicNumber:UsbAudioController.kt$UsbAudioController$3</ID>
+    <ID>MagicNumber:UsbAudioController.kt$UsbAudioController$4</ID>
+    <ID>MagicNumber:UsbAudioController.kt$UsbAudioController$5</ID>
+    <ID>MagicNumber:UsbAudioController.kt$UsbAudioController$6</ID>
+    <ID>MagicNumber:UsbAudioController.kt$UsbAudioController$7</ID>
+    <ID>MagicNumber:UsbAudioController.kt$UsbAudioController$8</ID>
+    <ID>MagicNumber:UsbAudioDescriptorHelper.kt$0xFF</ID>
+    <ID>MagicNumber:UsbAudioDescriptorHelper.kt$8</ID>
+    <ID>MagicNumber:UsbAudioDescriptorHelper.kt$UsbAudioDescriptorHelper$0x06</ID>
+    <ID>MagicNumber:UsbAudioDescriptorHelper.kt$UsbAudioDescriptorHelper$0x80</ID>
+    <ID>MagicNumber:UsbAudioDescriptorHelper.kt$UsbAudioDescriptorHelper$1000</ID>
+    <ID>MagicNumber:UsbAudioDescriptorHelper.kt$UsbAudioDescriptorHelper$2000</ID>
+    <ID>MagicNumber:UsbAudioDescriptorHelper.kt$UsbAudioDescriptorHelper$4</ID>
+    <ID>MagicNumber:UsbAudioDescriptorHelper.kt$UsbAudioDescriptorHelper$8</ID>
+    <ID>MagicNumber:UsbAudioDescriptorHelper.kt$UsbAudioDescriptorHelper$9</ID>
+    <ID>MagicNumber:UsbAudioDescriptorParserUac1.kt$UsbAudioDescriptorParserUac1$0x3</ID>
+    <ID>MagicNumber:UsbAudioDescriptorParserUac1.kt$UsbAudioDescriptorParserUac1$16</ID>
+    <ID>MagicNumber:UsbAudioDescriptorParserUac1.kt$UsbAudioDescriptorParserUac1$3</ID>
+    <ID>MagicNumber:UsbAudioDescriptorParserUac1.kt$UsbAudioDescriptorParserUac1$4</ID>
+    <ID>MagicNumber:UsbAudioDescriptorParserUac1.kt$UsbAudioDescriptorParserUac1$5</ID>
+    <ID>MagicNumber:UsbAudioDescriptorParserUac1.kt$UsbAudioDescriptorParserUac1$6</ID>
+    <ID>MagicNumber:UsbAudioDescriptorParserUac1.kt$UsbAudioDescriptorParserUac1$7</ID>
+    <ID>MagicNumber:UsbAudioDescriptorParserUac1.kt$UsbAudioDescriptorParserUac1$8</ID>
+    <ID>MagicNumber:UsbAudioDescriptorParserUac2.kt$UsbAudioDescriptorParserUac2$0x3</ID>
+    <ID>MagicNumber:UsbAudioDescriptorParserUac2.kt$UsbAudioDescriptorParserUac2$3</ID>
+    <ID>MagicNumber:UsbAudioDescriptorParserUac2.kt$UsbAudioDescriptorParserUac2$4</ID>
+    <ID>MagicNumber:UsbAudioDescriptorParserUac2.kt$UsbAudioDescriptorParserUac2$5</ID>
+    <ID>MagicNumber:UsbAudioDescriptorParserUac2.kt$UsbAudioDescriptorParserUac2$6</ID>
+    <ID>MagicNumber:UsbAudioDescriptorParserUac2.kt$UsbAudioDescriptorParserUac2$7</ID>
+    <ID>MagicNumber:UsbAudioDescriptorParserUac2.kt$UsbAudioDescriptorParserUac2$8</ID>
+    <ID>MagicNumber:UsbAudioDescriptorParserUac2.kt$UsbAudioDescriptorParserUac2$9</ID>
+    <ID>MagicNumber:UsbAudioDescriptorParserUac3.kt$UsbAudioDescriptorParserUac3$0x3</ID>
+    <ID>MagicNumber:UsbAudioDescriptorParserUac3.kt$UsbAudioDescriptorParserUac3$10</ID>
+    <ID>MagicNumber:UsbAudioDescriptorParserUac3.kt$UsbAudioDescriptorParserUac3$13</ID>
+    <ID>MagicNumber:UsbAudioDescriptorParserUac3.kt$UsbAudioDescriptorParserUac3$18</ID>
+    <ID>MagicNumber:UsbAudioDescriptorParserUac3.kt$UsbAudioDescriptorParserUac3$19</ID>
+    <ID>MagicNumber:UsbAudioDescriptorParserUac3.kt$UsbAudioDescriptorParserUac3$3</ID>
+    <ID>MagicNumber:UsbAudioDescriptorParserUac3.kt$UsbAudioDescriptorParserUac3$4</ID>
+    <ID>MagicNumber:UsbAudioDescriptorParserUac3.kt$UsbAudioDescriptorParserUac3$5</ID>
+    <ID>MagicNumber:UsbAudioDescriptorParserUac3.kt$UsbAudioDescriptorParserUac3$50</ID>
+    <ID>MagicNumber:UsbAudioDescriptorParserUac3.kt$UsbAudioDescriptorParserUac3$6</ID>
+    <ID>MagicNumber:UsbAudioDescriptorParserUac3.kt$UsbAudioDescriptorParserUac3$7</ID>
+    <ID>MagicNumber:UsbAudioDescriptorParserUac3.kt$UsbAudioDescriptorParserUac3$8</ID>
+    <ID>MagicNumber:UsbAudioDescriptorParserUac3.kt$UsbAudioDescriptorParserUac3$9</ID>
+    <ID>MagicNumber:UsbAudioInspector.kt$UsbAudioInspector$48000</ID>
+    <ID>MagicNumber:UsbAudioManagerImpl.kt$UsbAudioManagerImpl$16</ID>
+    <ID>MagicNumber:UsbAudioManagerImpl.kt$UsbAudioManagerImpl$8000L</ID>
+    <ID>MagicNumber:UsbAudioOutput.kt$UsbAudioOutput$0xFF</ID>
+    <ID>MagicNumber:UsbAudioOutput.kt$UsbAudioOutput$1000</ID>
+    <ID>MagicNumber:UsbAudioOutput.kt$UsbAudioOutput$1_000_000L</ID>
+    <ID>MagicNumber:UsbAudioOutput.kt$UsbAudioOutput$20</ID>
+    <ID>MagicNumber:UsbAudioOutput.kt$UsbAudioOutput$2000</ID>
+    <ID>MagicNumber:UsbAudioOutput.kt$UsbAudioOutput$3</ID>
+    <ID>MagicNumber:UsbAudioOutput.kt$UsbAudioOutput$4</ID>
+    <ID>MagicNumber:UsbAudioOutput.kt$UsbAudioOutput$5</ID>
+    <ID>MagicNumber:UsbAudioOutput.kt$UsbAudioOutput$50</ID>
+    <ID>MagicNumber:UsbAudioOutput.kt$UsbAudioOutput$500</ID>
+    <ID>MagicNumber:UsbAudioOutput.kt$UsbAudioOutput$6</ID>
+    <ID>MagicNumber:UsbAudioOutput.kt$UsbAudioOutput$8</ID>
+    <ID>MagicNumber:UsbAudioOutputProvider.kt$UsbAudioOutputProvider$3</ID>
+    <ID>MagicNumber:UsbAudioOutputProvider.kt$UsbAudioOutputProvider$4</ID>
+    <ID>MagicNumber:UsbAudioOutputProvider.kt$UsbAudioOutputProvider$5</ID>
+    <ID>MagicNumber:UsbAudioOutputProvider.kt$UsbAudioOutputProvider$6</ID>
+    <ID>MagicNumber:UsbAudioOutputProvider.kt$UsbAudioOutputProvider$7</ID>
+    <ID>MagicNumber:UsbAudioOutputProvider.kt$UsbAudioOutputProvider$8</ID>
+    <ID>MagicNumber:UsbDacActivatorImpl.kt$UsbDacActivatorImpl$3</ID>
+    <ID>MagicNumber:UsbDacActivatorImpl.kt$UsbDacActivatorImpl$44100</ID>
+    <ID>MagicNumber:UsbVolumeControllerImpl.kt$UsbVolumeControllerImpl$100f</ID>
+    <ID>MagicNumber:UsbVolumeControllerImpl.kt$UsbVolumeControllerImpl$17f</ID>
+    <ID>MagicNumber:UsbVolumeControllerImpl.kt$UsbVolumeControllerImpl$20f</ID>
+    <ID>MagicNumber:UsbVolumeControllerImpl.kt$UsbVolumeControllerImpl$256f</ID>
+    <ID>MagicNumber:UsbVolumeControllerImpl.kt$UsbVolumeControllerImpl$40f</ID>
+    <ID>MagicNumber:UsbVolumeControllerImpl.kt$UsbVolumeControllerImpl$58f</ID>
+    <ID>MagicNumber:UsbVolumeControllerImpl.kt$UsbVolumeControllerImpl$60f</ID>
+    <ID>MaxLineLength:RoutingAudioSink.kt$RoutingAudioSink$if</ID>
+    <ID>MaxLineLength:RoutingAudioSinkTest.kt$RoutingAudioSinkTest$fun</ID>
+    <ID>MaxLineLength:UsbAudioController.kt$UsbAudioController$L.i("Released streaming=${session.topology.streamingInterfaceNumber} then control=${session.controlInterface.id} to kernel")</ID>
+    <ID>MaxLineLength:UsbAudioController.kt$UsbAudioController$internal</ID>
+    <ID>MaxLineLength:UsbAudioControllerControlTransferTest.kt$UsbAudioControllerControlTransferTest$0x21</ID>
+    <ID>MaxLineLength:UsbAudioControllerControlTransferTest.kt$UsbAudioControllerControlTransferTest$assertEquals(0 to 100, UsbAudioController.getMixerGainRange(session, mixerUnitId = 7, inputChannel = 3, outputChannel = 1))</ID>
+    <ID>MaxLineLength:UsbAudioControllerControlTransferTest.kt$UsbAudioControllerControlTransferTest$assertTrue(UsbAudioController.setMixerGain(session, mixerUnitId = 7, inputChannel = 3, outputChannel = 1, value = -256))</ID>
+    <ID>MaxLineLength:UsbAudioControllerControlTransferTest.kt$UsbAudioControllerControlTransferTest$private</ID>
+    <ID>MaxLineLength:UsbAudioControllerControlTransferTest.kt$UsbAudioControllerControlTransferTest$session.connection.controlTransfer(0x21, 0x01, 0x0100, 0x0200, match&lt;ByteArray> { it.contentEquals(le(48000, 4)) }, 4, 1000)</ID>
+    <ID>MaxLineLength:UsbAudioControllerControlTransferTest.kt$UsbAudioControllerControlTransferTest$session.connection.controlTransfer(0x21, 0x01, 0x0100, 0x0300, match&lt;ByteArray> { it.contentEquals(byteArrayOf(1)) }, 1, 1000)</ID>
+    <ID>MaxLineLength:UsbAudioControllerControlTransferTest.kt$UsbAudioControllerControlTransferTest$session.connection.controlTransfer(0x21, 0x01, 0x0200, 0x0500, match&lt;ByteArray> { it.contentEquals(byteArrayOf(0)) }, 1, 1000)</ID>
+    <ID>MaxLineLength:UsbAudioControllerControlTransferTest.kt$UsbAudioControllerControlTransferTest$session.connection.controlTransfer(0x22, 0x01, 0x0100, 0x82, match&lt;ByteArray> { it.contentEquals(le(44100, 3)) }, 3, 1000)</ID>
+    <ID>MaxLineLength:UsbAudioControllerInterfaceOrchestrationTest.kt$UsbAudioControllerInterfaceOrchestrationTest$assertEquals(emptyList&lt;UsbInterfaceInfo>(), UsbAudioController.listInterfaces(device, topology(configurationValue = 1)))</ID>
+    <ID>MaxLineLength:UsbAudioControllerInterfaceOrchestrationTest.kt$UsbAudioControllerInterfaceOrchestrationTest$val config = fakeConfiguration(configId = 1, interfaces = listOf(control, streaming0, streaming1, otherAudio, hid))</ID>
+    <ID>MaxLineLength:UsbAudioControllerInterfaceOrchestrationTest.kt$UsbAudioControllerInterfaceOrchestrationTest$val result = UsbAudioController.listInterfaces(device, topology(configurationValue = 7, controlInterfaceNumber = 0))</ID>
+    <ID>MaxLineLength:UsbAudioControllerInterfaceOrchestrationTest.kt$UsbAudioControllerInterfaceOrchestrationTest$val rightConfig = fakeConfiguration(configId = 7, interfaces = listOf(fakeInterface(0, 0, UsbConstants.USB_CLASS_AUDIO)))</ID>
+    <ID>MaxLineLength:UsbAudioControllerInterfaceOrchestrationTest.kt$UsbAudioControllerInterfaceOrchestrationTest$val wrongConfig = fakeConfiguration(configId = 5, interfaces = listOf(fakeInterface(9, 0, UsbConstants.USB_CLASS_HID)))</ID>
+    <ID>MaxLineLength:UsbAudioDescriptorHelperTest.kt$UsbAudioDescriptorHelperTest$private fun headerDeclaring(totalLength: Int)</ID>
+    <ID>MaxLineLength:UsbAudioDescriptorHelperTest.kt$UsbAudioDescriptorHelperTest$val (formats, nonPcm) = record(bitResolution = 0, isTerminalLinked = true, isDeclaredPcm = false, isRawData = true)</ID>
+    <ID>MaxLineLength:UsbAudioDescriptorHelperTest.kt$UsbAudioDescriptorHelperTest$val (formats, nonPcm) = record(bitResolution = 24, subslotSize = 4, endpointSync = UsbAudioDescriptorHelper.SYNC_TYPE_ASYNC)</ID>
+    <ID>MaxLineLength:UsbAudioDescriptorParserUac1.kt$UsbAudioDescriptorParserUac1$/** [entries]-taking overload of [parseUac1Playback] -- see [UsbAudioDescriptorHelper.walk]'s doc comment for why this exists. */</ID>
+    <ID>MaxLineLength:UsbAudioDescriptorParserUac2.kt$UsbAudioDescriptorParserUac2$/** [entries]-taking overload of [parseUac2Playback] -- see [UsbAudioDescriptorHelper.walk]'s doc comment for why this exists. */</ID>
+    <ID>MaxLineLength:UsbAudioDescriptorParserUac3.kt$UsbAudioDescriptorParserUac3$/** [entries]-taking overload of [dumpAcTopology] -- see [UsbAudioDescriptorHelper.walk]'s doc comment for why this exists. */</ID>
+    <ID>MaxLineLength:UsbAudioDescriptorParserUac3.kt$UsbAudioDescriptorParserUac3$/** [entries]-taking overload of [parseUac3Playback] -- see [UsbAudioDescriptorHelper.walk]'s doc comment for why this exists. */</ID>
+    <ID>MaxLineLength:UsbAudioManager.kt$UsbAudioManager$/** Reads the active session's Clock Source frequency and valid/locked state right now, or null if not applicable. */</ID>
+    <ID>MaxLineLength:UsbAudioManagerFunctionalTest.kt$UsbAudioManagerFunctionalTest$UsbVolumeControllerImpl(audioManager, usbSettings, manager.controlState, manager.playbackRoute, logEvent = {})</ID>
+    <ID>MaxLineLength:UsbAudioManagerFunctionalTest.kt$UsbAudioManagerFunctionalTest$fun</ID>
+    <ID>MaxLineLength:UsbAudioManagerImpl.kt$UsbAudioManagerImpl$*</ID>
+    <ID>MaxLineLength:UsbAudioManagerImpl.kt$UsbAudioManagerImpl$controlWriter.refreshControlState(session, activeFormat ?: format, session.device.productName ?: session.device.deviceName)</ID>
+    <ID>MaxLineLength:UsbAudioManagerImpl.kt$UsbAudioManagerImpl$diagnosticLogger.log("Failed to switch to ${format.bitResolution}-bit (alt=${format.alternateSetting}) for upcoming track")</ID>
+    <ID>MaxLineLength:UsbAudioManagerImpl.kt$UsbAudioManagerImpl$diagnosticLogger.log("Switched to ${format.bitResolution}-bit (alt=${format.alternateSetting}) for upcoming track")</ID>
+    <ID>MaxLineLength:UsbAudioManagerImpl.kt$UsbAudioManagerImpl$releaseClaim(delayMs = UsbAudioTuning.RELEASE_GRACE_MS, awaitAndroidTakeover = false, deactivateOnTimeout = false)</ID>
+    <ID>MaxLineLength:UsbAudioManagerImpl.kt$UsbAudioManagerImpl$val bitPerfectWanted = if (usbSettings.abxTestMode) abxTester.groundTruth.value == true else usbSettings.bitPerfectMode</ID>
+    <ID>MaxLineLength:UsbAudioManagerImplTest.kt$UsbAudioManagerImplTest$fun</ID>
+    <ID>MaxLineLength:UsbAudioOutput.kt$UsbAudioOutput$UsbNative.openIsoStream(fd, format.endpointAddress, format.maxPacketSize, packetsPerUrb, UsbAudioTuning.NUM_URBS)</ID>
+    <ID>MaxLineLength:UsbAudioOutput.kt$UsbAudioOutput$bufferCapacityBytes = ringBuffer.availableToRead() + ringBuffer.availableToWrite()</ID>
+    <ID>MaxLineLength:UsbAudioOutputProvider.kt$UsbAudioOutputProvider$L.w("UsbAudioOutputProvider: no channel mask mapping for $channelCount channels, falling back to stereo")</ID>
+    <ID>MaxLineLength:UsbAudioOutputProvider.kt$UsbAudioOutputProvider$L.w("UsbAudioOutputProvider: no float conversion target at ${config.sampleRate}Hz, using ${it.bitResolution}-bit")</ID>
+    <ID>MaxLineLength:UsbAudioOutputProvider.kt$UsbAudioOutputProvider$L.w("UsbAudioOutputProvider: no format matches encoding=${config.encoding}, using ${it.bitResolution}-bit")</ID>
+    <ID>MaxLineLength:UsbAudioOutputVolumeRestoreTest.kt$UsbAudioOutputVolumeRestoreTest$fun</ID>
+    <ID>MaxLineLength:UsbClaimControllerImpl.kt$UsbClaimControllerImpl${ doReleaseClaim(awaitAndroidTakeover, effectiveDeactivateOnTimeout) }</ID>
+    <ID>MaxLineLength:UsbDeviceDiscoveryImplTest.kt$UsbDeviceDiscoveryImplTest$fakeUsbDevice("composite", interfaceClasses = listOf(UsbConstants.USB_CLASS_HID, UsbConstants.USB_CLASS_AUDIO))</ID>
+    <ID>MaxLineLength:UsbVolumeControllerImplTest.kt$UsbVolumeControllerImplTest$playbackRouteFlow.value = UsbAudioManager.PlaybackRoute.Direct(bitDepth = 24, sampleRateHz = 96000, channels = 2)</ID>
+    <ID>NestedBlockDepth:UsbAudioDescriptorParserUac1.kt$UsbAudioDescriptorParserUac1$fun parseUac1Playback(entries: List&lt;Pair&lt;Int, ByteArray>>): UacPlaybackTopology?</ID>
+    <ID>NestedBlockDepth:UsbAudioDescriptorParserUac2.kt$UsbAudioDescriptorParserUac2$fun parseUac2Playback(entries: List&lt;Pair&lt;Int, ByteArray>>): UacPlaybackTopology?</ID>
+    <ID>NestedBlockDepth:UsbAudioDescriptorParserUac3.kt$UsbAudioDescriptorParserUac3$fun dumpAcTopology(entries: List&lt;Pair&lt;Int, ByteArray>>)</ID>
+    <ID>NestedBlockDepth:UsbAudioDescriptorParserUac3.kt$UsbAudioDescriptorParserUac3$fun parseUac3Playback(entries: List&lt;Pair&lt;Int, ByteArray>>): UacPlaybackTopology?</ID>
+    <ID>NestedBlockDepth:UsbClaimControllerImpl.kt$UsbClaimControllerImpl$private fun awaitAndroidOutputTakeover(deactivateOnTimeout: Boolean)</ID>
+    <ID>NestedBlockDepth:UsbDacActivatorImpl.kt$UsbDacActivatorImpl$override fun activate(device: UsbDevice): UsbDacActivator.Result?</ID>
+    <ID>ReturnCount:UsbAudioController.kt$UsbAudioController$fun activate(context: Context, device: UsbDevice, topology: UacPlaybackTopology): UsbAudioSession?</ID>
+    <ID>ReturnCount:UsbAudioController.kt$UsbAudioController$fun getMute(session: UsbAudioSession, channel: Int = 0): Boolean?</ID>
+    <ID>ReturnCount:UsbAudioController.kt$UsbAudioController$fun getVolume(session: UsbAudioSession, channel: Int): Int?</ID>
+    <ID>ReturnCount:UsbAudioController.kt$UsbAudioController$fun getVolumeRange(session: UsbAudioSession, channel: Int): Pair&lt;Int, Int>?</ID>
+    <ID>ReturnCount:UsbAudioController.kt$UsbAudioController$fun reclaimFromKernel(session: UsbAudioSession): Boolean</ID>
+    <ID>ReturnCount:UsbAudioController.kt$UsbAudioController$fun wakePowerDomain(session: UsbAudioSession, powerDomainId: Int, d1RecoveryUs: Int, d2RecoveryUs: Int)</ID>
+    <ID>ReturnCount:UsbAudioDescriptorParserUac1.kt$UsbAudioDescriptorParserUac1$fun parseUac1Playback(entries: List&lt;Pair&lt;Int, ByteArray>>): UacPlaybackTopology?</ID>
+    <ID>ReturnCount:UsbAudioDescriptorParserUac2.kt$UsbAudioDescriptorParserUac2$fun parseUac2Playback(entries: List&lt;Pair&lt;Int, ByteArray>>): UacPlaybackTopology?</ID>
+    <ID>ReturnCount:UsbAudioDescriptorParserUac3.kt$UsbAudioDescriptorParserUac3$fun parseUac3Playback(entries: List&lt;Pair&lt;Int, ByteArray>>): UacPlaybackTopology?</ID>
+    <ID>ReturnCount:UsbAudioInspector.kt$UsbAudioInspector$fun inspect(context: Context, device: UsbDevice)</ID>
+    <ID>ReturnCount:UsbAudioManagerImpl.kt$UsbAudioManagerImpl$override fun ensureFormatActive(format: UacStreamFormat, sampleRateHz: Int): Boolean</ID>
+    <ID>ReturnCount:UsbAudioManagerImpl.kt$UsbAudioManagerImpl$override fun getClockInfo(): Pair&lt;Int?, Boolean?>?</ID>
+    <ID>ReturnCount:UsbAudioManagerImpl.kt$UsbAudioManagerImpl$override fun getPowerDomainState(): Int?</ID>
+    <ID>ReturnCount:UsbAudioManagerImpl.kt$UsbAudioManagerImpl$override fun resolveActiveSink(trigger: Boolean): AudioSink?</ID>
+    <ID>ReturnCount:UsbAudioManagerImpl.kt$UsbAudioManagerImpl$override fun retryActivation()</ID>
+    <ID>ReturnCount:UsbAudioManagerImpl.kt$UsbAudioManagerImpl$private fun ensureActivated()</ID>
+    <ID>ReturnCount:UsbAudioOutput.kt$UsbAudioOutput$override fun isStalled(): Boolean</ID>
+    <ID>ReturnCount:UsbAudioOutput.kt$UsbAudioOutput$override fun write(buffer: ByteBuffer, encodedAccessUnitCount: Int, presentationTimeUs: Long): Boolean</ID>
+    <ID>ReturnCount:UsbAudioOutput.kt$UsbAudioOutput$private fun activateAndStream(): Boolean</ID>
+    <ID>ReturnCount:UsbClaimControllerImpl.kt$UsbClaimControllerImpl$override fun requestClaim(session: UsbAudioSession?): UsbAudioManager.ClaimOutcome</ID>
+    <ID>ReturnCount:UsbControlWriterImpl.kt$UsbControlWriterImpl$override fun setMixerGain(inputChannel: Int, outputChannel: Int, valueDb: Int)</ID>
+    <ID>ReturnCount:UsbControlWriterImpl.kt$UsbControlWriterImpl$override fun setMuted(muted: Boolean)</ID>
+    <ID>ReturnCount:UsbControlWriterImpl.kt$UsbControlWriterImpl$private fun scheduleVolumeWrite()</ID>
+    <ID>ReturnCount:UsbDacActivatorImpl.kt$UsbDacActivatorImpl$override fun activate(device: UsbDevice): UsbDacActivator.Result?</ID>
+    <ID>ReturnCount:UsbDacDescriptorCacheImpl.kt$UsbDacDescriptorCacheImpl$override fun get(vendorId: Int, productId: Int): CachedUsbDacDescriptor?</ID>
+    <ID>ReturnCount:UsbVolumeControllerImpl.kt$UsbVolumeControllerImpl$override fun abxSyncTargetDb(): Int?</ID>
+    <ID>ReturnCount:UsbVolumeControllerImpl.kt$UsbVolumeControllerImpl$override fun onStreamMusicChanged(newIndex: Int)</ID>
+    <ID>TooGenericExceptionCaught:RoutingAudioSink.kt$RoutingAudioSink$e: Exception</ID>
+    <ID>TooManyFunctions:RoutingAudioSink.kt$RoutingAudioSink : AudioSink</ID>
+    <ID>TooManyFunctions:UsbAudioController.kt$UsbAudioController</ID>
+    <ID>TooManyFunctions:UsbAudioManager.kt$UsbAudioManager : Listener</ID>
+    <ID>TooManyFunctions:UsbAudioManagerImpl.kt$UsbAudioManagerImpl : UsbAudioManager</ID>
+    <ID>TooManyFunctions:UsbAudioOutput.kt$UsbAudioOutput : AudioOutput</ID>
+    <ID>TooManyFunctions:UsbAudioOutputProvider.kt$UsbAudioOutputProvider : AudioOutputProvider</ID>
+    <ID>TooManyFunctions:UsbClaimControllerImpl.kt$UsbClaimControllerImpl : UsbClaimController</ID>
+  </CurrentIssues>
+</SmellBaseline>

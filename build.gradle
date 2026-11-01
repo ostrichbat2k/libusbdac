@@ -12,6 +12,13 @@ buildscript {
         target_sdk = 37
         ndk_version = "28.2.13676358"
     }
+
+    dependencies {
+        // AGP's built-in Kotlin support resolves the Kotlin Gradle Plugin from the
+        // buildscript classpath (default: 2.2.10) -- bump it to match kotlin_version so a
+        // standalone build of this module uses the same compiler as kotlin-stdlib expects.
+        classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:$kotlin_version"
+    }
 }
 
 plugins {

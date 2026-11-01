@@ -1,0 +1,53 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and attach a release AAR to"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: gradle
+
+      - uses: android-actions/setup-android@v4
+        with:
+          packages: ""
+
+      - name: Install NDK and CMake
+        run: sdkmanager --install "ndk;28.2.13676358" "cmake;3.22.1"
+
+      - name: Run unit tests
+        run: |
+          export PATH="$ANDROID_HOME/cmake/3.22.1/bin:$PATH"
+          ./gradlew testDebugUnitTest --no-daemon
+
+      - name: Build release AAR
+        run: |
+          export PATH="$ANDROID_HOME/cmake/3.22.1/bin:$PATH"
+          ./gradlew assembleRelease --no-daemon
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          generate_release_notes: true
+          files: |
+            build/outputs/aar/libusbdac-release.aar

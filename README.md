@@ -118,6 +118,28 @@ takes a plain constructor behind the `UsbAudioManager` interface, and a
 host using something like Hilt or Koin bridges it into its own graph with
 an ordinary `@Provides`/factory method.
 
+## Installation
+
+Published via [JitPack](https://jitpack.io/#ostrichbat2k/libusbdac) from
+release tags.
+
+```groovy
+// settings.gradle
+dependencyResolutionManagement {
+    repositories {
+        maven { url 'https://jitpack.io' }
+    }
+}
+
+// build.gradle
+dependencies {
+    implementation 'com.github.ostrichbat2k:libusbdac:v0.1.0' // or any tag/commit
+}
+```
+
+(Auxio itself still consumes this repo as a git submodule rather than this
+published artifact, since it tracks unreleased commits between tags.)
+
 ## Using it
 
 ```kotlin

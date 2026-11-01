@@ -43,7 +43,7 @@
 
 extern "C" JNIEXPORT jboolean JNICALL
 Java_org_ostrichbat2k_usbdac_streaming_UsbNative_disconnectKernelDriver(
-        JNIEnv* /*env*/, jobject /*thiz*/, jint fd, jint interfaceNumber) {
+        JNIEnv* /*env*/, jobject /*thiz*/, jint fd, jint interfaceNumber) {  // NOLINT(bugprone-easily-swappable-parameters)
     if (fd < 0) {
         LOGE("disconnectKernelDriver called with invalid fd %d", fd);
         return JNI_FALSE;
@@ -148,8 +148,8 @@ static void freeStream(IsoStream* stream) {
 
 extern "C" JNIEXPORT jlong JNICALL
 Java_org_ostrichbat2k_usbdac_streaming_UsbNative_openIsoStream(
-        JNIEnv* /*env*/, jobject /*thiz*/, jint fd, jint endpointAddress, jint maxPacketSize,
-        jint packetsPerUrb, jint numUrbs) {
+        JNIEnv* /*env*/, jobject /*thiz*/, jint fd, jint endpointAddress, jint maxPacketSize,  // NOLINT(bugprone-easily-swappable-parameters)
+        jint packetsPerUrb, jint numUrbs) {  // NOLINT(bugprone-easily-swappable-parameters)
     if (fd < 0) {
         LOGE("openIsoStream called with invalid fd %d", fd);
         return 0;
@@ -201,7 +201,7 @@ Java_org_ostrichbat2k_usbdac_streaming_UsbNative_openIsoStream(
         // new T*[n] does not zero-initialize -- without this, the cleanup paths below (which
         // check `stream->urbs[j]` for null to know what's actually been allocated) would be
         // reading indeterminate pointers instead of a reliable "not yet allocated" sentinel.
-        memset(stream->urbs, 0, sizeof(struct usbdevfs_urb*) * (size_t) numUrbs);
+        memset(stream->urbs, 0, sizeof(struct usbdevfs_urb*) * (size_t) numUrbs);  // NOLINT(bugprone-multi-level-implicit-pointer-conversion)
 
         size_t urbSize = (size_t) urbSize64;
         for (int i = 0; i < numUrbs; i++) {
@@ -219,7 +219,7 @@ Java_org_ostrichbat2k_usbdac_streaming_UsbNative_openIsoStream(
             urb->endpoint = stream->endpoint;
             urb->flags = USBDEVFS_URB_ISO_ASAP;
             urb->buffer = buffer;
-            urb->usercontext = (void*) (intptr_t) i;
+            urb->usercontext = (void*) (intptr_t) i;  // NOLINT(performance-no-int-to-ptr)
             // iso_frame_desc[].length, buffer_length, and number_of_packets are set per
             // submission (see submitIso) since sample rates that don't divide evenly into the
             // 1ms packet schedule (e.g. 44100 Hz) need a varying number of samples -- and
@@ -252,7 +252,7 @@ Java_org_ostrichbat2k_usbdac_streaming_UsbNative_openIsoStream(
 // average out to exactly 44100/sec over time.
 extern "C" JNIEXPORT jboolean JNICALL
 Java_org_ostrichbat2k_usbdac_streaming_UsbNative_submitIso(
-        JNIEnv* env, jobject /*thiz*/, jlong handle, jint slot, jbyteArray data,
+        JNIEnv* env, jobject /*thiz*/, jlong handle, jint slot, jbyteArray data,  // NOLINT(bugprone-easily-swappable-parameters)
         jintArray packetLengths) {
     IsoStream* stream = lookupStream(handle);
     if (!stream || slot < 0 || slot >= stream->numUrbs) return JNI_FALSE;
@@ -333,7 +333,7 @@ Java_org_ostrichbat2k_usbdac_streaming_UsbNative_submitIso(
 // usbdevfs_urb, without a real USB device ever completing one for real (see
 // native-test/usb_native_test.cpp). External linkage (no `static`/anonymous namespace) so that
 // test binary can call it directly.
-int processReapedUrb(const struct usbdevfs_urb* reaped, int packetsPerUrb, int numUrbs) {
+int processReapedUrb(const struct usbdevfs_urb* reaped, int packetsPerUrb, int numUrbs) {  // NOLINT(bugprone-easily-swappable-parameters)
     if (reaped->status != 0) {
         LOGE("Reaped urb slot %ld with status=%d actual_length=%d",
              (long) (intptr_t) reaped->usercontext, reaped->status, reaped->actual_length);

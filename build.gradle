@@ -27,6 +27,7 @@ plugins {
     id 'jacoco'
     id "com.google.devtools.ksp" version '2.3.6'
     id 'io.gitlab.arturbosch.detekt' version '1.23.8'
+    id 'maven-publish'
 }
 
 detekt {
@@ -62,6 +63,14 @@ android {
         }
     }
 
+    publishing {
+        // Exposes the release AAR as a `components.release` publication for the
+        // maven-publish block below -- what JitPack's Android build docs require.
+        singleVariant("release") {
+            withSourcesJar()
+        }
+    }
+
     externalNativeBuild {
         cmake {
             path "src/main/cpp/CMakeLists.txt"
@@ -83,6 +92,21 @@ android {
     }
     testOptions {
         targetSdk target_sdk
+    }
+}
+
+afterEvaluate {
+    publishing {
+        publications {
+            // Coordinate JitPack rewrites to `com.github.ostrichbat2k:libusbdac:<tag>` on
+            // consumption regardless of the version string here, so a placeholder is fine.
+            release(MavenPublication) {
+                from components.release
+                groupId = 'com.github.ostrichbat2k'
+                artifactId = 'libusbdac'
+                version = project.findProperty('VERSION_NAME') ?: '0.0.1-SNAPSHOT'
+            }
+        }
     }
 }
 

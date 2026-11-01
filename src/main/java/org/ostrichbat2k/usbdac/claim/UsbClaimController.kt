@@ -40,6 +40,17 @@ internal interface UsbClaimController {
     /** The inverse of [notifyStreamingStarted] -- call before, not after, releasing anything. */
     fun notifyStreamingStopped()
 
+    /**
+     * Marks a [requestClaim]-through-activation attempt as in progress, so [releaseClaim] defers
+     * rather than runs concurrently -- see [releaseClaim]'s own doc comment on why a caller's
+     * [notifyStreamingStarted] alone (only called once an attempt *succeeds*) isn't early enough
+     * a guard. Every call must be matched by exactly one [endClaimAttempt], including on failure.
+     */
+    fun beginClaimAttempt()
+
+    /** The inverse of [beginClaimAttempt] -- call exactly once per [beginClaimAttempt], always. */
+    fun endClaimAttempt()
+
     /** Whether we currently hold the raw interface claim right now. */
     fun isClaimed(): Boolean
 
@@ -79,6 +90,13 @@ internal interface UsbClaimController {
      * any release already pending. Pass 0 to release immediately. See the implementation's own
      * doc comment for [awaitAndroidTakeover]/[deactivateOnTimeout]'s real-hardware-driven
      * semantics.
+     *
+     * Deferred the same way an [notifyStreamingStarted]-covered active stream is (see that
+     * function's doc comment) while a [beginClaimAttempt]/[endClaimAttempt]-bracketed attempt is
+     * in progress -- without this, a release arriving between [requestClaim] succeeding and the
+     * attempt's eventual [notifyStreamingStarted] call could run concurrently with that attempt's
+     * own in-progress clock/mute/volume relock, handing the interface back and forcing hardware
+     * gain to a HAL-handoff level out from under it.
      */
     fun releaseClaim(delayMs: Long, awaitAndroidTakeover: Boolean, deactivateOnTimeout: Boolean = false)
 }

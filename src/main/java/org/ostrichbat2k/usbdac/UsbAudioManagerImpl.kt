@@ -311,6 +311,11 @@ class UsbAudioManagerImpl(private val context: Context, private val usbSettings:
         controlWriter.shutdownExecutorForTest()
     }
 
+    /** Test-only, no production caller -- see [UsbClaimControllerImpl.awaitClaimSchedulerIdleForTest]. */
+    internal fun awaitClaimSettledForTest() {
+        claimController.awaitClaimSchedulerIdleForTest()
+    }
+
     /**
      * Schedules handing the interface back to the kernel's own driver after [delayMs] (see
      * [UsbAudioTuning.RELEASE_GRACE_MS]), canceling any release already pending -- so a
@@ -356,6 +361,21 @@ class UsbAudioManagerImpl(private val context: Context, private val usbSettings:
      * that only make sense while already [SessionState.Active].
      */
     @Volatile private var sessionState: SessionState = SessionState.Idle
+
+    // [awaitActivation]'s own "is there still something to wait for" signal -- deliberately not
+    // derived from sessionState's own type (as it used to be, via SessionState.Activating's own
+    // `settled` field). activateDac() flips sessionState to Active partway through its own body
+    // (right after building the session, well before its tail claimController.markAlreadyClaimed/
+    // releaseClaim(awaitAndroidTakeover=true) calls finish, further down) -- a caller's
+    // awaitActivation() landing in that gap saw sessionState already Active, concluded there was
+    // nothing left to await, and returned immediately while that tail claim-release was still
+    // genuinely in flight on the background thread. Confirmed, reproduced: a caller's own
+    // immediately-following requestClaim()/releaseClaim() then raced that same tail call over
+    // interfaceClaimed and the Feature Unit's real hardware state, non-deterministically.
+    // Set/cleared only in runActivation's own background thread, bracketing the *entire*
+    // activateDac() call (see its own finally block) rather than just the part of it that happens
+    // to run before sessionState's own transition.
+    @Volatile private var pendingActivationSettled: CompletableDeferred<Unit>? = null
 
     private val activeSession: UsbAudioSession?
         get() = (sessionState as? SessionState.Active)?.session
@@ -423,8 +443,10 @@ class UsbAudioManagerImpl(private val context: Context, private val usbSettings:
 
     /**
      * Runs [activateDac] on a dedicated background daemon thread, moving [sessionState] into
-     * [SessionState.Activating] (carrying the awaitable deferred -- see [awaitActivation]) around
-     * it and back out via [settleActivation] -- the single place both [ensureActivated] and
+     * [SessionState.Activating] around it and back out via [settleActivation] (see
+     * [pendingActivationSettled] for the separate, [awaitActivation]-facing completion signal,
+     * which deliberately brackets the *whole* call, not just the part of it [sessionState]'s own
+     * type reflects) -- the single place both [ensureActivated] and
      * [retryActivation] dispatch activation from, so neither signal can drift out of sync with
      * whether a background activation is actually running.
      *
@@ -444,7 +466,8 @@ class UsbAudioManagerImpl(private val context: Context, private val usbSettings:
     private fun runActivation(device: UsbDevice) {
         activationAttemptedFor = device.deviceName
         val deferred = CompletableDeferred<Unit>()
-        sessionState = SessionState.Activating(device, deferred)
+        pendingActivationSettled = deferred
+        sessionState = SessionState.Activating(device)
         updateBlockPlayback()
         activationThread =
             Thread {
@@ -453,6 +476,7 @@ class UsbAudioManagerImpl(private val context: Context, private val usbSettings:
                     } finally {
                         settleActivation()
                         deferred.complete(Unit)
+                        pendingActivationSettled = null
                     }
                 }
                 .apply {
@@ -552,7 +576,7 @@ class UsbAudioManagerImpl(private val context: Context, private val usbSettings:
      * inconsistency; 8000ms gives real margin over the measured worst case.
      */
     override suspend fun awaitActivation(timeoutMs: Long) {
-        val deferred = (sessionState as? SessionState.Activating)?.settled ?: return
+        val deferred = pendingActivationSettled ?: return
         withTimeoutOrNull(timeoutMs) { deferred.await() }
     }
 

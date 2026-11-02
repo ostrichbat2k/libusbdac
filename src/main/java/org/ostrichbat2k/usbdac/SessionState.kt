@@ -24,7 +24,6 @@ import org.ostrichbat2k.usbdac.protocol.UsbAudioSession
 import org.ostrichbat2k.usbdac.streaming.RoutingAudioSink
 import android.hardware.usb.UsbDevice
 import androidx.media3.exoplayer.audio.AudioSink
-import kotlinx.coroutines.CompletableDeferred
 
 /**
  * Everything that decides whether [UsbAudioManagerImpl.ensureFormatActive] needs to reassert the
@@ -53,7 +52,7 @@ internal sealed class SessionState {
     data object Idle : SessionState()
 
     /** [UsbAudioManagerImpl.activateDac] is running for [device] on its background thread right now. */
-    data class Activating(val device: UsbDevice, val settled: CompletableDeferred<Unit>) : SessionState()
+    data class Activating(val device: UsbDevice) : SessionState()
 
     /**
      * A real [UsbAudioSession] exists and is ready (or was) for playback.

@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: gradle
+
+      - uses: android-actions/setup-android@v4
+        with:
+          packages: ""
+
+      - name: Install NDK and CMake
+        run: sdkmanager --install "ndk;28.2.13676358" "cmake;3.22.1"
+
+      - name: Run unit tests
+        run: |
+          export PATH="$ANDROID_HOME/cmake/3.22.1/bin:$PATH"
+          ./gradlew testDebugUnitTest --no-daemon
+
+      - name: Static analysis with detekt
+        run: ./gradlew detekt --no-daemon
+
+      - name: Build debug AAR
+        run: |
+          export PATH="$ANDROID_HOME/cmake/3.22.1/bin:$PATH"
+          ./gradlew assembleDebug --no-daemon

@@ -102,4 +102,7 @@ internal interface UsbClaimController {
 
     /** See [UsbClaimControllerImpl.shutdownExecutorForTest] -- test-only, no production caller. */
     fun shutdownExecutorForTest()
+
+    /** See [UsbClaimControllerImpl.awaitClaimSchedulerIdleForTest] -- test-only, no production caller. */
+    fun awaitClaimSchedulerIdleForTest()
 }

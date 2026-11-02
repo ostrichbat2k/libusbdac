@@ -68,6 +68,14 @@ internal class UsbClaimControllerImpl(
     private val onClaimFailed: () -> Unit,
     private val onTakeoverTimeout: () -> Unit,
 ) : UsbClaimController {
+    private companion object {
+        // Generous on purpose: this only ever has to outlast a queued no-op plus whatever's
+        // already ahead of it (at most one fast-pathed awaitAndroidOutputTakeover call, or its
+        // real UsbAudioTuning.AWAIT_TAKEOVER_TIMEOUT_MS-bounded wait) -- never meant to trip in
+        // practice, just to fail loud instead of hanging a test suite if it ever did.
+        const val DRAIN_TIMEOUT_SECONDS_FOR_TEST = 5L
+    }
+
     private val claimScheduler =
         Executors.newSingleThreadScheduledExecutor { r ->
             Thread(r, "UsbAudioControl-Claim").apply { isDaemon = true }
@@ -128,6 +136,21 @@ internal class UsbClaimControllerImpl(
     // of this test suite's cross-class flakiness.
     override fun shutdownExecutorForTest() {
         claimScheduler.shutdownNow()
+    }
+
+    // Test-only: doReleaseClaim's awaitAndroidTakeover=false branch deliberately fires
+    // awaitAndroidOutputTakeover() fire-and-forget on claimScheduler (see its own doc comment --
+    // that's the whole point for production callers that can't afford to block). A test that
+    // calls releaseClaim(awaitAndroidTakeover = false) and then immediately asserts on
+    // claim/mute state is racing that background task on the very same mocks this test thread is
+    // using -- confirmed, reproduced: non-deterministic ALREADY_CLAIMED-vs-RECLAIMED and
+    // mute-level mismatches in UsbAudioManagerFunctionalTest, same symptom regardless of whether
+    // the background task's own fast-path (getDevices() already matching) or its real latch-wait
+    // path is the one that runs. claimScheduler is single-threaded, so submitting a no-op here
+    // and joining it drains exactly one pending task deep -- anything already queued ahead of it,
+    // including that fire-and-forget call, is guaranteed to have finished first.
+    override fun awaitClaimSchedulerIdleForTest() {
+        claimScheduler.submit {}.get(DRAIN_TIMEOUT_SECONDS_FOR_TEST, TimeUnit.SECONDS)
     }
 
     /** Called by [UsbAudioOutput] once it's actually claimed and streaming -- see [releaseClaim]. */

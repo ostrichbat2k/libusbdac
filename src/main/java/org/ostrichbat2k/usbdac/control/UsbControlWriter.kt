@@ -42,4 +42,7 @@ internal interface UsbControlWriter {
 
     /** See [UsbAudioManager.setMixerGain]. */
     fun setMixerGain(inputChannel: Int, outputChannel: Int, valueDb: Int)
+
+    /** See [UsbControlWriterImpl.shutdownExecutorForTest] -- test-only, no production caller. */
+    fun shutdownExecutorForTest()
 }

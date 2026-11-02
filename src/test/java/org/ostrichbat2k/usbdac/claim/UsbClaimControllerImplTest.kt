@@ -122,6 +122,9 @@ class UsbClaimControllerImplTest {
 
     @AfterEach
     fun tearDown() {
+        // See UsbClaimControllerImpl.shutdownExecutorForTest's doc comment -- without this, a
+        // still-pending scheduled release can fire during a later, unrelated test class's run.
+        controller.shutdownExecutorForTest()
         unmockkObject(UsbAudioController)
     }
 

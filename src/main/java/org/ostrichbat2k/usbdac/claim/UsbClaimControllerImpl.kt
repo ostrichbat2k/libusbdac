@@ -120,6 +120,16 @@ internal class UsbClaimControllerImpl(
     // left the Feature Unit sitting at prepareForHalHandoff's forced gain, never restored.
     @Volatile private var hardwareForcedForHandoff = false
 
+    // Test-only: claimScheduler is a real background thread with no production shutdown path
+    // (this instance is meant to live for the whole process) -- without this, a test's own
+    // scheduled-but-not-yet-fired releaseClaim(delayMs > 0) (or a real doReleaseClaim() still
+    // mid-flight) outlives the test method and can land during a *later*, unrelated test class's
+    // run, against whatever mock is active by then. Confirmed, reproduced: this is the root cause
+    // of this test suite's cross-class flakiness.
+    override fun shutdownExecutorForTest() {
+        claimScheduler.shutdownNow()
+    }
+
     /** Called by [UsbAudioOutput] once it's actually claimed and streaming -- see [releaseClaim]. */
     override fun notifyStreamingStarted() {
         activeStreamCount++

@@ -99,4 +99,7 @@ internal interface UsbClaimController {
      * gain to a HAL-handoff level out from under it.
      */
     fun releaseClaim(delayMs: Long, awaitAndroidTakeover: Boolean, deactivateOnTimeout: Boolean = false)
+
+    /** See [UsbClaimControllerImpl.shutdownExecutorForTest] -- test-only, no production caller. */
+    fun shutdownExecutorForTest()
 }

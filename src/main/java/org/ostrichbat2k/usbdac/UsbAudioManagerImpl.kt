@@ -304,6 +304,12 @@ class UsbAudioManagerImpl(private val context: Context, private val usbSettings:
 
     override fun consumeHardwareReset(): Boolean = claimController.consumeHardwareReset()
 
+    /** Test-only, no production caller -- see [UsbClaimControllerImpl.shutdownExecutorForTest]. */
+    internal fun shutdownExecutorsForTest() {
+        claimController.shutdownExecutorForTest()
+        controlWriter.shutdownExecutorForTest()
+    }
+
     /**
      * Schedules handing the interface back to the kernel's own driver after [delayMs] (see
      * [UsbAudioTuning.RELEASE_GRACE_MS]), canceling any release already pending -- so a

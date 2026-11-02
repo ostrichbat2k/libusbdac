@@ -143,6 +143,15 @@ internal class UsbControlWriterImpl(
     @Volatile private var pendingVolumeDb: Int? = null
     @Volatile private var volumeWriteInFlight = false
 
+    // Test-only: volumeExecutor is a real background thread with no production shutdown path
+    // (this instance is meant to live for the whole process) -- without this, a test's own
+    // scheduleVolumeWrite() still mid-flight outlives the test method and can land during a
+    // *later*, unrelated test class's run, against whatever mock is active by then. See
+    // UsbClaimControllerImpl.shutdownExecutorForTest's identical reasoning.
+    override fun shutdownExecutorForTest() {
+        volumeExecutor.shutdownNow()
+    }
+
     /**
      * Live-adjusts the active session's master/channel volume, if any; reflected in
      * [UsbAudioManager.controlState]. Runs the actual control transfers (and the full post-write

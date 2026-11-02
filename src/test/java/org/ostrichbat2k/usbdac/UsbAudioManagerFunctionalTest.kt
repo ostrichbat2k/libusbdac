@@ -30,6 +30,7 @@ import io.mockk.mockk
 import io.mockk.verify
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.runBlocking
+import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.BeforeEach
@@ -140,6 +141,14 @@ class UsbAudioManagerFunctionalTest {
         manager = UsbAudioManagerImpl(context, usbSettings)
         manager.deviceDiscovery = discovery
         manager.dacActivator = dacActivator
+    }
+
+    @AfterEach
+    fun tearDown() {
+        // See UsbAudioManagerImpl.shutdownExecutorsForTest's doc comment -- without this, a
+        // still-pending scheduled release or volume write can fire during a later, unrelated
+        // test class's run.
+        manager.shutdownExecutorsForTest()
     }
 
     private fun fakeDevice(name: String = "Test DAC"): UsbDevice =

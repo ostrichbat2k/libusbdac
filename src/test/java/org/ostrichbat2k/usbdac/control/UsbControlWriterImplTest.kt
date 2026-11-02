@@ -25,10 +25,10 @@ import io.mockk.mockkObject
 import io.mockk.unmockkObject
 import io.mockk.verify
 import io.mockk.verifyOrder
-import org.junit.After
-import org.junit.Assert.assertEquals
-import org.junit.Before
-import org.junit.Test
+import org.junit.jupiter.api.AfterEach
+import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.BeforeEach
+import org.junit.jupiter.api.Test
 import org.ostrichbat2k.usbdac.UsbAudioManager.ClaimOutcome
 import org.ostrichbat2k.usbdac.protocol.UacPlaybackTopology
 import org.ostrichbat2k.usbdac.protocol.UacStreamFormat
@@ -96,7 +96,7 @@ class UsbControlWriterImplTest {
     private val loggedEvents = mutableListOf<String>()
     private lateinit var writer: UsbControlWriterImpl
 
-    @Before
+    @BeforeEach
     fun setUp() {
         mockkObject(UsbAudioController)
         usbSettings = mockk(relaxed = true)
@@ -125,7 +125,7 @@ class UsbControlWriterImplTest {
             )
     }
 
-    @After
+    @AfterEach
     fun tearDown() {
         unmockkObject(UsbAudioController)
     }

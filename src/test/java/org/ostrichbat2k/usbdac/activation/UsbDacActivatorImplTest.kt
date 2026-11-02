@@ -30,12 +30,12 @@ import io.mockk.mockkObject
 import io.mockk.unmockkObject
 import io.mockk.verify
 import io.mockk.verifyOrder
-import org.junit.After
-import org.junit.Assert.assertEquals
-import org.junit.Assert.assertNull
-import org.junit.Assert.assertTrue
-import org.junit.Before
-import org.junit.Test
+import org.junit.jupiter.api.AfterEach
+import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertNull
+import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.BeforeEach
+import org.junit.jupiter.api.Test
 import org.ostrichbat2k.usbdac.protocol.UacPlaybackTopology
 import org.ostrichbat2k.usbdac.protocol.UacStreamFormat
 import org.ostrichbat2k.usbdac.protocol.UsbAudioController
@@ -170,7 +170,7 @@ class UsbDacActivatorImplTest {
     private var preferredBitResolution = 24
     private lateinit var activator: UsbDacActivatorImpl
 
-    @Before
+    @BeforeEach
     fun setUp() {
         mockkObject(
             UsbAudioController,
@@ -195,7 +195,7 @@ class UsbDacActivatorImplTest {
             )
     }
 
-    @After
+    @AfterEach
     fun tearDown() {
         unmockkObject(
             UsbAudioController,

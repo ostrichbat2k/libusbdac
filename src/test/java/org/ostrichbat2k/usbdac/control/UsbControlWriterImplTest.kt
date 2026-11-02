@@ -127,6 +127,9 @@ class UsbControlWriterImplTest {
 
     @AfterEach
     fun tearDown() {
+        // See UsbControlWriterImpl.shutdownExecutorForTest's doc comment -- without this, a
+        // still-pending volume write can fire during a later, unrelated test class's run.
+        writer.shutdownExecutorForTest()
         unmockkObject(UsbAudioController)
     }
 

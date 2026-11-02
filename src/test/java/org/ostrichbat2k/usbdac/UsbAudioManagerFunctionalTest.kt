@@ -30,6 +30,7 @@ import io.mockk.mockk
 import io.mockk.verify
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.runBlocking
+import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.BeforeEach
@@ -142,6 +143,14 @@ class UsbAudioManagerFunctionalTest {
         manager.dacActivator = dacActivator
     }
 
+    @AfterEach
+    fun tearDown() {
+        // See UsbAudioManagerImpl.shutdownExecutorsForTest's doc comment -- without this, a
+        // still-pending scheduled release or volume write can fire during a later, unrelated
+        // test class's run.
+        manager.shutdownExecutorsForTest()
+    }
+
     private fun fakeDevice(name: String = "Test DAC"): UsbDevice =
         mockk(relaxed = true) {
             every { deviceName } returns name
@@ -180,8 +189,11 @@ class UsbAudioManagerFunctionalTest {
         // actually uses -- forces a deterministic unclaimed baseline synchronously (the
         // prepareForHalHandoff/releaseToKernel/interfaceClaimed=false part of doReleaseClaim never
         // depends on awaitAndroidTakeover), pushing the racy wait itself onto a background
-        // scheduler thread this test never has to synchronize with.
+        // scheduler thread this test never has to synchronize with. Still has to settle before
+        // returning, though -- every caller of activate() goes on to assert claim/mute state
+        // against the same manager instance (see awaitClaimSettledForTest's own doc comment).
         manager.releaseClaim(delayMs = 0, awaitAndroidTakeover = false, deactivateOnTimeout = false)
+        manager.awaitClaimSettledForTest()
         return session
     }
 
@@ -206,6 +218,7 @@ class UsbAudioManagerFunctionalTest {
         manager.requestClaim()
 
         manager.releaseClaim(delayMs = 0, awaitAndroidTakeover = false, deactivateOnTimeout = false)
+        manager.awaitClaimSettledForTest()
 
         assertEquals(ClaimOutcome.RECLAIMED, manager.requestClaim())
     }
@@ -243,6 +256,7 @@ class UsbAudioManagerFunctionalTest {
         // orchestration path (UsbAudioManagerImpl -> UsbClaimControllerImpl ->
         // UsbVolumeControllerImpl.prepareForHalHandoff), not a direct call this time.
         manager.releaseClaim(delayMs = 0, awaitAndroidTakeover = false, deactivateOnTimeout = false)
+        manager.awaitClaimSettledForTest()
 
         // prepareForHalHandoff's real effect: every channel forced to the Feature Unit's own
         // reported max (unity), not left wherever the last bit-perfect write put it -- this is

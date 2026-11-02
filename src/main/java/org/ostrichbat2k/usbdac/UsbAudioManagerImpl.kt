@@ -306,6 +306,7 @@ class UsbAudioManagerImpl(private val context: Context, private val usbSettings:
 
     /** Test-only, no production caller -- see [UsbClaimControllerImpl.shutdownExecutorForTest]. */
     internal fun shutdownExecutorsForTest() {
+        joinActivationThreadForTest()
         claimController.shutdownExecutorForTest()
         controlWriter.shutdownExecutorForTest()
     }
@@ -445,18 +446,32 @@ class UsbAudioManagerImpl(private val context: Context, private val usbSettings:
         val deferred = CompletableDeferred<Unit>()
         sessionState = SessionState.Activating(device, deferred)
         updateBlockPlayback()
-        Thread {
-                try {
-                    activateDac(device)
-                } finally {
-                    settleActivation()
-                    deferred.complete(Unit)
+        activationThread =
+            Thread {
+                    try {
+                        activateDac(device)
+                    } finally {
+                        settleActivation()
+                        deferred.complete(Unit)
+                    }
                 }
-            }
-            .apply {
-                isDaemon = true
-                start()
-            }
+                .apply {
+                    isDaemon = true
+                    start()
+                }
+    }
+
+    // Test-only: this raw Thread has no production join/shutdown path (fire-and-forget is the
+    // whole point in production -- see runActivation's own doc comment). A caller that only
+    // ever uses triggerActivation() without also awaitActivation()-ing (or one whose
+    // awaitActivation() legitimately timed out) can leave this thread still running past the end
+    // of a test method, where it goes on to mutate a by-then-torn-down manager instance's own
+    // fields -- harmless for THAT instance, but it keeps the JVM busier than a real test run ever
+    // is, measurably widening the scheduling window other tests' own leaked threads race against.
+    @Volatile private var activationThread: Thread? = null
+
+    internal fun joinActivationThreadForTest(timeoutMs: Long = 2000) {
+        activationThread?.join(timeoutMs)
     }
 
     /**

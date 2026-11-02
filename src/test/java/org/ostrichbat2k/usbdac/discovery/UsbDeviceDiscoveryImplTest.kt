@@ -36,11 +36,11 @@ import io.mockk.mockkStatic
 import io.mockk.unmockkConstructor
 import io.mockk.unmockkStatic
 import io.mockk.verify
-import org.junit.After
-import org.junit.Assert.assertEquals
-import org.junit.Assert.assertTrue
-import org.junit.Before
-import org.junit.Test
+import org.junit.jupiter.api.AfterEach
+import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.BeforeEach
+import org.junit.jupiter.api.Test
 import org.ostrichbat2k.usbdac.UsbDacPreferences
 
 class UsbDeviceDiscoveryImplTest {
@@ -77,7 +77,7 @@ class UsbDeviceDiscoveryImplTest {
         every { usbManager.deviceList } returns HashMap(devices.associateBy { it.deviceName })
     }
 
-    @Before
+    @BeforeEach
     fun setUp() {
         mockkStatic(Toast::class)
         every { Toast.makeText(any(), any<String>(), any()) } returns mockk(relaxed = true)
@@ -106,7 +106,7 @@ class UsbDeviceDiscoveryImplTest {
             )
     }
 
-    @After
+    @AfterEach
     fun tearDown() {
         unmockkStatic(Toast::class)
         unmockkStatic(PendingIntent::class)

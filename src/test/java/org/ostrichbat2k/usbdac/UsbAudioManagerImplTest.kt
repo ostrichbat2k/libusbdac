@@ -29,12 +29,12 @@ import io.mockk.mockk
 import io.mockk.verify
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.runBlocking
-import org.junit.Assert.assertFalse
-import org.junit.Assert.assertNotNull
-import org.junit.Assert.assertNull
-import org.junit.Assert.assertTrue
-import org.junit.Before
-import org.junit.Test
+import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNotNull
+import org.junit.jupiter.api.Assertions.assertNull
+import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.BeforeEach
+import org.junit.jupiter.api.Test
 import org.ostrichbat2k.usbdac.activation.UsbDacActivator
 import org.ostrichbat2k.usbdac.discovery.UsbAudioDevice
 import org.ostrichbat2k.usbdac.discovery.UsbDeviceDiscovery
@@ -152,7 +152,7 @@ class UsbAudioManagerImplTest {
     private lateinit var dacActivator: UsbDacActivator
     private lateinit var manager: UsbAudioManagerImpl
 
-    @Before
+    @BeforeEach
     fun setUp() {
         usbManager = mockk(relaxed = true)
         audioManager = mockk(relaxed = true)
@@ -231,7 +231,7 @@ class UsbAudioManagerImplTest {
 
         verify(exactly = 1) { dacActivator.activate(device) }
         assertNotNull(manager.controlState.value)
-        org.junit.Assert.assertEquals(testFormat, manager.controlState.value?.activeFormat)
+        org.junit.jupiter.api.Assertions.assertEquals(testFormat, manager.controlState.value?.activeFormat)
         assertTrue(manager.diagnosticLog.value.any { it.contains("DAC session ready") })
     }
 
@@ -435,14 +435,14 @@ class UsbAudioManagerImplTest {
     @Test
     fun `halOutputSampleRate reads AudioManager's own output-sample-rate property`() {
         every { audioManager.getProperty(AudioManager.PROPERTY_OUTPUT_SAMPLE_RATE) } returns "48000"
-        org.junit.Assert.assertEquals(48000, manager.halOutputSampleRate())
+        org.junit.jupiter.api.Assertions.assertEquals(48000, manager.halOutputSampleRate())
     }
 
     @Test
     fun `reportPlaybackRoute publishes to playbackRoute`() {
         val route = UsbAudioManager.PlaybackRoute.Direct(bitDepth = 24, sampleRateHz = 44100, channels = 2)
         manager.reportPlaybackRoute(route)
-        org.junit.Assert.assertEquals(route, manager.playbackRoute.value)
+        org.junit.jupiter.api.Assertions.assertEquals(route, manager.playbackRoute.value)
     }
 
     @Test
@@ -456,7 +456,7 @@ class UsbAudioManagerImplTest {
                 bufferedBytes = 2048,
                 bufferCapacityBytes = 4096)
         manager.reportPipelineStats(stats)
-        org.junit.Assert.assertEquals(stats, manager.pipelineStats.value)
+        org.junit.jupiter.api.Assertions.assertEquals(stats, manager.pipelineStats.value)
 
         manager.reportPipelineStats(null)
         assertNull(manager.pipelineStats.value)
@@ -536,7 +536,7 @@ class UsbAudioManagerImplTest {
                 1
             }
 
-        org.junit.Assert.assertEquals(2, manager.getPowerDomainState())
+        org.junit.jupiter.api.Assertions.assertEquals(2, manager.getPowerDomainState())
     }
 
     @Test
@@ -556,7 +556,7 @@ class UsbAudioManagerImplTest {
                 }
             }
 
-        org.junit.Assert.assertEquals(48000 to true, manager.getClockInfo())
+        org.junit.jupiter.api.Assertions.assertEquals(48000 to true, manager.getClockInfo())
     }
 
     // ---- retryActivation's no-device branch ----
@@ -588,7 +588,7 @@ class UsbAudioManagerImplTest {
 
     @Test
     fun `requestClaim fails with no active session`() {
-        org.junit.Assert.assertEquals(UsbAudioManager.ClaimOutcome.FAILED, manager.requestClaim())
+        org.junit.jupiter.api.Assertions.assertEquals(UsbAudioManager.ClaimOutcome.FAILED, manager.requestClaim())
     }
 
     @Test

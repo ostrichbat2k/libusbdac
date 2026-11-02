@@ -21,10 +21,10 @@ package org.ostrichbat2k.usbdac.abx
 import io.mockk.every
 import io.mockk.mockk
 import io.mockk.verify
-import org.junit.Assert.assertEquals
-import org.junit.Assert.assertNull
-import org.junit.Assert.assertTrue
-import org.junit.Test
+import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertNull
+import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.Test
 import org.ostrichbat2k.usbdac.UsbDacPreferences
 import org.ostrichbat2k.usbdac.control.UsbVolumeController
 
@@ -100,7 +100,7 @@ class UsbAbxTesterImplTest {
             f.tester.rollTrial()
             if (f.tester.groundTruth.value == true) sawBitPerfect = true
         }
-        assertTrue("never rolled a bit-perfect trial in 60 tries", sawBitPerfect)
+        assertTrue(sawBitPerfect, "never rolled a bit-perfect trial in 60 tries")
         assertEquals(-12, f.lastVolumeSet)
     }
 
@@ -119,7 +119,7 @@ class UsbAbxTesterImplTest {
             f.tester.rollTrial()
             if (f.tester.groundTruth.value == false) sawFallback = true
         }
-        assertTrue("never rolled a fallback trial in 60 tries", sawFallback)
+        assertTrue(sawFallback, "never rolled a fallback trial in 60 tries")
         assertTrue(f.clearCachedSinkCalls > 0)
     }
 

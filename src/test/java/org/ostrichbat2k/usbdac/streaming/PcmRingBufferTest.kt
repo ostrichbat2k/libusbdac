@@ -19,9 +19,9 @@
 package org.ostrichbat2k.usbdac.streaming
 
 import java.nio.ByteBuffer
-import org.junit.Assert.assertArrayEquals
-import org.junit.Assert.assertEquals
-import org.junit.Test
+import org.junit.jupiter.api.Assertions.assertArrayEquals
+import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Test
 
 class PcmRingBufferTest {
 

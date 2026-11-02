@@ -18,9 +18,9 @@
 
 package org.ostrichbat2k.usbdac.protocol
 
-import org.junit.Assert.assertArrayEquals
-import org.junit.Assert.assertEquals
-import org.junit.Test
+import org.junit.jupiter.api.Assertions.assertArrayEquals
+import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Test
 
 /**
  * Covers [UsbAudioController]'s pure byte-math/request-selection helpers -- everything else in
@@ -82,7 +82,7 @@ class UsbAudioControllerTest {
         for (len in 1..4) {
             val maxValue = if (len == 4) Int.MAX_VALUE else (1 shl (8 * len)) - 1
             for (value in listOf(0, 1, maxValue / 2, maxValue)) {
-                assertEquals("len=$len value=$value", value, leBytes(value, len).leUInt(0, len))
+                assertEquals(value, leBytes(value, len).leUInt(0, len), "len=$len value=$value")
             }
         }
     }

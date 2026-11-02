@@ -29,11 +29,11 @@ import io.mockk.mockk
 import io.mockk.verify
 import io.mockk.verifyOrder
 import kotlinx.coroutines.flow.MutableStateFlow
-import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
-import org.junit.Assert.assertTrue
-import org.junit.Before
-import org.junit.Test
+import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.BeforeEach
+import org.junit.jupiter.api.Test
 import org.ostrichbat2k.usbdac.UsbAudioManager
 import org.ostrichbat2k.usbdac.control.UsbControlState
 import org.ostrichbat2k.usbdac.protocol.UacStreamFormat
@@ -98,7 +98,7 @@ class RoutingAudioSinkTest {
     private lateinit var usbSink: AudioSink
     private lateinit var sink: RoutingAudioSink
 
-    @Before
+    @BeforeEach
     fun setUp() {
         usbAudioManager = mockk(relaxed = true)
         fallback = mockk(relaxed = true)

@@ -18,8 +18,8 @@
 
 package org.ostrichbat2k.usbdac.streaming
 
-import org.junit.Assert.assertEquals
-import org.junit.Test
+import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Test
 
 class IsoPacketSchedulerTest {
     /** Sum of one full period's worth of packets must exactly equal the sample rate -- the
@@ -102,9 +102,9 @@ class IsoPacingTest {
         // ever shows up) would silently get full-speed pacing here, not its own real timing.
         for (usbSpeed in listOf(1, 2, 4, 5, 6, 0, -1, 99)) {
             val pacing = IsoPacing.forSpeed(usbSpeed, basePacketsPerUrb = 8)
-            assertEquals("usbSpeed=$usbSpeed", 1000, pacing.packetsPerSecond)
-            assertEquals("usbSpeed=$usbSpeed", 1_000_000L, pacing.packetDurationNs)
-            assertEquals("usbSpeed=$usbSpeed", 8, pacing.packetsPerUrb)
+            assertEquals(1000, pacing.packetsPerSecond, "usbSpeed=$usbSpeed")
+            assertEquals(1_000_000L, pacing.packetDurationNs, "usbSpeed=$usbSpeed")
+            assertEquals(8, pacing.packetsPerUrb, "usbSpeed=$usbSpeed")
         }
     }
 }

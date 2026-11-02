@@ -27,12 +27,12 @@ import io.mockk.mockkObject
 import io.mockk.unmockkObject
 import io.mockk.verify
 import io.mockk.verifyOrder
-import org.junit.After
-import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
-import org.junit.Assert.assertTrue
-import org.junit.Before
-import org.junit.Test
+import org.junit.jupiter.api.AfterEach
+import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.BeforeEach
+import org.junit.jupiter.api.Test
 import org.ostrichbat2k.usbdac.UsbAudioManager
 import org.ostrichbat2k.usbdac.control.UsbVolumeController
 import org.ostrichbat2k.usbdac.protocol.UacPlaybackTopology
@@ -103,7 +103,7 @@ class UsbClaimControllerImplTest {
     private var takeoverTimeoutCalls = 0
     private lateinit var controller: UsbClaimControllerImpl
 
-    @Before
+    @BeforeEach
     fun setUp() {
         mockkObject(UsbAudioController)
         audioManager = mockk(relaxed = true)
@@ -120,7 +120,7 @@ class UsbClaimControllerImplTest {
             )
     }
 
-    @After
+    @AfterEach
     fun tearDown() {
         unmockkObject(UsbAudioController)
     }

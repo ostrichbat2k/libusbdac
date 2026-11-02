@@ -30,10 +30,10 @@ import io.mockk.mockk
 import io.mockk.verify
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.runBlocking
-import org.junit.Assert.assertEquals
-import org.junit.Assert.assertTrue
-import org.junit.Before
-import org.junit.Test
+import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.BeforeEach
+import org.junit.jupiter.api.Test
 import org.ostrichbat2k.usbdac.UsbAudioManager.ClaimOutcome
 import org.ostrichbat2k.usbdac.activation.UsbDacActivator
 import org.ostrichbat2k.usbdac.control.UsbVolumeControllerImpl
@@ -107,7 +107,7 @@ class UsbAudioManagerFunctionalTest {
 
     private var volumeDbBacking: Int? = null
 
-    @Before
+    @BeforeEach
     fun setUp() {
         usbManager = mockk(relaxed = true)
         audioManager = mockk(relaxed = true)
@@ -274,7 +274,7 @@ class UsbAudioManagerFunctionalTest {
             manager.rollAbxTrial()
             if (manager.abxGroundTruth.value == true) isBitPerfect = true
         }
-        assertTrue("rollAbxTrial never landed on bit-perfect in 50 tries", isBitPerfect)
+        assertTrue(isBitPerfect, "rollAbxTrial never landed on bit-perfect in 50 tries")
 
         // syncAbxLoudnessToBitPerfect's real effect: manager.setVolume() got called with exactly
         // the dB abxSyncTargetDb computed from STREAM_MUSIC's current index (-4352, same

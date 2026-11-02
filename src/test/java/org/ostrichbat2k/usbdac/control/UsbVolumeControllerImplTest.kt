@@ -26,11 +26,11 @@ import io.mockk.unmockkObject
 import io.mockk.verify
 import io.mockk.verifyOrder
 import kotlinx.coroutines.flow.MutableStateFlow
-import org.junit.After
-import org.junit.Assert.assertEquals
-import org.junit.Assert.assertNull
-import org.junit.Before
-import org.junit.Test
+import org.junit.jupiter.api.AfterEach
+import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertNull
+import org.junit.jupiter.api.BeforeEach
+import org.junit.jupiter.api.Test
 import org.ostrichbat2k.usbdac.UsbAudioManager
 import org.ostrichbat2k.usbdac.UsbDacPreferences
 import org.ostrichbat2k.usbdac.protocol.UacPlaybackTopology
@@ -105,7 +105,7 @@ class UsbVolumeControllerImplTest {
     private lateinit var playbackRouteFlow: MutableStateFlow<UsbAudioManager.PlaybackRoute>
     private lateinit var controller: UsbVolumeControllerImpl
 
-    @Before
+    @BeforeEach
     fun setUp() {
         mockkObject(UsbAudioController)
         audioManager = mockk(relaxed = true)
@@ -123,7 +123,7 @@ class UsbVolumeControllerImplTest {
             )
     }
 
-    @After
+    @AfterEach
     fun tearDown() {
         unmockkObject(UsbAudioController)
     }

@@ -427,13 +427,21 @@ Java_org_ostrichbat2k_usbdac_streaming_UsbNative_reapIso(JNIEnv* /*env*/, jobjec
 
     struct usbdevfs_urb* reaped = nullptr;
     int ret = ioctl(stream->fd, USBDEVFS_REAPURB, &reaped);
-    if (ret != 0 || !reaped) {
+    if (ret != 0) {
+        // errno is only meaningful right after the call that actually failed -- reading it in a
+        // combined `ret != 0 || !reaped` branch would risk logging a stale value from some
+        // unrelated earlier call on the rare path where the ioctl itself succeeds but still
+        // somehow returns a null urb (handled separately below).
         int err = errno;
         int code = reapErrorCodeForErrno(err);
         if (code == kReapErrorFatal) {
             LOGE("REAPURB failed: errno=%d (%s)", err, strerror(err));
         }
         return code;
+    }
+    if (!reaped) {
+        LOGE("REAPURB succeeded but returned a null urb");
+        return kReapErrorFatal;
     }
     return (jint) processReapedUrb(reaped, stream->packetsPerUrb, stream->numUrbs);
 }

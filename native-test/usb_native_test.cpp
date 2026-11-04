@@ -19,6 +19,7 @@
 #include <linux/usbdevice_fs.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <cstring>
 #include <vector>
 
@@ -39,10 +40,11 @@ void Java_org_ostrichbat2k_usbdac_streaming_UsbNative_cancelIso(JNIEnv*, jobject
 void Java_org_ostrichbat2k_usbdac_streaming_UsbNative_closeIsoStream(JNIEnv*, jobject, jlong handle);
 }
 
-// Not extern "C" -- usb_native.cpp declares this with plain C++ linkage (it's an internal helper
-// with external linkage, never called from Kotlin/JNI directly), so this forward declaration
-// must match that exactly for the linker to resolve it.
+// Not extern "C" -- usb_native.cpp declares these with plain C++ linkage (internal helpers with
+// external linkage, never called from Kotlin/JNI directly), so these forward declarations must
+// match that exactly for the linker to resolve them.
 int processReapedUrb(const struct usbdevfs_urb* reaped, int packetsPerUrb, int numUrbs);
+int reapErrorCodeForErrno(int err);
 
 namespace {
 
@@ -51,6 +53,8 @@ namespace {
 constexpr jint kMaxNumUrbs = 64;
 constexpr jint kMaxPacketsPerUrb = 4096;
 constexpr jint kMaxPacketSize = 4096;
+constexpr jint kReapErrorTransient = -1;
+constexpr jint kReapErrorFatal = -2;
 
 // A real, open fd that supports none of the USBDEVFS_* ioctls this file issues -- every ioctl()
 // call against it fails with ENOTTY, standing in for "reached the syscall but it failed" without
@@ -167,8 +171,9 @@ TEST(HandleTable, CancelUnknownHandleIsASafeNoOp) {
     Java_org_ostrichbat2k_usbdac_streaming_UsbNative_cancelIso(nullptr, nullptr, 0x4242);
 }
 
-TEST(HandleTable, ReapUnknownHandleReturnsMinusOne) {
-    EXPECT_EQ(Java_org_ostrichbat2k_usbdac_streaming_UsbNative_reapIso(nullptr, nullptr, 0x4242), -1);
+TEST(HandleTable, ReapUnknownHandleReturnsFatal) {
+    EXPECT_EQ(Java_org_ostrichbat2k_usbdac_streaming_UsbNative_reapIso(nullptr, nullptr, 0x4242),
+              kReapErrorFatal);
 }
 
 TEST_F(DummyFd, DoubleCloseIsASafeNoOp) {
@@ -195,12 +200,13 @@ TEST_F(DummyFd, SubmitAfterCloseFailsInsteadOfUseAfterFree) {
     EXPECT_EQ(result, JNI_FALSE);
 }
 
-TEST_F(DummyFd, ReapAfterCloseReturnsMinusOne) {
+TEST_F(DummyFd, ReapAfterCloseReturnsFatal) {
     ASSERT_GE(fd_, 0);
     jlong handle = openValidStream(fd_);
     ASSERT_NE(handle, 0);
     Java_org_ostrichbat2k_usbdac_streaming_UsbNative_closeIsoStream(nullptr, nullptr, handle);
-    EXPECT_EQ(Java_org_ostrichbat2k_usbdac_streaming_UsbNative_reapIso(nullptr, nullptr, handle), -1);
+    EXPECT_EQ(Java_org_ostrichbat2k_usbdac_streaming_UsbNative_reapIso(nullptr, nullptr, handle),
+              kReapErrorFatal);
 }
 
 TEST_F(DummyFd, CancelAfterCloseIsASafeNoOp) {
@@ -330,8 +336,29 @@ TEST_F(DummyFd, ReapOnFreshStreamReachesTheIoctlCallAndFails) {
     ASSERT_GE(fd_, 0);
     jlong handle = openValidStream(fd_);
     ASSERT_NE(handle, 0);
-    EXPECT_EQ(Java_org_ostrichbat2k_usbdac_streaming_UsbNative_reapIso(nullptr, nullptr, handle), -1);
+    // /dev/null's ioctl() always fails with ENOTTY, never EINTR, so this always takes the fatal
+    // branch -- see ReapErrorCodeForErrno below for the EINTR-specific case.
+    EXPECT_EQ(Java_org_ostrichbat2k_usbdac_streaming_UsbNative_reapIso(nullptr, nullptr, handle),
+              kReapErrorFatal);
     Java_org_ostrichbat2k_usbdac_streaming_UsbNative_closeIsoStream(nullptr, nullptr, handle);
+}
+
+// --- reapErrorCodeForErrno: the errno -> reapIso() return code mapping, extracted so it's
+// testable without a real interrupted syscall (see #60). ---
+
+TEST(ReapErrorCodeForErrno, EintrIsTransient) {
+    EXPECT_EQ(reapErrorCodeForErrno(EINTR), kReapErrorTransient);
+}
+
+TEST(ReapErrorCodeForErrno, DeviceGoneIsFatal) {
+    EXPECT_EQ(reapErrorCodeForErrno(ENODEV), kReapErrorFatal);
+}
+
+TEST(ReapErrorCodeForErrno, UnrecognizedErrnoIsFatalNotRetriedForever) {
+    // Deliberately not EINTR and not one of the "obviously means device gone" errnos either --
+    // the whole point of #60's fix is to not special-case every errno that might mean "device
+    // gone" and risk missing one, so anything that isn't EINTR must come back fatal.
+    EXPECT_EQ(reapErrorCodeForErrno(EBADF), kReapErrorFatal);
 }
 
 // --- processReapedUrb: reapIso's packet-scan logic, extracted so it's testable with a
@@ -363,13 +390,13 @@ TEST(ProcessReapedUrb, ReturnsSlotFromUsercontext) {
 TEST(ProcessReapedUrb, RejectsNegativeUsercontextSlot) {
     FakeUrb urb(0);
     urb.get()->usercontext = (void*) (intptr_t) -1;
-    EXPECT_EQ(processReapedUrb(urb.get(), 4, 4), -1);
+    EXPECT_EQ(processReapedUrb(urb.get(), 4, 4), kReapErrorFatal);
 }
 
 TEST(ProcessReapedUrb, RejectsUsercontextSlotAtOrAboveNumUrbs) {
     FakeUrb urb(0);
     urb.get()->usercontext = (void*) (intptr_t) 4;  // numUrbs is 4, so 0-3 are the valid slots.
-    EXPECT_EQ(processReapedUrb(urb.get(), 4, /*numUrbs=*/4), -1);
+    EXPECT_EQ(processReapedUrb(urb.get(), 4, /*numUrbs=*/4), kReapErrorFatal);
 }
 
 TEST(ProcessReapedUrb, ClampsImplausibleNumPacketsInsteadOfScanningOutOfBounds) {

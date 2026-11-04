@@ -1005,7 +1005,22 @@ class UsbAudioOutput(
         if (isoHandle != 0L) {
             UsbNative.cancelIso(isoHandle)
         }
-        streamThread?.join(2000)
+        streamThread?.join(UsbAudioTuning.STREAM_THREAD_JOIN_TIMEOUT_MS)
+        if (isStreamThreadStuck(streamThread)) {
+            // cancelIso() failed to unblock the thread's native call within the timeout --
+            // freeing isoHandle now would race a still-running reapIso()/submitIso() over memory
+            // closeIsoStream() frees underneath it, a genuine use-after-free (confirmed,
+            // reproduced -- see UsbAudioTuning.STREAM_THREAD_JOIN_TIMEOUT_MS's doc comment).
+            // Leaking the handle and the stuck thread is the safe failure mode here: [streaming]
+            // is already false, so nothing further gets submitted from this instance, and a
+            // later call into this same function (e.g. a retried pause()/release()) will attempt
+            // the same cancel-and-join sequence again rather than being permanently blocked.
+            L.e(
+                "UsbAudioOutput: streaming thread did not stop within " +
+                    "${UsbAudioTuning.STREAM_THREAD_JOIN_TIMEOUT_MS}ms of cancelIso() -- leaving " +
+                    "the native stream open rather than risk a use-after-free")
+            return
+        }
         streamThread = null
         if (isoHandle != 0L) {
             UsbNative.closeIsoStream(isoHandle)
@@ -1016,4 +1031,14 @@ class UsbAudioOutput(
         // track that isn't playing anymore.
         usbAudioManager.reportPipelineStats(null)
     }
+
+    /**
+     * Whether [thread] is still running after [stopStreamingThread]'s join -- i.e.
+     * [UsbNative.cancelIso] failed to unblock it within
+     * [UsbAudioTuning.STREAM_THREAD_JOIN_TIMEOUT_MS]. `internal`, not `private`, purely so a test
+     * can drive this one decision directly without needing to reference [UsbNative] at all (see
+     * [UsbAudioTuning.STREAM_THREAD_JOIN_TIMEOUT_MS]'s doc comment for why this must gate whether
+     * [stopStreamingThread] is allowed to free the native stream).
+     */
+    internal fun isStreamThreadStuck(thread: Thread?): Boolean = thread?.isAlive == true
 }

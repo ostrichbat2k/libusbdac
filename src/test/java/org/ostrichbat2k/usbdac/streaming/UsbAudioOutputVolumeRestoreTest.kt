@@ -256,4 +256,43 @@ class UsbAudioOutputVolumeRestoreTest {
         proceed.countDown()
         output.release()
     }
+
+    /**
+     * Regression coverage for #68: [UsbAudioOutput.stopStreamingThread] must not free the native
+     * isochronous stream while the streaming thread might still be inside a blocked native call
+     * using it (a confirmed, reproduced use-after-free risk when `cancelIso()` fails to unblock a
+     * wedged `reapIso()` in time -- see [org.ostrichbat2k.usbdac.UsbAudioTuning.
+     * STREAM_THREAD_JOIN_TIMEOUT_MS]'s doc comment). [UsbAudioOutput.isStreamThreadStuck] is the
+     * exact decision [stopStreamingThread] gates on; tested directly, not through
+     * `stopStreamingThread()` itself, since any real path through that function where
+     * `isoHandle != 0` touches [UsbNative] and throws `UnsatisfiedLinkError` in a plain JVM test
+     * (the native-bridge-seam gap tracked in #73) -- this is the one piece of the fix that's
+     * genuinely testable without it.
+     */
+    @Test
+    fun `isStreamThreadStuck is false for a null thread or one that already finished`() {
+        val featureUnit = FakeFeatureUnit(unitId = 7, controlInterfaceId = 0)
+        val session = sessionWith(featureUnit)
+        val output = output(session, fakeUsbSettings(-2000))
+        val finished = Thread {}.apply { start(); join() }
+
+        assertFalse(output.isStreamThreadStuck(null))
+        assertFalse(output.isStreamThreadStuck(finished))
+    }
+
+    @Test
+    fun `isStreamThreadStuck is true for a thread that is still running`() {
+        val featureUnit = FakeFeatureUnit(unitId = 7, controlInterfaceId = 0)
+        val session = sessionWith(featureUnit)
+        val output = output(session, fakeUsbSettings(-2000))
+        val unblock = CountDownLatch(1)
+        val stillRunning = Thread { unblock.await() }.apply { isDaemon = true; start() }
+
+        try {
+            assertTrue(output.isStreamThreadStuck(stillRunning))
+        } finally {
+            unblock.countDown()
+            stillRunning.join(1000)
+        }
+    }
 }

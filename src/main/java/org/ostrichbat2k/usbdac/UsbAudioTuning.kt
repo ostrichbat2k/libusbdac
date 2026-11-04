@@ -142,4 +142,17 @@ internal object UsbAudioTuning {
      * produces.
      */
     const val UNDERRUN_FADE_FRAMES = 32
+
+    /**
+     * How long [UsbAudioOutput.stopStreamingThread] waits for the streaming thread to actually
+     * exit after [org.ostrichbat2k.usbdac.streaming.UsbNative.cancelIso] before deciding it's
+     * stuck. Generous relative to this class's own ~8ms URB pacing -- the thread should notice
+     * `cancelIso`'s unblocked `reapIso` within one loop iteration almost always. Not just a
+     * courtesy wait: [UsbAudioOutput.stopStreamingThread] must NOT free the native isochronous
+     * stream ([org.ostrichbat2k.usbdac.streaming.UsbNative.closeIsoStream]) while the thread
+     * might still be inside a blocked native call using it -- confirmed, reproduced as a real
+     * use-after-free risk when `cancelIso` fails to unblock a wedged `reapIso` (e.g. a vanished
+     * device) and this timeout is reached.
+     */
+    const val STREAM_THREAD_JOIN_TIMEOUT_MS = 2000L
 }

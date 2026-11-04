@@ -913,9 +913,18 @@ class UsbAudioOutput(
                     L.i("UsbAudioOutput: streaming thread starting ($sampleRateHz Hz)")
                     for (slot in 0 until UsbAudioTuning.NUM_URBS) {
                         val total = buildUrb()
-                        val ok = UsbNative.submitIso(handle, slot, urbBuffer, packetLengths)
+                        // Retry once immediately before giving up on this slot -- see #59: a
+                        // slot that's never submitted here never enters the reap/resubmit
+                        // rotation at all, permanently shrinking it by one for the rest of the
+                        // stream's life. A device not yet fully settled right after claim is the
+                        // one case actually seen to fail transiently this early (see
+                        // UsbAudioTuning.DAC_SETTLE_DELAY_MS's own history); a second attempt a
+                        // few microseconds later costs nothing against that.
+                        val ok =
+                            UsbNative.submitIso(handle, slot, urbBuffer, packetLengths) ||
+                                UsbNative.submitIso(handle, slot, urbBuffer, packetLengths)
                         if (!ok) {
-                            L.w("UsbAudioOutput: initial submitIso failed for slot $slot")
+                            L.e("UsbAudioOutput: initial submitIso failed twice for slot $slot -- this URB stays unsubmitted")
                         } else {
                             framesOutput += total / frameBytes
                         }
@@ -944,6 +953,16 @@ class UsbAudioOutput(
                         if (!streaming) break
                         if (slot < 0) {
                             reapErrors++
+                            if (slot == UsbNative.REAP_ERROR_FATAL) {
+                                // The stream cannot produce anything more (device gone, most
+                                // likely) -- see #60: looping back to reapIso() here is exactly
+                                // the busy-spin this check exists to stop. isStalled() (already
+                                // polled by callers, e.g. play()'s retry path) picks this up on
+                                // its own once lastUrbSubmittedAtMs stops advancing, so nothing
+                                // further needs to be signalled from here.
+                                L.e("UsbAudioOutput: reapIso() reported a fatal error -- stopping the streaming thread")
+                                break
+                            }
                             continue
                         }
 
@@ -954,40 +973,53 @@ class UsbAudioOutput(
                         }
 
                         val total = buildUrb()
-                        if (UsbNative.submitIso(handle, slot, urbBuffer, packetLengths)) {
-                            submitted++
-                            lastUrbSubmittedAtMs = System.currentTimeMillis()
-                            // Not while paused: this is synthetic silence standing in for the USB
-                            // clock's unstoppable schedule, not real consumed track audio -- see
-                            // [paused]'s doc comment. Advancing it here would let getPositionUs()
-                            // catch up to framesWritten mid-pause and re-trigger the exact
-                            // premature-isEnded() stall this counter exists to prevent.
-                            if (!paused) {
-                                framesOutput += total / frameBytes
-                            }
-                            // ~20 URBs at this class's ~8ms-of-real-audio-per-URB pacing (see
-                            // UsbAudioTuning.BASE_PACKETS_PER_URB) is roughly a 160ms cadence -- frequent enough
-                            // for a live pipeline visualizer to feel real-time without pushing a
-                            // new StateFlow value (and the GC churn that implies) on every single
-                            // URB, which happens ~125 times/sec.
-                            if (submitted % 20 == 0) {
-                                usbAudioManager.reportPipelineStats(
-                                    UsbPipelineStats(
-                                        atMs = System.currentTimeMillis(),
-                                        urbsSubmitted = submitted.toLong(),
-                                        reapErrors = reapErrors,
-                                        underrunCount = underrunCount,
-                                        bufferedBytes = ringBuffer.availableToRead(),
-                                        bufferCapacityBytes = ringBuffer.availableToRead() + ringBuffer.availableToWrite()))
-                            }
-                            if (submitted % 500 == 0) {
-                                val realElapsedMs = (System.nanoTime() - streamStartNs) / 1_000_000L
-                                val pacedMs = urbsPaced * urbRealTimeNs / 1_000_000L
-                                L.i(
-                                    "UsbAudioOutput: $submitted URBs submitted, $reapErrors reap " +
-                                        "errors, ${ringBuffer.availableToRead()} bytes buffered, " +
-                                        "${pacedMs}ms of audio paced over ${realElapsedMs}ms real time")
-                            }
+                        // Retry once immediately before giving up on this slot -- see #59: unlike
+                        // every other slot, which keeps cycling through reapIso() even after a
+                        // failed resubmit (so a future reap just finds it still full of stale
+                        // data), a slot that's never resubmitted here never comes back through
+                        // reapIso() at all, permanently shrinking the rotation by one.
+                        val resubmitted =
+                            UsbNative.submitIso(handle, slot, urbBuffer, packetLengths) ||
+                                UsbNative.submitIso(handle, slot, urbBuffer, packetLengths)
+                        if (!resubmitted) {
+                            // Lost for good now -- same reasoning as the fatal reapIso() branch
+                            // above: stop rather than keep draining the ring buffer into a
+                            // shrinking, eventually-empty set of URB slots.
+                            L.e("UsbAudioOutput: submitIso() failed twice in a row for slot $slot -- stopping the streaming thread")
+                            break
+                        }
+                        submitted++
+                        lastUrbSubmittedAtMs = System.currentTimeMillis()
+                        // Not while paused: this is synthetic silence standing in for the USB
+                        // clock's unstoppable schedule, not real consumed track audio -- see
+                        // [paused]'s doc comment. Advancing it here would let getPositionUs()
+                        // catch up to framesWritten mid-pause and re-trigger the exact
+                        // premature-isEnded() stall this counter exists to prevent.
+                        if (!paused) {
+                            framesOutput += total / frameBytes
+                        }
+                        // ~20 URBs at this class's ~8ms-of-real-audio-per-URB pacing (see
+                        // UsbAudioTuning.BASE_PACKETS_PER_URB) is roughly a 160ms cadence -- frequent enough
+                        // for a live pipeline visualizer to feel real-time without pushing a
+                        // new StateFlow value (and the GC churn that implies) on every single
+                        // URB, which happens ~125 times/sec.
+                        if (submitted % 20 == 0) {
+                            usbAudioManager.reportPipelineStats(
+                                UsbPipelineStats(
+                                    atMs = System.currentTimeMillis(),
+                                    urbsSubmitted = submitted.toLong(),
+                                    reapErrors = reapErrors,
+                                    underrunCount = underrunCount,
+                                    bufferedBytes = ringBuffer.availableToRead(),
+                                    bufferCapacityBytes = ringBuffer.availableToRead() + ringBuffer.availableToWrite()))
+                        }
+                        if (submitted % 500 == 0) {
+                            val realElapsedMs = (System.nanoTime() - streamStartNs) / 1_000_000L
+                            val pacedMs = urbsPaced * urbRealTimeNs / 1_000_000L
+                            L.i(
+                                "UsbAudioOutput: $submitted URBs submitted, $reapErrors reap " +
+                                    "errors, ${ringBuffer.availableToRead()} bytes buffered, " +
+                                    "${pacedMs}ms of audio paced over ${realElapsedMs}ms real time")
                         }
                     }
                     L.i("UsbAudioOutput: streaming thread exiting ($submitted submitted, $reapErrors reap errors)")

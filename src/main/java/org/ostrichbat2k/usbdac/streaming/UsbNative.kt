@@ -59,8 +59,25 @@ object UsbNative {
      */
     external fun submitIso(handle: Long, slot: Int, data: ByteArray, packetLengths: IntArray): Boolean
 
-    /** Blocks until a submitted URB completes; returns its slot index, or -1 on error/cancel. */
+    /**
+     * Blocks until a submitted URB completes; returns its slot index, or one of
+     * [REAP_ERROR_TRANSIENT]/[REAP_ERROR_FATAL] on failure.
+     */
     external fun reapIso(handle: Long): Int
+
+    /**
+     * The wait was interrupted (EINTR) -- nothing is actually wrong, call [reapIso] again. Mirrors
+     * usb_native.cpp's `kReapErrorTransient` exactly (keep in sync if that ever changes).
+     */
+    const val REAP_ERROR_TRANSIENT = -1
+
+    /**
+     * The stream cannot produce anything more -- device gone, handle closed, or any other
+     * REAPURB failure. The caller must stop streaming rather than retry (see #60: retrying
+     * forever here is exactly the busy-spin this exists to prevent). Mirrors usb_native.cpp's
+     * `kReapErrorFatal` exactly (keep in sync if that ever changes).
+     */
+    const val REAP_ERROR_FATAL = -2
 
     /**
      * Cancels all outstanding URBs, unblocking any in-flight [reapIso] call on another thread.

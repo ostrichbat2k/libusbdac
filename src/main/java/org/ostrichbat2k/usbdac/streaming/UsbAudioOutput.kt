@@ -924,7 +924,9 @@ class UsbAudioOutput(
                             UsbNative.submitIso(handle, slot, urbBuffer, packetLengths) ||
                                 UsbNative.submitIso(handle, slot, urbBuffer, packetLengths)
                         if (!ok) {
-                            L.e("UsbAudioOutput: initial submitIso failed twice for slot $slot -- this URB stays unsubmitted")
+                            L.e(
+                                "UsbAudioOutput: initial submitIso failed twice for slot $slot " +
+                                    "-- this URB stays unsubmitted")
                         } else {
                             framesOutput += total / frameBytes
                         }
@@ -985,7 +987,9 @@ class UsbAudioOutput(
                             // Lost for good now -- same reasoning as the fatal reapIso() branch
                             // above: stop rather than keep draining the ring buffer into a
                             // shrinking, eventually-empty set of URB slots.
-                            L.e("UsbAudioOutput: submitIso() failed twice in a row for slot $slot -- stopping the streaming thread")
+                            L.e(
+                                "UsbAudioOutput: submitIso() failed twice in a row for slot " +
+                                    "$slot -- stopping the streaming thread")
                             break
                         }
                         submitted++

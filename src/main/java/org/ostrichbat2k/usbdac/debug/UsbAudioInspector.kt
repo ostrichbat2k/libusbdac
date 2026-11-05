@@ -29,11 +29,32 @@ import timber.log.Timber as L
 
 /**
  * Opens a permitted USB device and walks every one of its configurations looking for a UAC 3.0
- * playback topology, logging what it finds. This is read-only enumeration: it does not switch
- * the device's active configuration or claim any interface.
+ * playback topology, logging what it finds. The enumeration half (everything up to and including
+ * the topology walk) is read-only: it does not switch the device's active configuration or claim
+ * any interface. The probe half that follows (clock/mute/volume) does claim the interface via
+ * [UsbAudioController.activate] -- see [isSessionActive]'s doc comment for why that's guarded.
+ *
+ * `internal`, not public (#56) -- same reasoning as [UsbAudioController]'s own doc comment: this
+ * is a raw debugging probe (its own log lines still say "Phase 4 probe"), not a supported library
+ * entry point, and has no current caller anywhere in this library or in Auxio.
+ *
+ * The probe's `48000`-fixed clock/channel-floor values are a smoke-test default, not real
+ * negotiated playback configuration -- unlike [org.ostrichbat2k.usbdac.activation.UsbDacActivator],
+ * this never queries the device's actual Clock Source supported-rate range, so it should not be
+ * taken as evidence of what rate a real activation would pick.
  */
-object UsbAudioInspector {
-    fun inspect(context: Context, device: UsbDevice) {
+internal object UsbAudioInspector {
+    /**
+     * [isSessionActive] lets a caller that already holds a real [org.ostrichbat2k.usbdac.UsbAudioManager]
+     * session for this device tell this probe not to open a second, independent one (#57) --
+     * [UsbAudioController.activate] has no awareness of (or coordination with) whatever claim
+     * [org.ostrichbat2k.usbdac.UsbAudioManagerImpl]/[org.ostrichbat2k.usbdac.claim.UsbClaimController]
+     * already holds, so running both at once can leave either side's view of the interface's
+     * claim state wrong. Defaults to `{ false }` (no guard) since this probe currently has no
+     * caller to wire a real check through -- any future caller that does have a live
+     * [org.ostrichbat2k.usbdac.UsbAudioManager] in hand should pass a real predicate instead.
+     */
+    fun inspect(context: Context, device: UsbDevice, isSessionActive: () -> Boolean = { false }) {
         val usbManager = context.getSystemService(Context.USB_SERVICE) as UsbManager
         val connection = usbManager.openDevice(device)
         if (connection == null) {
@@ -60,8 +81,13 @@ object UsbAudioInspector {
         }
 
         val found = topology ?: return
+        if (isSessionActive()) {
+            L.w("Skipping probe-claim for ${device.deviceName}: a real session already holds this device")
+            return
+        }
         val session = UsbAudioController.activate(context, device, found) ?: return
         try {
+            // Smoke-test default, not a real negotiated rate -- see this object's own doc comment.
             val sampleRateHz = 48000
             val setClock = UsbAudioController.setClockFrequency(session, sampleRateHz)
             L.i("Phase 4 probe: set clock to $sampleRateHz Hz -> $setClock")

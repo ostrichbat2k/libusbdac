@@ -541,7 +541,7 @@ class UsbAudioManagerImplTest {
         every { session.connection.controlTransfer(any(), any(), any(), any(), any(), any(), any()) } answers
             {
                 val buffer = arg<ByteArray>(4)
-                buffer[0] = 2 // UsbAudioController.PD_STATE_D2
+                buffer[0] = 2 // UsbAudioManager.PD_STATE_D2
                 1
             }
 

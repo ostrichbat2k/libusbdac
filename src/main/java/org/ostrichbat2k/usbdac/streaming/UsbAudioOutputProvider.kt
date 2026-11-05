@@ -27,6 +27,8 @@ import android.media.AudioFormat
 import androidx.media3.common.C
 import androidx.media3.exoplayer.audio.AudioOutput
 import androidx.media3.exoplayer.audio.AudioOutputProvider
+import java.util.Collections
+import java.util.IdentityHashMap
 import timber.log.Timber as L
 
 /**
@@ -52,13 +54,44 @@ class UsbAudioOutputProvider(
     private val usbAudioManager: UsbAudioManager,
     private val session: UsbAudioSession,
     private val usbSettings: UsbDacPreferences,
+    // The host app's own, decoder-specific way to tell us a track's real source bit depth, when
+    // it's narrower than the container Format.pcmEncoding reports (#67) -- this library has no
+    // dependency on whatever decoder produced the track (FFmpeg or otherwise) and never will, so
+    // it can't read that off the Format itself. Auxio's FfmpegAudioDecoder-based pipeline can:
+    // it already depends on decoder_ffmpeg directly and reads androidx.media3.decoder.ffmpeg.
+    // RawSampleBitsData off format.metadata there, then hands us back just the plain Int this
+    // callback returns -- so no reflection and no new cross-repo dependency either way. Returns
+    // null (the default) when the real depth is unknown or equals the container width, i.e.
+    // nothing to narrow.
+    private val realBitsPerSample: (androidx.media3.common.Format) -> Int? = { null },
 ) : AudioOutputProvider {
 
     private companion object {
         // Fallback only -- used when a format's own supported rates couldn't be read back at all
         // (see acceptedSampleRates). Not a hardcoded assumption applied unconditionally.
         val FALLBACK_SAMPLE_RATES = setOf(44100, 48000)
+
+        // The widest real source depth a 4-byte-container sample can still losslessly narrow down
+        // to a 3-byte device format by dropping its bottom byte -- see
+        // isPaddedTwentyFourBitContent's doc comment for why 24, not e.g. 25.
+        const val MAX_PADDABLE_BITS = 24
     }
+
+    // Bridges getOutputConfig()'s knowledge of a specific track's real Format (and therefore
+    // whether UsbAudioOutput will need UsbAudioOutput.InputConversion.DROP_PADDING_BYTE) through
+    // to getAudioOutput(), which only ever receives the resolved OutputConfig -- by then,
+    // config.encoding == C.ENCODING_PCM_32BIT is ambiguous between "genuinely 32-bit" and
+    // "24-bit padded into a 32-bit container" (#67), and DefaultAudioSink defers building the
+    // AudioOutput until later (see getAudioOutput's own doc comment on usbAudioManager.
+    // releaseClaim's call site), so this can't just be "the most recently seen format" -- an
+    // upcoming track's getOutputConfig() can run ahead of an earlier one's getAudioOutput().
+    // Keyed by identity on the exact OutputConfig instance DefaultAudioSink round-trips
+    // unchanged (confirmed by reading its own source: getOutputConfig()'s return value is what's
+    // later passed into getAudioOutput() as-is) -- entries are removed once consumed in
+    // getAudioOutput() so this can't grow unbounded. Not synchronized: like allFormats and every
+    // other field on this class, only ever touched from ExoPlayer's own single playback thread.
+    private val paddedConfigs =
+        Collections.newSetFromMap(IdentityHashMap<AudioOutputProvider.OutputConfig, Boolean>())
 
     // Every format this device's streaming interface declares (one per alt-setting, typically one
     // per bit depth) -- matched against per-track, not narrowed down to a single one up front.
@@ -167,40 +200,58 @@ class UsbAudioOutputProvider(
         }
 
     /**
-     * The best integer device format to convert *float* PCM down to. ExoPlayer never actually
-     * hands a custom `AudioOutputProvider` real 32-bit integer PCM, no matter what the decoder
-     * produced or what this provider claims to accept: `DefaultAudioSink.configure()`
-     * unconditionally funnels every `MimeTypes.AUDIO_RAW` input through exactly one of two fixed
-     * internal processors -- `ToInt16PcmAudioProcessor` or `ToFloatPcmAudioProcessor` -- *before*
-     * this provider ever sees the format (confirmed by reading `DefaultAudioSink.configure()`
-     * and `shouldUseFloatOutput()` directly; there is no custom-provider escape hatch from this).
-     * So a 32-bit source that `FfmpegAudioDecoder.OUTPUT_MODE_NATIVE_INTEGER` decoded exactly
-     * (see that mode's doc comment: FFmpeg's own FLAC/ALAC/PCM decoders pick 16- or 32-bit based
-     * on the real source bps) always arrives here as float -- `shouldUseFloatOutput()` is keyed
-     * on the *decoder's* reported encoding being wider than 16-bit, and the USB sink is built
-     * with `enableFloatOutput = true` specifically so that rewrite lands on float, not a forced
-     * 16-bit truncation. (An earlier version of this method matched on
-     * `C.ENCODING_PCM_32BIT` instead, on the wrong assumption that the real 32-bit decode would
-     * reach this provider unmodified -- confirmed, reproduced: it silently forced every >16-bit
-     * source, including a genuine 24-bit FLAC, down to 16-bit with no warning, since that
-     * encoding can structurally never arrive here to match against.)
+     * The best integer device format to convert wide (>16-bit) PCM down to -- used for *float*
+     * input, and (since #67) for literal-32-bit input that's actually real ≤24-bit content
+     * padded into that container (see [isPaddedTwentyFourBitContent]). Before `media#4`/`#6`
+     * landed, float was the *only* way wide content could ever reach this provider at all:
+     * `DefaultAudioSink.configure()` used to unconditionally funnel every `MimeTypes.AUDIO_RAW`
+     * input through exactly one of two fixed internal processors -- `ToInt16PcmAudioProcessor`
+     * or `ToFloatPcmAudioProcessor` -- *before* this provider ever saw the format, never asking
+     * it first whether it could take the real encoding directly (confirmed by reading
+     * `DefaultAudioSink.configure()`/`shouldUseFloatOutput()` directly, at the time). So a 32-bit
+     * source that `FfmpegAudioDecoder.OUTPUT_MODE_NATIVE_INTEGER` decoded exactly (see that
+     * mode's doc comment: FFmpeg's own FLAC/ALAC/PCM decoders pick 16- or 32-bit based on the
+     * real source bps) always arrived here as float -- `shouldUseFloatOutput()` was keyed on the
+     * *decoder's* reported encoding being wider than 16-bit, and the USB sink was built with
+     * `enableFloatOutput = true` specifically so that rewrite landed on float, not a forced
+     * 16-bit truncation. `media#4`/`#6` fixed this: `getFormatSupport()`/`configure()` now ask
+     * the provider first with the literal encoding, and skip the float/16-bit rewrite entirely
+     * when it reports `FORMAT_SUPPORTED_DIRECTLY` -- which is what makes real, unconverted
+     * 32-bit integer PCM (and therefore #67's padded-24-in-32 case) reach this provider at all.
      *
      * This picks the device's own *smallest* integer bit depth that's still wide enough to hold
      * real 24-bit content (24-bit when the device offers it, 32-bit only as a fallback): both are
      * an equally lossless, exact round-trip for it (a 24-bit target reconstructs the original
      * integer directly; a 32-bit one reconstructs it scaled up by a fixed power-of-two factor --
-     * float32's mantissa represents either exactly), so there's no fidelity reason to prefer the
-     * wider one, only a real cost: 33% more bytes over USB for identical information.
+     * float32's mantissa represents either exactly, as does a plain padding-byte drop), so
+     * there's no fidelity reason to prefer the wider one, only a real cost: 33% more bytes over
+     * USB for identical information.
      */
     private fun wideIntTargetFormat(targetChannels: Int, sampleRate: Int): UacStreamFormat? =
         allFormats
             .filter { it.subslotSize >= 3 && targetChannels == channels && sampleRate in acceptedSampleRates(it) }
             .minByOrNull { it.subslotSize }
 
+    /**
+     * Whether [format]'s literal (non-float) 32-bit-container encoding is actually real ≤24-bit
+     * content left-shift-padded into that container, per [realBitsPerSample] (#67) -- FFmpeg's
+     * `libavcodec` has no native 24-bit `AVSampleFormat`, so any source wider than 16 but no
+     * wider than 24 real bits still decodes to `AV_SAMPLE_FMT_S32` (ExoPlayer's
+     * `C.ENCODING_PCM_32BIT`), with the real value occupying only the top bits and the bottom
+     * byte always exactly zero -- see [UsbAudioOutput.InputConversion.DROP_PADDING_BYTE]'s doc
+     * comment for why dropping that byte is lossless for any real depth from 1 to 24 bits, not
+     * just exactly 24. A genuinely 32-bit source (`realBitsPerSample` returns null, or 25-31,
+     * i.e. too wide for a clean byte drop) is deliberately excluded, so it stays on the existing
+     * exact-match path below.
+     */
+    private fun isPaddedTwentyFourBitContent(format: androidx.media3.common.Format): Boolean =
+        format.pcmEncoding == C.ENCODING_PCM_32BIT &&
+            realBitsPerSample(format)?.let { it in 1..MAX_PADDABLE_BITS } == true
+
     override fun getFormatSupport(formatConfig: AudioOutputProvider.FormatConfig): AudioOutputProvider.FormatSupport {
         val format = formatConfig.format
         val match =
-            if (format.pcmEncoding == C.ENCODING_PCM_FLOAT) {
+            if (format.pcmEncoding == C.ENCODING_PCM_FLOAT || isPaddedTwentyFourBitContent(format)) {
                 wideIntTargetFormat(format.channelCount, format.sampleRate)
             } else {
                 matchingFormat(format)
@@ -226,46 +277,94 @@ class UsbAudioOutputProvider(
         val format = formatConfig.format
         // getFormatSupport already gated on a match existing for this exact format/encoding --
         // this just has to agree with it. Float input stays float all the way to UsbAudioOutput
-        // (which converts it to whatever wideIntTargetFormat picked); everything else requests
-        // the matched device format's own real integer encoding.
+        // (which converts it to whatever wideIntTargetFormat picked); padded-24-in-32 content
+        // (#67) similarly stays reported as its own real, literal C.ENCODING_PCM_32BIT -- that's
+        // genuinely what DefaultAudioSink will hand write() (dropping the padding byte is
+        // UsbAudioOutput's job, once getAudioOutput below resolves the real narrower target, not
+        // something DefaultAudioSink's own pipeline does) -- everything else requests the
+        // matched device format's own real integer encoding.
+        val isPadded = isPaddedTwentyFourBitContent(format)
         val encoding =
-            if (format.pcmEncoding == C.ENCODING_PCM_FLOAT) {
-                C.ENCODING_PCM_FLOAT
-            } else {
-                matchingFormat(format)?.let { encodingFor(it.subslotSize) } ?: C.ENCODING_PCM_16BIT
+            when {
+                format.pcmEncoding == C.ENCODING_PCM_FLOAT -> C.ENCODING_PCM_FLOAT
+                isPadded -> format.pcmEncoding
+                else -> matchingFormat(format)?.let { encodingFor(it.subslotSize) } ?: C.ENCODING_PCM_16BIT
             }
         val channelMask = channelMaskFor(channels)
-        return AudioOutputProvider.OutputConfig.Builder()
-            .setEncoding(encoding)
-            .setSampleRate(format.sampleRate)
-            .setChannelMask(channelMask)
-            .setAudioAttributes(formatConfig.audioAttributes)
-            .setAudioSessionId(formatConfig.audioSessionId)
-            .setVirtualDeviceId(formatConfig.virtualDeviceId)
-            .build()
+        val config =
+            AudioOutputProvider.OutputConfig.Builder()
+                .setEncoding(encoding)
+                .setSampleRate(format.sampleRate)
+                .setChannelMask(channelMask)
+                .setAudioAttributes(formatConfig.audioAttributes)
+                .setAudioSessionId(formatConfig.audioSessionId)
+                .setVirtualDeviceId(formatConfig.virtualDeviceId)
+                .build()
+        if (isPadded) {
+            paddedConfigs += config
+        }
+        return config
+    }
+
+    /**
+     * Resolves which device format and [UsbAudioOutput.InputConversion] [getAudioOutput] should
+     * use for [config] -- split out purely to keep that function's own cyclomatic complexity
+     * under threshold; every side effect (claiming, logging, reporting the route) stays there.
+     *
+     * [config.encoding][AudioOutputProvider.OutputConfig.encoding] `== C.ENCODING_PCM_32BIT` is
+     * ambiguous between "genuinely 32-bit" and "24-bit padded into a 32-bit container" (#67) --
+     * [paddedConfigs] (removed here, not just checked: this [config] is spent once an
+     * [AudioOutput] is actually built for it) is what [getOutputConfig] left behind to
+     * disambiguate it. A padded [config] whose resolved target still comes back 4 bytes wide
+     * means [wideIntTargetFormat]'s own `>= 3` filter found no alt-setting narrower than the
+     * literal container already matches -- i.e. the device has no 24-bit alt-setting at all, so
+     * this is routed to the same 32-bit alt-setting a genuinely-32-bit track would use anyway
+     * (still exactly lossless, just not bandwidth-optimal), and [UsbAudioOutput] has nothing to
+     * drop: the real bytes it receives already exactly match that target's own 4-byte container.
+     */
+    private fun resolveTarget(
+        config: AudioOutputProvider.OutputConfig,
+    ): Pair<UacStreamFormat, UsbAudioOutput.InputConversion> {
+        val isFloatInput = config.encoding == C.ENCODING_PCM_FLOAT
+        val isPaddedInput = !isFloatInput && paddedConfigs.remove(config)
+        val target =
+            if (isFloatInput || isPaddedInput) {
+                wideIntTargetFormat(channels, config.sampleRate)
+                    ?: allFormats.first().also {
+                        L.w(
+                            "UsbAudioOutputProvider: no narrow-int conversion target at " +
+                                "${config.sampleRate}Hz, using ${it.bitResolution}-bit")
+                    }
+            } else {
+                allFormats.firstOrNull { encodingFor(it.subslotSize) == config.encoding }
+                    ?: allFormats.first().also {
+                        L.w(
+                            "UsbAudioOutputProvider: no format matches " +
+                                "encoding=${config.encoding}, using ${it.bitResolution}-bit")
+                    }
+            }
+        val conversion =
+            when {
+                isFloatInput -> UsbAudioOutput.InputConversion.FLOAT_TO_INT
+                isPaddedInput && target.subslotSize < 4 -> UsbAudioOutput.InputConversion.DROP_PADDING_BYTE
+                else -> UsbAudioOutput.InputConversion.NONE
+            }
+        return target to conversion
     }
 
     override fun getAudioOutput(config: AudioOutputProvider.OutputConfig): AudioOutput {
         // Only called when DefaultAudioSink has already decided the OutputConfig genuinely
         // changed (AudioOutput.canReuseAudioOutput's default contract) -- so this is exactly the
         // point, and the only point, where switching the device's alt-setting is actually needed.
-        val isFloatInput = config.encoding == C.ENCODING_PCM_FLOAT
-        val target =
-            if (isFloatInput) {
-                wideIntTargetFormat(channels, config.sampleRate)
-                    ?: allFormats.first().also {
-                        L.w("UsbAudioOutputProvider: no float conversion target at ${config.sampleRate}Hz, using ${it.bitResolution}-bit")
-                    }
-            } else {
-                allFormats.firstOrNull { encodingFor(it.subslotSize) == config.encoding }
-                    ?: allFormats.first().also {
-                        L.w("UsbAudioOutputProvider: no format matches encoding=${config.encoding}, using ${it.bitResolution}-bit")
-                    }
-            }
+        val (target, conversion) = resolveTarget(config)
         L.i(
             "UsbAudioOutputProvider: activating ${target.bitResolution}-bit/alt=${target.alternateSetting} " +
                 "at ${config.sampleRate}Hz for upcoming track" +
-                (if (isFloatInput) " (converting from float)" else ""))
+                when (conversion) {
+                    UsbAudioOutput.InputConversion.FLOAT_TO_INT -> " (converting from float)"
+                    UsbAudioOutput.InputConversion.DROP_PADDING_BYTE -> " (dropping 32-bit container padding)"
+                    UsbAudioOutput.InputConversion.NONE -> ""
+                })
         usbAudioManager.ensureFormatActive(target, config.sampleRate)
         // Authoritative Now Playing route report -- RoutingAudioSink.configure() also reports
         // an immediate, optimistic one right after resolveForConfigure() for UI responsiveness,
@@ -302,7 +401,7 @@ class UsbAudioOutputProvider(
         // call used to pass, would go stale the moment a volume-key change happened mid-track with
         // no format change in between, see UsbAudioOutput.restoreVolumeAfterRelock's own doc
         // comment for the confirmed bug this caused.
-        return UsbAudioOutput(session, target, channels, config.sampleRate, usbSettings, isFloatInput, usbAudioManager)
+        return UsbAudioOutput(session, target, channels, config.sampleRate, usbSettings, conversion, usbAudioManager)
     }
 
     override fun addListener(listener: AudioOutputProvider.Listener) {}

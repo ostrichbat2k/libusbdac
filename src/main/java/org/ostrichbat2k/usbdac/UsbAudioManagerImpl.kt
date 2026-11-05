@@ -88,8 +88,16 @@ import timber.log.Timber as L
  * handful of fields ([controlState], [capabilities]) that more than one component needs to both
  * read and write, so none of them can solely own it.
  */
-class UsbAudioManagerImpl(private val context: Context, private val usbSettings: UsbDacPreferences) :
-    UsbAudioManager {
+class UsbAudioManagerImpl(
+    private val context: Context,
+    private val usbSettings: UsbDacPreferences,
+    // Forwarded as-is to UsbAudioOutputProvider -- see its own constructor doc comment (#67).
+    // Defaulted rather than required: a host app that never hands real 24-bit-in-32-bit-
+    // container content (or doesn't care about the bandwidth saving) can ignore this entirely
+    // and nothing changes from before -- literal wide-integer PCM still plays back losslessly,
+    // just always on the device's 32-bit alt-setting.
+    private val realBitsPerSample: (androidx.media3.common.Format) -> Int? = { null },
+) : UsbAudioManager {
     private val usbManager = context.getSystemService(Context.USB_SERVICE) as UsbManager
     private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
     private val descriptorCache: UsbDacDescriptorCache = UsbDacDescriptorCacheImpl(context)
@@ -706,7 +714,7 @@ class UsbAudioManagerImpl(private val context: Context, private val usbSettings:
         if (!bitPerfectWanted || !isBitPerfectCapable()) return null
         val session = activeSession ?: return null
         return DefaultAudioSink.Builder(context)
-            .setAudioOutputProvider(UsbAudioOutputProvider(this, session, usbSettings))
+            .setAudioOutputProvider(UsbAudioOutputProvider(this, session, usbSettings, realBitsPerSample))
             // Off by default in DefaultAudioSink -- without this, getFormatSupport() silently
             // rewrites every float-PCM query back down to 16-bit before UsbAudioOutputProvider
             // ever sees it, which is exactly what made every decoder's own float-vs-16-bit

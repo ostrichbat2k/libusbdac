@@ -286,7 +286,11 @@ Java_org_ostrichbat2k_usbdac_streaming_UsbNative_submitIso(
         LOGE("GetIntArrayElements failed for slot %d", slot);
         return JNI_FALSE;
     }
-    unsigned int total = 0;
+    // A 64-bit accumulator: numPackets can be as large as kMaxPacketsPerUrb (4096) and each len
+    // as large as INT_MAX, so summing in a 32-bit unsigned int can overflow and wrap around to an
+    // arbitrary small value well before the bufferLength check below ever runs -- defeating the
+    // one check that exists specifically to catch an oversized total (#79).
+    uint64_t total = 0;
     bool negativeLength = false;
     for (jsize p = 0; p < numPackets && !negativeLength; p++) {
         jint len = lengths[p];
@@ -297,7 +301,7 @@ Java_org_ostrichbat2k_usbdac_streaming_UsbNative_submitIso(
             break;
         }
         urb->iso_frame_desc[p].length = (unsigned int) len;
-        total += (unsigned int) len;
+        total += (uint64_t) len;
     }
     env->ReleaseIntArrayElements(packetLengths, lengths, JNI_ABORT);
     if (negativeLength) {
@@ -305,27 +309,31 @@ Java_org_ostrichbat2k_usbdac_streaming_UsbNative_submitIso(
         return JNI_FALSE;
     }
 
-    if (total > stream->bufferLength) {
-        LOGE("Packet total %u exceeds buffer capacity %u for slot %d", total, stream->bufferLength, slot);
+    if (total > (uint64_t) stream->bufferLength) {
+        LOGE("Packet total %llu exceeds buffer capacity %u for slot %d", (unsigned long long) total,
+             stream->bufferLength, slot);
         return JNI_FALSE;
     }
+    // Safe to narrow now: the check above already bounded total by bufferLength, itself a
+    // validated unsigned int (see openIsoStream's own UINT32_MAX check).
+    unsigned int totalU = (unsigned int) total;
 
     jsize dataLen = env->GetArrayLength(data);
     if (dataLen < 0) {
         LOGE("GetArrayLength returned negative length for slot %d", slot);
         return JNI_FALSE;
     }
-    unsigned int toCopy = (unsigned int) dataLen < total ? (unsigned int) dataLen : total;
+    unsigned int toCopy = (unsigned int) dataLen < totalU ? (unsigned int) dataLen : totalU;
     if (toCopy > 0) {
         env->GetByteArrayRegion(data, 0, (jsize) toCopy, (jbyte*) urb->buffer);
     }
-    if (toCopy < total) {
-        memset((char*) urb->buffer + toCopy, 0, total - toCopy);
+    if (toCopy < totalU) {
+        memset((char*) urb->buffer + toCopy, 0, totalU - toCopy);
     }
 
     urb->status = -1;
     urb->actual_length = 0;
-    urb->buffer_length = (int) total;
+    urb->buffer_length = (int) totalU;
     urb->number_of_packets = (int) numPackets;
 
     int ret = ioctl(stream->fd, USBDEVFS_SUBMITURB, urb);

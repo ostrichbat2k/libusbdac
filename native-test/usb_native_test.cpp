@@ -20,6 +20,7 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <climits>
 #include <cstring>
 #include <vector>
 
@@ -285,6 +286,15 @@ TEST_F(SubmitIso, RejectsOutOfRangeSlot) {
     EXPECT_EQ(submit(-1, &data, &lens), JNI_FALSE);
     EXPECT_EQ(submit(2 /* numUrbs is 2, so 0 and 1 are the only valid slots */, &data, &lens),
               JNI_FALSE);
+}
+
+// #79: INT_MAX + INT_MAX + 2 == 2^32 exactly, which a 32-bit unsigned accumulator wraps to 0 --
+// wrongly passing the bufferLength(64, from this fixture's packetsPerUrb=4 * maxPacketSize=16)
+// check below even though the real sum is ~4GB. A 64-bit accumulator must reject it instead.
+TEST_F(SubmitIso, RejectsPacketTotalThatWouldOverflowA32BitAccumulator) {
+    FakeJavaArray data = FakeJavaArray::OfBytes({1});
+    FakeJavaArray lens = FakeJavaArray::OfInts({INT_MAX, INT_MAX, 2});
+    EXPECT_EQ(submitAndExpectLog(0, &data, &lens, "exceeds buffer capacity"), JNI_FALSE);
 }
 
 TEST_F(SubmitIso, RejectsNullData) {

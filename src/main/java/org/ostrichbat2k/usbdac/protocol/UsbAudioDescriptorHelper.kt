@@ -120,6 +120,7 @@ internal object UsbAudioDescriptorHelper {
         endpointAddress: Int,
         endpointSync: Int,
         maxPacketSize: Int,
+        bInterval: Int,
         bitResolution: Int,
         subslotSize: Int,
         clusterDescriptorId: Int,
@@ -141,7 +142,8 @@ internal object UsbAudioDescriptorHelper {
                         clusterDescriptorId = clusterDescriptorId,
                         endpointAddress = endpointAddress,
                         maxPacketSize = maxPacketSize,
-                        isAsync = endpointSync == SYNC_TYPE_ASYNC))
+                        isAsync = endpointSync == SYNC_TYPE_ASYNC,
+                        bInterval = bInterval.takeIf { it > 0 } ?: 1))
         } else if (isTerminalLinked && !isDeclaredPcm) {
             // A real alt setting on our own streaming interface (not some other, e.g. capture,
             // interface that merely shares this AudioStreaming subclass/protocol) -- just not one

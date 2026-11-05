@@ -198,6 +198,7 @@ internal object UsbAudioDescriptorParserUac3 {
         var pendingEndpointAddress = -1
         var pendingEndpointSync = -1
         var pendingMaxPacketSize = -1
+        var pendingBInterval = -1
         var pendingBitResolution = -1
         var pendingSubslotSize = -1
         var pendingClusterId = -1
@@ -218,6 +219,7 @@ internal object UsbAudioDescriptorParserUac3 {
                 endpointAddress = pendingEndpointAddress,
                 endpointSync = pendingEndpointSync,
                 maxPacketSize = pendingMaxPacketSize,
+                bInterval = pendingBInterval,
                 bitResolution = pendingBitResolution,
                 subslotSize = pendingSubslotSize,
                 clusterDescriptorId = pendingClusterId,
@@ -230,6 +232,7 @@ internal object UsbAudioDescriptorParserUac3 {
             pendingEndpointAddress = -1
             pendingEndpointSync = -1
             pendingMaxPacketSize = -1
+            pendingBInterval = -1
             pendingBitResolution = -1
             pendingSubslotSize = -1
             pendingClusterId = -1
@@ -338,6 +341,7 @@ internal object UsbAudioDescriptorParserUac3 {
                         val attributes = bytes.u8(3)
                         pendingEndpointSync = (attributes shr 2) and 0x3
                         pendingMaxPacketSize = bytes.u16(4)
+                        pendingBInterval = bytes.u8(6)
                     }
                 }
             }

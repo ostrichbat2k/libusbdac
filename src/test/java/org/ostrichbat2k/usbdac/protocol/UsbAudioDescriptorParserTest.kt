@@ -71,11 +71,12 @@ private object D {
         }
 
     /** Standard Endpoint Descriptor. */
-    fun endpoint(address: Int, attributes: Int, maxPacketSize: Int) =
+    fun endpoint(address: Int, attributes: Int, maxPacketSize: Int, bInterval: Int = 1) =
         bytes(7, DT_ENDPOINT) {
             setU8(2, address)
             setU8(3, attributes)
             setU16(4, maxPacketSize)
+            setU8(6, bInterval)
         }
 
     /** A raw CS_INTERFACE entry of exactly [length] bytes, [subtype] at offset 2. */
@@ -257,7 +258,10 @@ class UsbAudioDescriptorParserUac3Test {
         val output = D.outputTerminal(terminalType = 0x0301, sourceId = 4)
         val asIface = D.iface(1, 0, 1, 2, 0x30)
         val asGeneral = D.uac3AsGeneral(terminalLink = 1, clusterId = 32, subslotSize = 4, bitResolution = 24)
-        val endpoint = D.endpoint(address = 0x83, attributes = 0x05, maxPacketSize = 196) // sync bits = ASYNC
+        // bInterval=4: distinct from the real-devices-tested default of 1, to actually exercise
+        // parsing it rather than coincidentally matching UacStreamFormat's own default -- see #61.
+        // sync bits = ASYNC
+        val endpoint = D.endpoint(address = 0x83, attributes = 0x05, maxPacketSize = 196, bInterval = 4)
         return config + acIface + input + clock + mixer + output + asIface + asGeneral + endpoint
     }
 
@@ -283,6 +287,7 @@ class UsbAudioDescriptorParserUac3Test {
         assertEquals(0x83, format.endpointAddress)
         assertEquals(196, format.maxPacketSize)
         assertTrue(format.isAsync)
+        assertEquals(4, format.bInterval)
     }
 
     @Test
@@ -334,7 +339,9 @@ class UsbAudioDescriptorParserUac2Test {
         val asIface = D.iface(1, 1, 1, 2, 0x20)
         val asGeneral = D.uac2AsGeneral(terminalLink = 1)
         val formatType = D.uac2FormatType(subslotSize = 2, bitResolution = 16)
-        val endpoint = D.endpoint(address = 0x07, attributes = 0x05, maxPacketSize = 196)
+        // bInterval=4: see UsbAudioDescriptorParserUac3Test's earPodsLikeConfig for why a
+        // non-default value is used here.
+        val endpoint = D.endpoint(address = 0x07, attributes = 0x05, maxPacketSize = 196, bInterval = 4)
         return config + acIface + input + clock + output + asIface + asGeneral + formatType + endpoint
     }
 
@@ -353,11 +360,29 @@ class UsbAudioDescriptorParserUac2Test {
         assertEquals(2, format.subslotSize)
         assertEquals(-1, format.clusterDescriptorId) // UAC2 never sets this -- UAC3-only concept
         assertTrue(format.sampleRates.isEmpty()) // UAC2 negotiates rate via the Clock Source
+        assertEquals(4, format.bInterval)
     }
 
     @Test
     fun `returns null without a clock source`() {
         assertNull(UsbAudioDescriptorParserUac2.parseUac2Playback(fiioLikeConfig(withClock = false)))
+    }
+
+    @Test
+    fun `a malformed zero bInterval falls back to 1 instead of being recorded literally`() {
+        val config = D.configuration(1)
+        val acIface = D.iface(0, 0, 1, 1, 0x20)
+        val input = D.uac2InputTerminal(id = 1, terminalType = 0x0101, channelCount = 2)
+        val clock = D.uac2ClockSource(id = 10)
+        val output = D.outputTerminal(terminalType = 0x0301, sourceId = 15)
+        val asIface = D.iface(1, 1, 1, 2, 0x20)
+        val asGeneral = D.uac2AsGeneral(terminalLink = 1)
+        val formatType = D.uac2FormatType(subslotSize = 2, bitResolution = 16)
+        val endpoint = D.endpoint(address = 0x07, attributes = 0x05, maxPacketSize = 196, bInterval = 0)
+        val topology =
+            UsbAudioDescriptorParserUac2.parseUac2Playback(
+                config + acIface + input + clock + output + asIface + asGeneral + formatType + endpoint)!!
+        assertEquals(1, topology.formats.single().bInterval)
     }
 
     @Test
@@ -391,7 +416,9 @@ class UsbAudioDescriptorParserUac1Test {
         val asIface = D.iface(1, 1, 1, 2, 0x00)
         val asGeneral = D.uac1AsGeneral(terminalLink = 1)
         val formatType = D.uac1FormatType(subslotSize = 2, bitResolution = 16, sampleRates = sampleRates)
-        val endpoint = D.endpoint(address = 0x01, attributes = 0x05, maxPacketSize = 192)
+        // bInterval=4: see UsbAudioDescriptorParserUac3Test's earPodsLikeConfig for why a
+        // non-default value is used here.
+        val endpoint = D.endpoint(address = 0x01, attributes = 0x05, maxPacketSize = 192, bInterval = 4)
         return config + acIface + input + output + asIface + asGeneral + formatType + endpoint
     }
 
@@ -408,6 +435,7 @@ class UsbAudioDescriptorParserUac1Test {
         assertEquals(16, format.bitResolution)
         assertEquals(2, format.subslotSize)
         assertEquals(listOf(8000, 48000), format.sampleRates)
+        assertEquals(4, format.bInterval)
     }
 
     @Test

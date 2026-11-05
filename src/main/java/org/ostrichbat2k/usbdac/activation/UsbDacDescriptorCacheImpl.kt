@@ -158,7 +158,8 @@ private fun CachedUacFormat.toDomain() =
         endpointAddress = endpointAddress,
         maxPacketSize = maxPacketSize,
         isAsync = isAsync,
-        sampleRates = sampleRatesEncoded.decodeInts())
+        sampleRates = sampleRatesEncoded.decodeInts(),
+        bInterval = bInterval)
 
 private fun UacStreamFormat.toEntity(deviceKey: String) =
     CachedUacFormat(
@@ -170,7 +171,8 @@ private fun UacStreamFormat.toEntity(deviceKey: String) =
         endpointAddress = endpointAddress,
         maxPacketSize = maxPacketSize,
         isAsync = isAsync,
-        sampleRatesEncoded = sampleRates.joinToString(","))
+        sampleRatesEncoded = sampleRates.joinToString(","),
+        bInterval = bInterval)
 
 @Entity(tableName = "usb_dac_topology")
 internal data class CachedUacTopology(
@@ -203,6 +205,7 @@ internal data class CachedUacFormat(
     val maxPacketSize: Int,
     val isAsync: Boolean,
     val sampleRatesEncoded: String,
+    val bInterval: Int,
 )
 
 @Dao
@@ -228,7 +231,11 @@ internal interface DescriptorCacheDao {
     }
 }
 
-@Database(entities = [CachedUacTopology::class, CachedUacFormat::class], version = 1, exportSchema = false)
+// Bumped to 2 for #61's new CachedUacFormat.bInterval column -- fallbackToDestructiveMigration
+// above means this just wipes and recreates the cache on next open rather than needing an
+// explicit Migration, acceptable for a pure performance cache (see this class's own doc comment
+// on why a stale/missing entry is a one-tap-equivalent cost, not a correctness risk).
+@Database(entities = [CachedUacTopology::class, CachedUacFormat::class], version = 2, exportSchema = false)
 internal abstract class DescriptorCacheDatabase : RoomDatabase() {
     abstract fun dao(): DescriptorCacheDao
 }

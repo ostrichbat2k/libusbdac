@@ -45,6 +45,7 @@ class UsbAudioDescriptorHelperTest {
         endpointAddress: Int = 0x02,
         endpointSync: Int = UsbAudioDescriptorHelper.SYNC_TYPE_ASYNC,
         maxPacketSize: Int = 192,
+        bInterval: Int = 1,
         bitResolution: Int = 24,
         subslotSize: Int = 4,
         clusterDescriptorId: Int = -1,
@@ -60,6 +61,7 @@ class UsbAudioDescriptorHelperTest {
             endpointAddress,
             endpointSync,
             maxPacketSize,
+            bInterval,
             bitResolution,
             subslotSize,
             clusterDescriptorId,
@@ -124,6 +126,20 @@ class UsbAudioDescriptorHelperTest {
         val (formats, nonPcm) = record(endpointAddress = -1, bitResolution = 24)
         assertTrue(formats.isEmpty())
         assertTrue(nonPcm.isEmpty())
+    }
+
+    @Test
+    fun `a positive bInterval is recorded as-is`() {
+        val (formats, _) = record(bInterval = 4, bitResolution = 24)
+        assertEquals(4, formats.getValue(1).single().bInterval)
+    }
+
+    @Test
+    fun `a non-positive bInterval falls back to 1`() {
+        for (bInterval in listOf(0, -1, -99)) {
+            val (formats, _) = record(bInterval = bInterval, bitResolution = 24)
+            assertEquals(1, formats.getValue(1).single().bInterval, "bInterval=$bInterval")
+        }
     }
 
     @Test

@@ -168,6 +168,16 @@ class UsbAudioOutput(
     // of starting a stream nothing will ever read from -- see play()'s completion callback.
     @Volatile private var released = false
 
+    // Serializes every place that decides whether to start/stop the native stream together with
+    // flipping [activated] -- onActivationAttemptFinished() (on activationExecutor's thread) and
+    // pause()/release() (on whatever thread calls them). Without this, a pause()/release() landing
+    // in the narrow window between startStreamingThread() actually running and activated being set
+    // true reads activated as still false, skips stopStreamingThread() entirely, and leaves the
+    // just-started stream running with nothing left to ever stop it (#70). Each of those three call
+    // sites does its own check-and-act (start-or-release-claim; stop-and-flip) entirely inside this
+    // lock, so they can't interleave.
+    private val activationLock = Any()
+
     // Runs activateAndStream() off the thread that calls play() -- see play()'s own doc comment
     // for why. Single-threaded like UsbControlWriterImpl's volumeExecutor/
     // UsbClaimControllerImpl's claimScheduler, the same pattern elsewhere in this codebase for
@@ -522,16 +532,18 @@ class UsbAudioOutput(
             L.w("UsbAudioOutput: failed to resume streaming -- isStalled() will reflect this")
             return
         }
-        if (!paused && !released) {
-            startStreamingThread()
-            activated = true
-            // Tells UsbAudioManager's Settings-screen mutators (setMuted/setVolume/setMixerGain)
-            // not to release the claim out from under this still-running stream just because
-            // their own one-off control write finished -- see notifyStreamingStarted's doc
-            // comment.
-            usbAudioManager.notifyStreamingStarted()
-        } else {
-            usbAudioManager.releaseClaim()
+        synchronized(activationLock) {
+            if (!paused && !released) {
+                startStreamingThread()
+                activated = true
+                // Tells UsbAudioManager's Settings-screen mutators (setMuted/setVolume/
+                // setMixerGain) not to release the claim out from under this still-running
+                // stream just because their own one-off control write finished -- see
+                // notifyStreamingStarted's doc comment.
+                usbAudioManager.notifyStreamingStarted()
+            } else {
+                usbAudioManager.releaseClaim()
+            }
         }
     }
 
@@ -540,15 +552,17 @@ class UsbAudioOutput(
         // audio out over up to UsbAudioTuning.RING_BUFFER_MS.
         L.i("UsbAudioOutput: pause()")
         paused = true
-        if (activated) {
-            stopStreamingThread()
-            activated = false
-            usbAudioManager.notifyStreamingStopped()
-            // Hand the interface back to Android after a short grace period (see
-            // UsbAudioManager.releaseClaim's doc comment) rather than immediately -- a quick
-            // pause/resume shouldn't pay the real hand-off cost, but genuinely leaving playback
-            // paused should free the device for every other app.
-            usbAudioManager.releaseClaim()
+        synchronized(activationLock) {
+            if (activated) {
+                stopStreamingThread()
+                activated = false
+                usbAudioManager.notifyStreamingStopped()
+                // Hand the interface back to Android after a short grace period (see
+                // UsbAudioManager.releaseClaim's doc comment) rather than immediately -- a quick
+                // pause/resume shouldn't pay the real hand-off cost, but genuinely leaving
+                // playback paused should free the device for every other app.
+                usbAudioManager.releaseClaim()
+            }
         }
     }
 
@@ -652,14 +666,16 @@ class UsbAudioOutput(
         // instance (a track skip landing mid-relock) hand back its claim instead of starting a
         // stream nothing will ever read from.
         released = true
-        stopStreamingThread()
-        if (activated) {
-            activated = false
-            usbAudioManager.notifyStreamingStopped()
-            // The player is genuinely done with this instance -- release immediately rather
-            // than waiting out the usual grace period, which exists only to absorb a quick
-            // pause/resume that this is specifically not.
-            usbAudioManager.releaseClaim(delayMs = 0)
+        synchronized(activationLock) {
+            stopStreamingThread()
+            if (activated) {
+                activated = false
+                usbAudioManager.notifyStreamingStopped()
+                // The player is genuinely done with this instance -- release immediately rather
+                // than waiting out the usual grace period, which exists only to absorb a quick
+                // pause/resume that this is specifically not.
+                usbAudioManager.releaseClaim(delayMs = 0)
+            }
         }
         // Not shutdownNow(): a task already running (an activation this release() landed in the
         // middle of) still needs to finish and see [released] itself -- see play()'s doc comment.

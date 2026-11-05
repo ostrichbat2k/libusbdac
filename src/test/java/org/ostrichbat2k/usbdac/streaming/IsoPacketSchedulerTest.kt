@@ -79,7 +79,7 @@ class IsoPacketSchedulerTest {
 
 class IsoPacingTest {
     @Test
-    fun `high speed (3), bInterval=1 (the default, and every device tested so far), paces at 8000 packets per second, 125us each, and scales packetsPerUrb`() {
+    fun `high speed (3) with bInterval=1 (the default, every device tested so far) paces at 8000 packets per second`() {
         val pacing = IsoPacing.forSpeed(usbSpeed = 3, basePacketsPerUrb = 8, bInterval = 1)
         assertEquals(8000, pacing.packetsPerSecond)
         assertEquals(125_000L, pacing.packetDurationNs) // 125us

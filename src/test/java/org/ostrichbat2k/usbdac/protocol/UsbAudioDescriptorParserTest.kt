@@ -260,7 +260,8 @@ class UsbAudioDescriptorParserUac3Test {
         val asGeneral = D.uac3AsGeneral(terminalLink = 1, clusterId = 32, subslotSize = 4, bitResolution = 24)
         // bInterval=4: distinct from the real-devices-tested default of 1, to actually exercise
         // parsing it rather than coincidentally matching UacStreamFormat's own default -- see #61.
-        val endpoint = D.endpoint(address = 0x83, attributes = 0x05, maxPacketSize = 196, bInterval = 4) // sync bits = ASYNC
+        // sync bits = ASYNC
+        val endpoint = D.endpoint(address = 0x83, attributes = 0x05, maxPacketSize = 196, bInterval = 4)
         return config + acIface + input + clock + mixer + output + asIface + asGeneral + endpoint
     }
 

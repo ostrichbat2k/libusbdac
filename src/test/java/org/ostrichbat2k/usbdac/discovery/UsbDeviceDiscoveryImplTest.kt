@@ -26,7 +26,6 @@ import android.hardware.usb.UsbConstants
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbInterface
 import android.hardware.usb.UsbManager
-import android.widget.Toast
 import io.mockk.Runs
 import io.mockk.every
 import io.mockk.just
@@ -71,6 +70,7 @@ class UsbDeviceDiscoveryImplTest {
     private lateinit var usbSettings: UsbDacPreferences
     private var detachedCalls = 0
     private val refreshedCalls = mutableListOf<List<UsbAudioDevice>>()
+    private val logCalls = mutableListOf<String>()
     private lateinit var discovery: UsbDeviceDiscoveryImpl
 
     private fun setDeviceList(vararg devices: UsbDevice) {
@@ -79,8 +79,6 @@ class UsbDeviceDiscoveryImplTest {
 
     @BeforeEach
     fun setUp() {
-        mockkStatic(Toast::class)
-        every { Toast.makeText(any(), any<String>(), any()) } returns mockk(relaxed = true)
         mockkStatic(PendingIntent::class)
         every { PendingIntent.getBroadcast(any(), any(), any(), any()) } returns mockk(relaxed = true)
         // Intent/IntentFilter's real bodies throw "not mocked" in a plain JVM unit test; mocking
@@ -103,12 +101,12 @@ class UsbDeviceDiscoveryImplTest {
                 actionUsbPermission = "org.ostrichbat2k.usbdac.test.USB_PERMISSION",
                 onDeviceDetached = { detachedCalls++ },
                 onRefreshed = { refreshedCalls += it },
+                log = { logCalls += it },
             )
     }
 
     @AfterEach
     fun tearDown() {
-        unmockkStatic(Toast::class)
         unmockkStatic(PendingIntent::class)
         unmockkConstructor(Intent::class, IntentFilter::class)
     }
@@ -148,7 +146,7 @@ class UsbDeviceDiscoveryImplTest {
     }
 
     @Test
-    fun `a newly seen device name triggers exactly one toast, not on every subsequent refresh`() {
+    fun `a newly seen device name logs exactly once, not on every subsequent refresh`() {
         val device = fakeUsbDevice("audio", productName = "Shiny DAC")
         setDeviceList(device)
 
@@ -156,7 +154,7 @@ class UsbDeviceDiscoveryImplTest {
         discovery.refresh()
         discovery.refresh()
 
-        verify(exactly = 1) { Toast.makeText(context, "USB Audio Device detected: Shiny DAC", Toast.LENGTH_LONG) }
+        assertEquals(listOf("USB Audio Device detected: Shiny DAC"), logCalls)
     }
 
     @Test

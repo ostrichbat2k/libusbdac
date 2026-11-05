@@ -32,7 +32,6 @@ import android.hardware.usb.UsbConstants
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
 import android.os.Build
-import android.widget.Toast
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -58,6 +57,11 @@ import timber.log.Timber as L
  * DAC session (not this class's job), and [UsbAudioManager]'s own "already tried activating this
  * attachment" bookkeeping needs pruning whenever the attached-device set changes, same timing as
  * before extraction -- synchronously, right after [devices] itself updates.
+ *
+ * Device-detected/permission-result notices go through [log] (defaulting to a no-op), the same
+ * host-observable surface every other library component feeds -- not a hardcoded [android.widget.Toast]
+ * (#64): a library has no business deciding a host app wants a system Toast for this, and a host
+ * that *does* want one can trivially show it itself off whatever [log] is wired to.
  */
 internal class UsbDeviceDiscoveryImpl(
     private val context: Context,
@@ -66,6 +70,7 @@ internal class UsbDeviceDiscoveryImpl(
     private val actionUsbPermission: String,
     private val onDeviceDetached: () -> Unit,
     private val onRefreshed: (List<UsbAudioDevice>) -> Unit = {},
+    private val log: (String) -> Unit = {},
 ) : UsbDeviceDiscovery {
     private val _devices = MutableStateFlow<List<UsbAudioDevice>>(emptyList())
     override val devices: StateFlow<List<UsbAudioDevice>> = _devices.asStateFlow()
@@ -101,13 +106,9 @@ internal class UsbDeviceDiscoveryImpl(
                         L.i("USB permission result for ${device?.deviceName}: granted=$granted")
                         if (device != null) {
                             val label = device.productName ?: device.deviceName
-                            Toast.makeText(
-                                    context,
-                                    if (granted) "USB DAC permission granted: $label"
-                                    else "USB DAC permission denied: $label",
-                                    Toast.LENGTH_LONG,
-                                )
-                                .show()
+                            log(
+                                if (granted) "USB DAC permission granted: $label"
+                                else "USB DAC permission denied: $label")
                         }
                         refresh()
                     }
@@ -162,7 +163,7 @@ internal class UsbDeviceDiscoveryImpl(
 
         val newNames = found.map { it.displayName }.toSet()
         for (name in newNames - knownDeviceNames) {
-            Toast.makeText(context, "USB Audio Device detected: $name", Toast.LENGTH_LONG).show()
+            log("USB Audio Device detected: $name")
         }
         knownDeviceNames = newNames
 

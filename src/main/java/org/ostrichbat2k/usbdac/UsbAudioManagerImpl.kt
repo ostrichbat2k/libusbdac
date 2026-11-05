@@ -195,6 +195,7 @@ class UsbAudioManagerImpl(private val context: Context, private val usbSettings:
             onRefreshed = { found ->
                 activationAttemptedFor = activationAttemptedFor.takeIf { it in found.map { d -> d.device.deviceName } }
             },
+            log = diagnosticLogger::log,
         )
     override val devices: StateFlow<List<UsbAudioDevice>> = deviceDiscovery.devices
 

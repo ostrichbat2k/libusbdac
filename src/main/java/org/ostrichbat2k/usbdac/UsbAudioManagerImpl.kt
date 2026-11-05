@@ -59,6 +59,7 @@ import android.media.AudioManager
 import android.os.Build
 import androidx.media3.exoplayer.audio.AudioSink
 import androidx.media3.exoplayer.audio.DefaultAudioSink
+import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -245,7 +246,7 @@ class UsbAudioManagerImpl(private val context: Context, private val usbSettings:
             isBitPerfectCapable = { isBitPerfectCapable() },
             volumeController,
             setVolume = { setVolume(it) },
-            clearCachedSink = { (sessionState as? SessionState.Active)?.let { sessionState = it.copy(sink = null) } },
+            clearCachedSink = { updateActiveSessionState { it.copy(sink = null) } },
         )
     /**
      * Whether the *current* track was secretly routed bit-perfect (`true`) or HAL fallback
@@ -359,8 +360,32 @@ class UsbAudioManagerImpl(private val context: Context, private val usbSettings:
      * [deactivateDac] itself, and a handful of single-field `copy()` updates
      * ([ensureFormatActive], [clearActiveFormatOnReclaim], [resolveActiveSink], [UsbAbxTester])
      * that only make sense while already [SessionState.Active].
+     *
+     * Backed by an [AtomicReference], not a bare `@Volatile` field: several of the sites below
+     * only ever touch one field of the current [SessionState.Active] (format, rateHz, sink) via
+     * a check-then-copy-then-set, and `@Volatile` alone only guarantees cross-thread visibility,
+     * not atomicity of that read-modify-write -- two such updates racing from different threads
+     * (e.g. [ensureFormatActive]'s own write racing [clearActiveFormatOnReclaim]'s) could
+     * silently lose one side's change. [updateActiveSessionState] below runs every one of those
+     * through [AtomicReference.updateAndGet]'s CAS retry loop instead, so a losing attempt
+     * reapplies its own transform against the winner's result rather than being discarded.
      */
-    @Volatile private var sessionState: SessionState = SessionState.Idle
+    private val sessionStateRef = AtomicReference<SessionState>(SessionState.Idle)
+    private var sessionState: SessionState
+        get() = sessionStateRef.get()
+        set(value) {
+            sessionStateRef.set(value)
+        }
+
+    /**
+     * Atomically applies [transform] to the current state iff it's currently
+     * [SessionState.Active] right now -- a no-op otherwise (e.g. a reclaim/format-switch callback
+     * firing after the session already deactivated). See [sessionStateRef]'s own doc comment for
+     * why this exists instead of each call site doing its own check-then-copy-then-set.
+     */
+    private fun updateActiveSessionState(transform: (SessionState.Active) -> SessionState.Active) {
+        sessionStateRef.updateAndGet { current -> if (current is SessionState.Active) transform(current) else current }
+    }
 
     // [awaitActivation]'s own "is there still something to wait for" signal -- deliberately not
     // derived from sessionState's own type (as it used to be, via SessionState.Activating's own
@@ -412,7 +437,7 @@ class UsbAudioManagerImpl(private val context: Context, private val usbSettings:
      * if nothing is [SessionState.Active] right now.
      */
     private fun clearActiveFormatOnReclaim() {
-        (sessionState as? SessionState.Active)?.let { sessionState = it.copy(format = null) }
+        updateActiveSessionState { it.copy(format = null) }
     }
 
     private val _blockPlayback = MutableStateFlow(false)
@@ -693,7 +718,7 @@ class UsbAudioManagerImpl(private val context: Context, private val usbSettings:
             // shouldUseFloatOutput() check.
             .setEnableFloatOutput(true)
             .build()
-            .also { sink -> (sessionState as? SessionState.Active)?.let { sessionState = it.copy(sink = sink) } }
+            .also { sink -> updateActiveSessionState { it.copy(sink = sink) } }
     }
 
     /**
@@ -742,14 +767,14 @@ class UsbAudioManagerImpl(private val context: Context, private val usbSettings:
             UsbAudioController.reassertKernelEviction(session)
             ok = UsbAudioController.selectFormat(session, format)
             if (ok) {
-                (sessionState as? SessionState.Active)?.let { sessionState = it.copy(format = format) }
+                updateActiveSessionState { it.copy(format = format) }
                 diagnosticLogger.log("Switched to ${format.bitResolution}-bit (alt=${format.alternateSetting}) for upcoming track")
             } else {
                 diagnosticLogger.log("Failed to switch to ${format.bitResolution}-bit (alt=${format.alternateSetting}) for upcoming track")
             }
         }
         if (configChanged) {
-            (sessionState as? SessionState.Active)?.let { sessionState = it.copy(rateHz = sampleRateHz) }
+            updateActiveSessionState { it.copy(rateHz = sampleRateHz) }
             controlWriter.refreshControlState(session, activeFormat ?: format, session.device.productName ?: session.device.deviceName)
         }
         return ok

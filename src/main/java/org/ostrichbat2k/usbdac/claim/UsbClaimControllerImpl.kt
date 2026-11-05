@@ -35,6 +35,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import timber.log.Timber as L
 
 /**
@@ -99,14 +100,22 @@ internal class UsbClaimControllerImpl(
     // interface out from under the still-running native thread, which only recovered once
     // DefaultAudioSink's own stall detection eventually noticed and forced a fresh
     // reconfigure/reclaim.
-    @Volatile private var activeStreamCount = 0
+    //
+    // AtomicInteger, not a bare @Volatile Int: notifyStreamingStarted/Stopped mutate this via a
+    // plain ++/-- read-modify-write, which @Volatile alone doesn't make atomic across threads --
+    // two concurrent increments/decrements can lose one side's update (classic non-atomic x++).
+    // That matters here specifically because releaseClaim/doReleaseClaim gate whether it's safe
+    // to release the interface on this count, so a lost update could let a release proceed while
+    // a stream genuinely still depends on the claim, or block one that should have gone through.
+    private val activeStreamCount = AtomicInteger(0)
 
     // How many beginClaimAttempt()/endClaimAttempt()-bracketed activation attempts are currently
     // in progress -- see releaseClaim's own doc comment on why this, not just activeStreamCount,
     // has to gate a concurrent release. Distinct from activeStreamCount because an attempt that's
     // still claiming/relocking hasn't called notifyStreamingStarted() yet (and may never, if it
-    // fails), so activeStreamCount alone leaves exactly that window unguarded.
-    @Volatile private var claimAttemptsInFlight = 0
+    // fails), so activeStreamCount alone leaves exactly that window unguarded. Same
+    // AtomicInteger-not-@Volatile reasoning as activeStreamCount above.
+    private val claimAttemptsInFlight = AtomicInteger(0)
 
     // Latches a deactivateOnTimeout=true request that arrived while activeStreamCount > 0 (see
     // releaseClaim's early-return branch) so it isn't silently lost. The caller that lost that
@@ -155,20 +164,20 @@ internal class UsbClaimControllerImpl(
 
     /** Called by [UsbAudioOutput] once it's actually claimed and streaming -- see [releaseClaim]. */
     override fun notifyStreamingStarted() {
-        activeStreamCount++
+        activeStreamCount.incrementAndGet()
     }
 
     /** The inverse of [notifyStreamingStarted] -- call before, not after, releasing anything. */
     override fun notifyStreamingStopped() {
-        activeStreamCount = (activeStreamCount - 1).coerceAtLeast(0)
+        activeStreamCount.updateAndGet { (it - 1).coerceAtLeast(0) }
     }
 
     override fun beginClaimAttempt() {
-        claimAttemptsInFlight++
+        claimAttemptsInFlight.incrementAndGet()
     }
 
     override fun endClaimAttempt() {
-        claimAttemptsInFlight = (claimAttemptsInFlight - 1).coerceAtLeast(0)
+        claimAttemptsInFlight.updateAndGet { (it - 1).coerceAtLeast(0) }
     }
 
     override fun consumeHardwareReset(): Boolean {
@@ -284,7 +293,7 @@ internal class UsbClaimControllerImpl(
      */
     override fun releaseClaim(delayMs: Long, awaitAndroidTakeover: Boolean, deactivateOnTimeout: Boolean) {
         pendingRelease?.cancel(false)
-        if (activeStreamCount > 0 || claimAttemptsInFlight > 0) {
+        if (activeStreamCount.get() > 0 || claimAttemptsInFlight.get() > 0) {
             // Something is genuinely streaming right now (or an activation attempt is still
             // claiming/relocking -- see beginClaimAttempt's own doc comment) and still needs the
             // claim -- a caller here (a Settings-screen mutator, most likely) just wanted it
@@ -311,7 +320,7 @@ internal class UsbClaimControllerImpl(
     }
 
     private fun doReleaseClaim(awaitAndroidTakeover: Boolean, deactivateOnTimeout: Boolean) {
-        if (activeStreamCount > 0) {
+        if (activeStreamCount.get() > 0) {
             // The race can still be lost a second time between releaseClaim scheduling this and
             // it actually firing (a new stream started in the meantime) -- re-latch for the same
             // reason releaseClaim's own early-return branch does, rather than silently dropping

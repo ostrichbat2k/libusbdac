@@ -34,6 +34,16 @@ data class UacStreamFormat(
      * instead -- UAC 1.0 has no Clock Source entity at all).
      */
     val sampleRates: List<Int> = emptyList(),
+    /**
+     * This alt setting's streaming endpoint's own declared `bInterval` -- the raw USB Standard
+     * Endpoint Descriptor field (offset 6), not a UAC-specific one. Defaults to 1 (the shortest
+     * legal interval, and what every device actually seen by this codebase declares) for the
+     * handful of callers that build a [UacStreamFormat] without a real descriptor behind it
+     * (tests, the descriptor cache's pre-#61 rows). See [org.ostrichbat2k.usbdac.streaming.IsoPacing]
+     * for why this matters -- isochronous packet timing is derived from speed + this field, not
+     * speed alone.
+     */
+    val bInterval: Int = 1,
 )
 
 /**

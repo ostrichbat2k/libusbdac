@@ -79,32 +79,79 @@ class IsoPacketSchedulerTest {
 
 class IsoPacingTest {
     @Test
-    fun `high speed (3) paces at 8000 packets per second, 125us each, and scales packetsPerUrb`() {
-        val pacing = IsoPacing.forSpeed(usbSpeed = 3, basePacketsPerUrb = 8)
+    fun `high speed (3), bInterval=1 (the default, and every device tested so far), paces at 8000 packets per second, 125us each, and scales packetsPerUrb`() {
+        val pacing = IsoPacing.forSpeed(usbSpeed = 3, basePacketsPerUrb = 8, bInterval = 1)
         assertEquals(8000, pacing.packetsPerSecond)
         assertEquals(125_000L, pacing.packetDurationNs) // 125us
         assertEquals(64, pacing.packetsPerUrb) // 8 * (8000/1000)
     }
 
     @Test
-    fun `full speed (2) paces at 1000 packets per second, 1ms each, with packetsPerUrb unscaled`() {
-        val pacing = IsoPacing.forSpeed(usbSpeed = 2, basePacketsPerUrb = 8)
+    fun `full speed (2), bInterval=1, paces at 1000 packets per second, 1ms each, with packetsPerUrb unscaled`() {
+        val pacing = IsoPacing.forSpeed(usbSpeed = 2, basePacketsPerUrb = 8, bInterval = 1)
         assertEquals(1000, pacing.packetsPerSecond)
         assertEquals(1_000_000L, pacing.packetDurationNs) // 1ms
         assertEquals(8, pacing.packetsPerUrb)
     }
 
     @Test
-    fun `every non-high-speed value currently falls back to full-speed pacing`() {
-        // Documents current behavior, not necessarily a deliberate design choice for every one
-        // of these: low (1), wireless (4), super (5) and super+ (6) all collapse to the same
-        // full-speed numbers as an unrecognized value would. A real super-speed UAC DAC (if one
-        // ever shows up) would silently get full-speed pacing here, not its own real timing.
-        for (usbSpeed in listOf(1, 2, 4, 5, 6, 0, -1, 99)) {
-            val pacing = IsoPacing.forSpeed(usbSpeed, basePacketsPerUrb = 8)
+    fun `full speed ignores bInterval's exponential rule entirely -- always 1ms packets`() {
+        // Full-/low-speed isochronous endpoints schedule one packet per 1ms frame regardless of
+        // bInterval (USB 2.0 5.6.4) -- only high-speed and above use bInterval's 2^(n-1) rule.
+        for (bInterval in listOf(1, 2, 4, 16)) {
+            val pacing = IsoPacing.forSpeed(usbSpeed = 2, basePacketsPerUrb = 8, bInterval = bInterval)
+            assertEquals(1000, pacing.packetsPerSecond, "bInterval=$bInterval")
+            assertEquals(1_000_000L, pacing.packetDurationNs, "bInterval=$bInterval")
+            assertEquals(8, pacing.packetsPerUrb, "bInterval=$bInterval")
+        }
+    }
+
+    @Test
+    fun `super speed (5) and super+ (6) now pace the same as high-speed, not full-speed`() {
+        // #61: these used to fall into the full-speed branch and get timed as 1000 packets/sec,
+        // wrong by the same 8x factor high-speed would be if mistimed -- just never caught
+        // because no SuperSpeed audio device has been tested yet.
+        for (usbSpeed in listOf(5, 6)) {
+            val pacing = IsoPacing.forSpeed(usbSpeed, basePacketsPerUrb = 8, bInterval = 1)
+            assertEquals(8000, pacing.packetsPerSecond, "usbSpeed=$usbSpeed")
+            assertEquals(125_000L, pacing.packetDurationNs, "usbSpeed=$usbSpeed")
+            assertEquals(64, pacing.packetsPerUrb, "usbSpeed=$usbSpeed")
+        }
+    }
+
+    @Test
+    fun `high speed with bInterval=4 schedules one packet every 8 microframes, not every microframe`() {
+        // 2^(4-1) = 8 microframes = 1ms real interval -- same real-time packet rate as
+        // full-speed, just arrived at via high-speed's microframe-based rule instead of
+        // full-speed's frame-based one.
+        val pacing = IsoPacing.forSpeed(usbSpeed = 3, basePacketsPerUrb = 8, bInterval = 4)
+        assertEquals(1000, pacing.packetsPerSecond)
+        assertEquals(1_000_000L, pacing.packetDurationNs)
+        assertEquals(8, pacing.packetsPerUrb)
+    }
+
+    @Test
+    fun `an out-of-spec bInterval falls back to the shortest interval instead of producing nonsense`() {
+        for (bInterval in listOf(0, -1, -99)) {
+            val pacing = IsoPacing.forSpeed(usbSpeed = 3, basePacketsPerUrb = 8, bInterval = bInterval)
+            assertEquals(8000, pacing.packetsPerSecond, "bInterval=$bInterval")
+        }
+    }
+
+    @Test
+    fun `low (1), wireless (4) and unrecognized speeds still fall back to full-speed pacing`() {
+        for (usbSpeed in listOf(1, 4, 0, -1, 99)) {
+            val pacing = IsoPacing.forSpeed(usbSpeed, basePacketsPerUrb = 8, bInterval = 1)
             assertEquals(1000, pacing.packetsPerSecond, "usbSpeed=$usbSpeed")
             assertEquals(1_000_000L, pacing.packetDurationNs, "usbSpeed=$usbSpeed")
             assertEquals(8, pacing.packetsPerUrb, "usbSpeed=$usbSpeed")
         }
+    }
+
+    @Test
+    fun `forSpeed defaults bInterval to 1 when the caller omits it`() {
+        val withoutArg = IsoPacing.forSpeed(usbSpeed = 3, basePacketsPerUrb = 8)
+        val withExplicitOne = IsoPacing.forSpeed(usbSpeed = 3, basePacketsPerUrb = 8, bInterval = 1)
+        assertEquals(withExplicitOne, withoutArg)
     }
 }

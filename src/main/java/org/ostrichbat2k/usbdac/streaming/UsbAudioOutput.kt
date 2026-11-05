@@ -771,7 +771,7 @@ class UsbAudioOutput(
                 6 -> "super+"
                 else -> "unknown"
             }
-        val pacing = IsoPacing.forSpeed(usbSpeed, UsbAudioTuning.BASE_PACKETS_PER_URB)
+        val pacing = IsoPacing.forSpeed(usbSpeed, UsbAudioTuning.BASE_PACKETS_PER_URB, format.bInterval)
         val packetsPerSecond = pacing.packetsPerSecond
         val packetDurationNs = pacing.packetDurationNs
         val packetsPerUrb = pacing.packetsPerUrb
@@ -785,8 +785,8 @@ class UsbAudioOutput(
         L.i(
             "UsbAudioOutput: opened iso stream fd=$fd endpoint=${format.endpointAddress} " +
                 "maxPacketSize=${format.maxPacketSize} handle=$handle usbSpeed=$speedName " +
-                "(pacing $packetsPerSecond packets/sec, ${packetDurationNs / 1000}us/packet, " +
-                "$packetsPerUrb packets/urb)")
+                "bInterval=${format.bInterval} (pacing $packetsPerSecond packets/sec, " +
+                "${packetDurationNs / 1000}us/packet, $packetsPerUrb packets/urb)")
         isoHandle = handle
         val scheduler = IsoPacketScheduler(sampleRateHz, packetsPerSecond)
         val frameBytes = bytesPerFrame

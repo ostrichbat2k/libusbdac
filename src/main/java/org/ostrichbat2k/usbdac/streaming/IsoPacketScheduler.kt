@@ -53,20 +53,47 @@ class IsoPacketScheduler(sampleRateHz: Int, private val packetsPerSecond: Int = 
 }
 
 /**
- * Pacing parameters derived from a device's negotiated USB speed -- used by [UsbAudioOutput]'s
- * real playback path so the high-speed-vs-full-speed distinction can't drift out of sync between
- * callers that need it. See [UsbNative.getUsbSpeed]'s doc comment for why 125us microframes vs.
- * 1ms frames matters here, not just cosmetically.
+ * Pacing parameters derived from a device's negotiated USB speed and its streaming endpoint's own
+ * declared `bInterval` -- used by [UsbAudioOutput]'s real playback path so this distinction can't
+ * drift out of sync between callers that need it. See [UsbNative.getUsbSpeed]'s doc comment for
+ * why 125us microframes vs. 1ms frames matters here, not just cosmetically.
  */
 data class IsoPacing(val packetsPerSecond: Int, val packetDurationNs: Long, val packetsPerUrb: Int) {
     companion object {
-        /** [basePacketsPerUrb] is the caller's full-speed (1 packet == 1ms) target; scaled up here. */
-        fun forSpeed(usbSpeed: Int, basePacketsPerUrb: Int): IsoPacing {
-            val packetsPerSecond = if (usbSpeed == 3) 8000 else 1000
+        // USB_SPEED_* values (linux/usb/ch9.h) that schedule isochronous packets per 125us
+        // microframe, same unit full-/low-speed don't use: high-speed and both SuperSpeed
+        // variants. SuperSpeed/SuperSpeed+ (5/6) used to fall into the full-speed branch below
+        // and get timed as 1ms packets -- wrong by the same 8x factor high-speed would be if
+        // mistimed, just never caught because no SuperSpeed audio device has been tested yet.
+        private val MICROFRAME_SPEEDS = setOf(3, 5, 6)
+
+        /**
+         * [basePacketsPerUrb] is the caller's full-speed (1 packet == 1ms) target; scaled up here.
+         * [bInterval] is the streaming endpoint's own declared service interval (USB Standard
+         * Endpoint Descriptor offset 6, [UacStreamFormat.bInterval]) -- every device actually
+         * tested so far declares the shortest legal interval (1), which this degenerates to
+         * exactly the previous hardcoded 1000/8000 packets/sec behavior for, so this generalizes
+         * the previously speed-only computation without changing anything on tested hardware.
+         *
+         * Per the USB 2.0 spec (5.6.4): full-/low-speed isochronous endpoints schedule one packet
+         * per 1ms frame regardless of `bInterval`'s value (its exponential rule only applies to
+         * high-speed and above); high-speed/SuperSpeed/SuperSpeed+ schedule one packet every
+         * `2^(bInterval-1)` 125us microframes. An out-of-spec `bInterval` (<= 0) falls back to the
+         * shortest interval (1) rather than producing a nonsensical (or divide-by-zero-adjacent)
+         * pacing.
+         */
+        fun forSpeed(usbSpeed: Int, basePacketsPerUrb: Int, bInterval: Int = 1): IsoPacing {
+            val safeBInterval = bInterval.takeIf { it > 0 } ?: 1
+            val packetsPerSecond =
+                if (usbSpeed in MICROFRAME_SPEEDS) {
+                    8000 / (1 shl (safeBInterval - 1))
+                } else {
+                    1000
+                }
             return IsoPacing(
                 packetsPerSecond = packetsPerSecond,
                 packetDurationNs = 1_000_000_000L / packetsPerSecond,
-                packetsPerUrb = basePacketsPerUrb * (packetsPerSecond / 1000))
+                packetsPerUrb = basePacketsPerUrb * (packetsPerSecond / 1000).coerceAtLeast(1))
         }
     }
 }

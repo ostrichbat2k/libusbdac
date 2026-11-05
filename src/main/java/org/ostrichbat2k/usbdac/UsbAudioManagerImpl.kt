@@ -791,7 +791,7 @@ class UsbAudioManagerImpl(private val context: Context, private val usbSettings:
 
     /**
      * Reads the active session's Power Domain state right now (one of
-     * [UsbAudioController.PD_STATE_D0]/`D1`/`D2`), or null if there's no active session or this
+     * [UsbAudioManager.PD_STATE_D0]/`D1`/`D2`), or null if there's no active session or this
      * device's topology has no Power Domain at all (UAC 1.0/2.0, or a UAC 3.0 device that didn't
      * declare one). A blocking USB control transfer, same as the other on-demand reads this class
      * does in response to a UI query (e.g. [setMuted]'s read-back) -- fine for an occasional

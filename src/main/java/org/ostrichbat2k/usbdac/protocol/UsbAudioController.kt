@@ -62,8 +62,18 @@ data class UsbAudioSession(
  * verified against a passive capture (control transfers are live, not something `lsusb` records),
  * so [getClockFrequency] is meant to be tried first as a safe, read-only check of the addressing
  * before any SET_CUR write is attempted.
+ *
+ * `internal`, not public (#56): every raw control-transfer primitive here bypasses
+ * [org.ostrichbat2k.usbdac.UsbAudioManagerImpl]'s claim bookkeeping, [SessionState][
+ * org.ostrichbat2k.usbdac.SessionState], and every activation/release ordering invariant the
+ * manager's private machinery depends on -- several hard-won against real hardware, per this
+ * file's own doc comments throughout. A host app calling these directly silently desyncs the
+ * manager's tracked state from real hardware state with no warning. Host apps go through
+ * [org.ostrichbat2k.usbdac.UsbAudioManager]/[org.ostrichbat2k.usbdac.control.UsbControlWriter]
+ * instead, which already exposes everything a real consumer needs ([UsbAudioManager.PD_STATE_D0]
+ * etc. included).
  */
-object UsbAudioController {
+internal object UsbAudioController {
     private const val REQ_TYPE_CLASS_INTERFACE_GET = 0xA1 // Device-to-host, Class, Interface
     private const val REQ_TYPE_CLASS_INTERFACE_SET = 0x21 // Host-to-device, Class, Interface
     private const val REQ_TYPE_CLASS_ENDPOINT_GET = 0xA2 // Device-to-host, Class, Endpoint
@@ -109,10 +119,6 @@ object UsbAudioController {
 
     /** Encodes [value] as [len] little-endian bytes (1-4) -- the write-side counterpart of [leUInt]. */
     internal fun leBytes(value: Int, len: Int): ByteArray = ByteArray(len) { i -> ((value shr (8 * i)) and 0xFF).toByte() }
-
-    const val PD_STATE_D0 = 0
-    const val PD_STATE_D1 = 1
-    const val PD_STATE_D2 = 2
 
     /** Opens, configures, and claims the interfaces for [device]'s playback topology. */
     fun activate(context: Context, device: UsbDevice, topology: UacPlaybackTopology): UsbAudioSession? {
@@ -774,18 +780,18 @@ object UsbAudioController {
             L.w("Could not read power domain $powerDomainId state; skipping wake")
             return
         }
-        if (current == PD_STATE_D0) {
+        if (current == UsbAudioManager.PD_STATE_D0) {
             L.i("Power domain $powerDomainId already in D0")
             return
         }
-        if (!setPowerDomainState(session, powerDomainId, PD_STATE_D0)) {
+        if (!setPowerDomainState(session, powerDomainId, UsbAudioManager.PD_STATE_D0)) {
             L.w("Failed to set power domain $powerDomainId to D0")
             return
         }
         val recoveryUs =
             when (current) {
-                PD_STATE_D1 -> d1RecoveryUs
-                PD_STATE_D2 -> d2RecoveryUs
+                UsbAudioManager.PD_STATE_D1 -> d1RecoveryUs
+                UsbAudioManager.PD_STATE_D2 -> d2RecoveryUs
                 else -> 0
             }
         L.i("Power domain $powerDomainId: D$current -> D0, waiting ${recoveryUs}us")

@@ -10,6 +10,7 @@
     <ID>CyclomaticComplexMethod:UsbAudioDescriptorParserUac2.kt$UsbAudioDescriptorParserUac2$fun parseUac2Playback(entries: List&lt;Pair&lt;Int, ByteArray>>): UacPlaybackTopology?</ID>
     <ID>CyclomaticComplexMethod:UsbAudioDescriptorParserUac3.kt$UsbAudioDescriptorParserUac3$fun dumpAcTopology(entries: List&lt;Pair&lt;Int, ByteArray>>)</ID>
     <ID>CyclomaticComplexMethod:UsbAudioDescriptorParserUac3.kt$UsbAudioDescriptorParserUac3$fun parseUac3Playback(entries: List&lt;Pair&lt;Int, ByteArray>>): UacPlaybackTopology?</ID>
+    <ID>CyclomaticComplexMethod:UsbAudioInspector.kt$UsbAudioInspector$fun inspect(context: Context, device: UsbDevice, isSessionActive: () -> Boolean = { false })</ID>
     <ID>CyclomaticComplexMethod:UsbAudioOutput.kt$UsbAudioOutput$private fun activateAndStream(): Boolean</ID>
     <ID>CyclomaticComplexMethod:UsbAudioOutput.kt$UsbAudioOutput$private fun startStreamingThread()</ID>
     <ID>CyclomaticComplexMethod:UsbClaimControllerImpl.kt$UsbClaimControllerImpl$private fun awaitAndroidOutputTakeover(deactivateOnTimeout: Boolean)</ID>
@@ -172,7 +173,7 @@
     <ID>ReturnCount:UsbAudioDescriptorParserUac1.kt$UsbAudioDescriptorParserUac1$fun parseUac1Playback(entries: List&lt;Pair&lt;Int, ByteArray>>): UacPlaybackTopology?</ID>
     <ID>ReturnCount:UsbAudioDescriptorParserUac2.kt$UsbAudioDescriptorParserUac2$fun parseUac2Playback(entries: List&lt;Pair&lt;Int, ByteArray>>): UacPlaybackTopology?</ID>
     <ID>ReturnCount:UsbAudioDescriptorParserUac3.kt$UsbAudioDescriptorParserUac3$fun parseUac3Playback(entries: List&lt;Pair&lt;Int, ByteArray>>): UacPlaybackTopology?</ID>
-    <ID>ReturnCount:UsbAudioInspector.kt$UsbAudioInspector$fun inspect(context: Context, device: UsbDevice)</ID>
+    <ID>ReturnCount:UsbAudioInspector.kt$UsbAudioInspector$fun inspect(context: Context, device: UsbDevice, isSessionActive: () -> Boolean = { false })</ID>
     <ID>ReturnCount:UsbAudioManagerImpl.kt$UsbAudioManagerImpl$override fun ensureFormatActive(format: UacStreamFormat, sampleRateHz: Int): Boolean</ID>
     <ID>ReturnCount:UsbAudioManagerImpl.kt$UsbAudioManagerImpl$override fun getClockInfo(): Pair&lt;Int?, Boolean?>?</ID>
     <ID>ReturnCount:UsbAudioManagerImpl.kt$UsbAudioManagerImpl$override fun getPowerDomainState(): Int?</ID>

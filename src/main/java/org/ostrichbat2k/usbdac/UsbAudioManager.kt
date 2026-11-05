@@ -39,6 +39,13 @@ import kotlinx.coroutines.flow.StateFlow
  * device attach/detach.
  */
 interface UsbAudioManager : UsbDacPreferences.Listener {
+    /** [getPowerDomainState]'s possible return values. */
+    companion object {
+        const val PD_STATE_D0 = 0
+        const val PD_STATE_D1 = 1
+        const val PD_STATE_D2 = 2
+    }
+
     /**
      * The real sample rate Android's shared audio HAL mixer runs at -- what any non-direct
      * (fallback) track actually gets resampled to on its way out, regardless of its own native

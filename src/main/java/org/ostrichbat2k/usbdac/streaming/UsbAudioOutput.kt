@@ -802,6 +802,12 @@ class UsbAudioOutput(
         val maxBytesPerPacket = (sampleRateHz / packetsPerSecond + 1) * frameBytes
         val urbBuffer = ByteArray(packetsPerUrb * maxBytesPerPacket)
         val packetLengths = IntArray(packetsPerUrb)
+        // What's currently loaded into each URB slot, for framesOutput to credit once reapIso()
+        // confirms *that* slot's URB actually completed -- not when it was merely submitted (#71).
+        // Reused across this stream's whole lifetime the same way urbBuffer/packetLengths are:
+        // indexed by slot, overwritten every time that slot is resubmitted.
+        val slotFrames = LongArray(UsbAudioTuning.NUM_URBS)
+        val slotCreditable = BooleanArray(UsbAudioTuning.NUM_URBS)
 
         /**
          * Ramps the last [UsbAudioTuning.UNDERRUN_FADE_FRAMES] frames of real audio already in [buf] (ending at
@@ -928,7 +934,13 @@ class UsbAudioOutput(
                                 "UsbAudioOutput: initial submitIso failed twice for slot $slot " +
                                     "-- this URB stays unsubmitted")
                         } else {
-                            framesOutput += total / frameBytes
+                            // Credited once reapIso() confirms this slot's URB actually
+                            // completed, in the steady-state loop below -- not now (#71). Prefill
+                            // always runs right after startStreamingThread() was called with
+                            // paused already confirmed false, so always creditable, same as the
+                            // old unconditional credit here.
+                            slotFrames[slot] = (total / frameBytes).toLong()
+                            slotCreditable[slot] = true
                         }
                     }
 
@@ -968,6 +980,17 @@ class UsbAudioOutput(
                             continue
                         }
 
+                        // This slot's URB has now genuinely completed (reapIso() returning it is
+                        // exactly that confirmation) -- credit framesOutput for whatever was
+                        // loaded into it back when IT was submitted (prefill above, or a previous
+                        // trip through this loop), not for the new content built below (#71:
+                        // submission time != completion time -- crediting at submission there
+                        // reported playback as running ahead of what the device had actually
+                        // consumed, by up to the whole prefill depth).
+                        if (slotCreditable[slot]) {
+                            framesOutput += slotFrames[slot]
+                        }
+
                         urbsPaced++
                         val waitNs = (streamStartNs + urbsPaced * urbRealTimeNs) - System.nanoTime()
                         if (waitNs > 0) {
@@ -994,14 +1017,15 @@ class UsbAudioOutput(
                         }
                         submitted++
                         lastUrbSubmittedAtMs = System.currentTimeMillis()
-                        // Not while paused: this is synthetic silence standing in for the USB
-                        // clock's unstoppable schedule, not real consumed track audio -- see
-                        // [paused]'s doc comment. Advancing it here would let getPositionUs()
-                        // catch up to framesWritten mid-pause and re-trigger the exact
-                        // premature-isEnded() stall this counter exists to prevent.
-                        if (!paused) {
-                            framesOutput += total / frameBytes
-                        }
+                        // Recorded now, credited above next time this slot comes back around
+                        // through reapIso() confirming it completed. Not creditable while paused:
+                        // this is synthetic silence standing in for the USB clock's unstoppable
+                        // schedule, not real consumed track audio -- see [paused]'s doc comment.
+                        // Crediting it would let getPositionUs() catch up to framesWritten
+                        // mid-pause and re-trigger the exact premature-isEnded() stall this
+                        // counter exists to prevent.
+                        slotFrames[slot] = (total / frameBytes).toLong()
+                        slotCreditable[slot] = !paused
                         // ~20 URBs at this class's ~8ms-of-real-audio-per-URB pacing (see
                         // UsbAudioTuning.BASE_PACKETS_PER_URB) is roughly a 160ms cadence -- frequent enough
                         // for a live pipeline visualizer to feel real-time without pushing a

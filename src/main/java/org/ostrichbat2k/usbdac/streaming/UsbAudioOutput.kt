@@ -71,17 +71,39 @@ class UsbAudioOutput(
     // mid-track, with this same instance still alive (no format change), was silently reverted
     // to whatever was persisted back when this instance was first built.
     private val usbSettings: UsbDacPreferences,
-    // True when UsbAudioOutputProvider picked this device format as a *conversion target* for
-    // 32-bit float PCM (FfmpegAudioRenderer's only way to get real higher-than-16-bit precision
-    // out of a device whose own Feature Unit works in integer, not float) rather than ExoPlayer
-    // already producing this format's own native encoding directly. write() branches on this --
-    // see its own doc comment for the actual conversion.
-    private val isFloatInput: Boolean = false,
+    // How write()'s buffer needs to be converted before landing in ringBuffer as format's own
+    // real integer PCM -- see write()'s own doc comment for what each one actually does and why
+    // UsbAudioOutputProvider picked it.
+    private val inputConversion: InputConversion = InputConversion.NONE,
     // So pause()/play() can hand the raw interface back to Android's own USB-audio HAL whenever
     // this instance genuinely stops being used, and reclaim it when actually needed again --
     // see activateAndStream()/pause()'s doc comments.
     private val usbAudioManager: UsbAudioManager,
 ) : AudioOutput {
+
+    /** What [write]'s `buffer` holds, and therefore how it needs to be converted -- see [write]'s own doc comment. */
+    enum class InputConversion {
+        /** `buffer` already holds exactly [format]'s own encoding -- plain byte copy. */
+        NONE,
+
+        /**
+         * `buffer` holds 32-bit float PCM -- the only way wide (>16-bit) content could reach this
+         * class before #67's fix, since `DefaultAudioSink` used to unconditionally force any
+         * wider-than-16-bit input through a float round-trip before an `AudioOutputProvider` was
+         * ever consulted.
+         */
+        FLOAT_TO_INT,
+
+        /**
+         * `buffer` holds real, [format]-native-depth content left-shift-padded into a wider
+         * 4-byte-per-sample container (FFmpeg's `OUTPUT_MODE_NATIVE_INTEGER`'s only output
+         * container wider than 16-bit, `AV_SAMPLE_FMT_S32`, has no native 24-bit option -- see
+         * `UsbAudioOutputProvider.realBitsPerSample`'s doc comment) -- [format] here is always the
+         * device's own narrower real alt-setting (e.g. 24-bit), chosen specifically to avoid
+         * wasting ~33% of USB bandwidth on padding bytes that carry no real information (#67).
+         */
+        DROP_PADDING_BYTE,
+    }
 
     private companion object {
         // factor(i) = 1.0 - (i+1)/UsbAudioTuning.UNDERRUN_FADE_FRAMES for the common case where a short read's
@@ -107,10 +129,11 @@ class UsbAudioOutput(
     private var ringBuffer =
         PcmRingBuffer((bytesPerFrame.toLong() * sampleRateHz * UsbAudioTuning.RING_BUFFER_MS / 1000).toInt())
     private var framesWritten = 0L
-    // Only used when isFloatInput -- reused across write() calls the same way UsbAudioOutput's
-    // own URB buffers are, to avoid allocating on every single call. Grown (never shrunk) to fit
-    // the largest buffer ExoPlayer has handed write() so far.
+    // Only used for the matching InputConversion mode -- reused across write() calls the same
+    // way UsbAudioOutput's own URB buffers are, to avoid allocating on every single call. Grown
+    // (never shrunk) to fit the largest buffer ExoPlayer has handed write() so far.
     private var floatConversionBuffer = ByteArray(0)
+    private var paddingDropBuffer = ByteArray(0)
     // Frames actually handed to the device via a paced, submitted URB -- i.e. audibly played,
     // not just sitting in [ringBuffer]. [getPositionUs] MUST report this, not [framesWritten]:
     // DefaultAudioSink.hasAudioOutputPendingData() compares its own written-frame count against
@@ -570,26 +593,31 @@ class UsbAudioOutput(
      * [ringBuffer] (and therefore the native layer feeding the device) only ever holds the
      * target device format's own real integer PCM -- [format]'s `subslotSize` bytes per sample,
      * signed little-endian. For most tracks ExoPlayer's decoder already produces exactly that,
-     * so this is a plain byte copy (the `else` branch below, unchanged from before float input
-     * existed).
+     * so this is a plain byte copy ([InputConversion.NONE] below, unchanged from before float
+     * input existed).
      *
-     * When [isFloatInput] is true, [buffer] instead holds 32-bit float PCM (one 4-byte float per
-     * channel sample, nominal range -1.0..1.0, native byte order) -- the only way wide (>16-bit)
-     * content can ever reach this class at all, since `DefaultAudioSink.configure()`
-     * unconditionally converts any raw PCM input to either plain 16-bit or float before an
-     * `AudioOutputProvider` ever sees it (confirmed by reading `DefaultAudioSink.configure()`/
-     * `shouldUseFloatOutput()` directly -- there is no way for a custom provider like ours to
-     * receive real 32-bit integer PCM through it, no matter what the decoder itself produced).
+     * [InputConversion.FLOAT_TO_INT]: [buffer] instead holds 32-bit float PCM (one 4-byte float
+     * per channel sample, nominal range -1.0..1.0, native byte order) -- how wide (>16-bit)
+     * content reached this class before `media#6` let a provider accept a literal wide-integer
+     * encoding directly: `DefaultAudioSink.configure()` used to unconditionally convert any raw
+     * PCM input wider than 16-bit to float before an `AudioOutputProvider` ever saw it, since it
+     * never asked the provider first whether it could take the real encoding as-is.
      * `FfmpegAudioDecoder.OUTPUT_MODE_NATIVE_INTEGER` decodes a >16-bit source to exact integer
      * PCM internally so no earlier, *unnecessary* float round-trip happens for a merely-16-bit
      * source -- but once the real source genuinely is wider than 16 bits, this one float stage
-     * (ExoPlayer's own standard, exact int32<->float32 conversion) is unavoidable, and is a
-     * lossless round-trip for real ≤24-bit content either way (float32's mantissa has enough
-     * bits to represent it exactly). This is the one place that ever has to convert it back:
-     * each float sample is scaled to [format]'s real full-scale integer range and packed down to
-     * its actual `subslotSize`, so what lands in [ringBuffer] -- and therefore what the native
-     * streaming thread submits -- is genuine integer PCM at the device's own bit depth either
-     * way, never raw float bytes.
+     * (ExoPlayer's own standard, exact int32<->float32 conversion) is unavoidable on a device
+     * with no direct-wide-integer bypass available, and is a lossless round-trip for real
+     * ≤24-bit content either way (float32's mantissa has enough bits to represent it exactly).
+     * This is the one place that ever has to convert it back: each float sample is scaled to
+     * [format]'s real full-scale integer range and packed down to its actual `subslotSize`, so
+     * what lands in [ringBuffer] -- and therefore what the native streaming thread submits -- is
+     * genuine integer PCM at the device's own bit depth either way, never raw float bytes.
+     *
+     * [InputConversion.DROP_PADDING_BYTE]: [buffer] holds real, [format]-native-depth content
+     * left-shift-padded into a wider 4-byte container (see the enum's own doc comment) -- dropping
+     * the bottom (least-significant, zero) byte of each 4-byte little-endian sample is an exact,
+     * lossless recovery of the real value, no scaling or rounding needed, unlike the float path
+     * above (#67).
      *
      * Converts (and attempts to buffer) everything [buffer] currently offers in one call rather
      * than clamping up front to how much room [ringBuffer] actually has -- simpler, and this
@@ -601,10 +629,14 @@ class UsbAudioOutput(
      * on its next call, the same backpressure contract [write] already has for integer input.
      */
     override fun write(buffer: ByteBuffer, encodedAccessUnitCount: Int, presentationTimeUs: Long): Boolean {
-        if (!isFloatInput) {
-            val written = ringBuffer.write(buffer)
-            framesWritten += written / bytesPerFrame
-            return !buffer.hasRemaining()
+        when (inputConversion) {
+            InputConversion.NONE -> {
+                val written = ringBuffer.write(buffer)
+                framesWritten += written / bytesPerFrame
+                return !buffer.hasRemaining()
+            }
+            InputConversion.DROP_PADDING_BYTE -> return writeDroppingPaddingByte(buffer)
+            InputConversion.FLOAT_TO_INT -> {}
         }
 
         val subslot = format.subslotSize
@@ -648,6 +680,44 @@ class UsbAudioOutput(
         buffer.position(pos + consumedFloats * 4)
         framesWritten += consumedFloats / channels
         return consumedFloats == availableFloats
+    }
+
+    /**
+     * [buffer] holds [format]'s real content padded into a 4-byte-per-sample container, real
+     * bits at the top, zero-padding at the bottom (little-endian byte 0) -- see
+     * [InputConversion.DROP_PADDING_BYTE]'s doc comment. Dropping the bottom
+     * `4 - format.subslotSize` bytes of each 4-byte sample recovers the real value exactly: no
+     * scaling, rounding, or clamping needed, unlike [write]'s float path.
+     */
+    private fun writeDroppingPaddingByte(buffer: ByteBuffer): Boolean {
+        val subslot = format.subslotSize
+        val padding = 4 - subslot
+        val pos = buffer.position()
+        val limit = buffer.limit()
+        val availableSamples = (limit - pos) / 4
+        if (availableSamples == 0) return true
+
+        val neededBytes = availableSamples * subslot
+        if (paddingDropBuffer.size < neededBytes) {
+            paddingDropBuffer = ByteArray(neededBytes)
+        }
+
+        var outIdx = 0
+        for (i in 0 until availableSamples) {
+            val inOffset = pos + i * 4 + padding
+            for (b in 0 until subslot) {
+                paddingDropBuffer[outIdx + b] = buffer.get(inOffset + b)
+            }
+            outIdx += subslot
+        }
+
+        val writtenBytes = ringBuffer.write(ByteBuffer.wrap(paddingDropBuffer, 0, neededBytes))
+        // Same backpressure contract as the plain and float paths above -- only samples that
+        // genuinely made it into ringBuffer are marked consumed.
+        val consumedSamples = writtenBytes / subslot
+        buffer.position(pos + consumedSamples * 4)
+        framesWritten += consumedSamples / channels
+        return consumedSamples == availableSamples
     }
 
     override fun flush() {

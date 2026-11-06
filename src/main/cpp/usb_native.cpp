@@ -465,7 +465,16 @@ Java_org_ostrichbat2k_usbdac_streaming_UsbNative_reapIso(JNIEnv* /*env*/, jobjec
 // later in this same file).
 static void discardAllUrbs(IsoStream* stream) {
     for (int i = 0; i < stream->numUrbs; i++) {
-        ioctl(stream->fd, USBDEVFS_DISCARDURB, stream->urbs[i]);
+        if (ioctl(stream->fd, USBDEVFS_DISCARDURB, stream->urbs[i]) != 0) {
+            // EINVAL/ENOENT are expected here, not failures: a given URB may have already
+            // completed, already been discarded by an earlier pass, or never been submitted at
+            // all. Suppressing only those two keeps a genuinely unexpected error (e.g. the
+            // device actually gone) visible instead of silently swallowed -- see #76/#68's own
+            // caution around diagnosing why a stream failed to tear down cleanly.
+            if (errno != EINVAL && errno != ENOENT) {
+                LOGE("DISCARDURB failed for urb %d: errno=%d", i, errno);
+            }
+        }
     }
 }
 

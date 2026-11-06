@@ -29,6 +29,19 @@ Devices tested against: a FiiO Snowsky Tiny A (UAC2), a generic "AB13X USB
 Audio" dongle (UAC1, 8000/48000 Hz only), and wired EarPods presenting a
 UAC3 interface.
 
+## Versioning
+
+This project is **pre-1.0**: it follows no formal semver guarantee yet, and
+a breaking API change may land between tags without a major-version bump.
+If you depend on this via JitPack, pin to an exact tag or commit
+(`com.github.ostrichbat2k:libusbdac:<tag-or-sha>`) rather than a version
+range. See [CHANGELOG.md](CHANGELOG.md) for what changed between releases,
+including unreleased changes on `master`.
+
+Going-forward policy (informal, until 1.0): a `0.x` bump may break the
+public API; reaching `1.0` is this project's commitment to semver from
+then on.
+
 ## Features
 
 - UAC 1.0, 2.0, and 3.0 descriptor parsing (clock sources/entities,

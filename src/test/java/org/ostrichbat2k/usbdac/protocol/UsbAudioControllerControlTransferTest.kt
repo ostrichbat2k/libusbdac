@@ -188,7 +188,7 @@ class UsbAudioControllerControlTransferTest {
     fun `getMute and setMute are no-ops with no Feature Unit`() {
         val session = fakeSession(topology(outputFeatureUnitId = -1))
         assertNull(UsbAudioController.getMute(session))
-        assertFalse(UsbAudioController.setMute(session, true))
+        assertEquals(UsbAudioController.ControlWriteOutcome.Unsupported, UsbAudioController.setMute(session, true))
         verify(exactly = 0) { session.connection.controlTransfer(any(), any(), any(), any(), any(), any(), any()) }
     }
 
@@ -206,14 +206,18 @@ class UsbAudioControllerControlTransferTest {
         every {
             session.connection.controlTransfer(0x21, 0x01, 0x0100, 0x0300, match<ByteArray> { it.contentEquals(byteArrayOf(1)) }, 1, 1000)
         } returns 1
-        assertTrue(UsbAudioController.setMute(session, muted = true, channel = 0))
+        assertEquals(
+            UsbAudioController.ControlWriteOutcome.Success,
+            UsbAudioController.setMute(session, muted = true, channel = 0))
     }
 
     @Test
     fun `setMute addresses the requested channel in the low byte of wValue`() {
         val session = fakeSession(topology(outputFeatureUnitId = 3), controlInterfaceId = 0)
         every { session.connection.controlTransfer(0x21, 0x01, 0x0102, 0x0300, any(), any(), any()) } returns 1
-        assertTrue(UsbAudioController.setMute(session, muted = false, channel = 2))
+        assertEquals(
+            UsbAudioController.ControlWriteOutcome.Success,
+            UsbAudioController.setMute(session, muted = false, channel = 2))
     }
 
     // ---- volume ----
@@ -233,7 +237,9 @@ class UsbAudioControllerControlTransferTest {
             session.connection.controlTransfer(
                 0x21, 0x01, 0x0200, 0x0300, match<ByteArray> { it.contentEquals(byteArrayOf(0x00, 0xEF.toByte())) }, 2, 1000)
         } returns 2
-        assertTrue(UsbAudioController.setVolume(session, value = -4352, channel = 0))
+        assertEquals(
+            UsbAudioController.ControlWriteOutcome.Success,
+            UsbAudioController.setVolume(session, value = -4352, channel = 0))
     }
 
     @Test
@@ -265,7 +271,10 @@ class UsbAudioControllerControlTransferTest {
     fun `setMixerGain writes the pair at the same address getMixerGain reads from`() {
         val session = fakeSession(controlInterfaceId = 0)
         every { session.connection.controlTransfer(0x21, 0x01, 0x0301, 0x0700, any(), any(), any()) } returns 2
-        assertTrue(UsbAudioController.setMixerGain(session, mixerUnitId = 7, inputChannel = 3, outputChannel = 1, value = -256))
+        assertEquals(
+            UsbAudioController.ControlWriteOutcome.Success,
+            UsbAudioController.setMixerGain(
+                session, mixerUnitId = 7, inputChannel = 3, outputChannel = 1, value = -256))
     }
 
     @Test
@@ -360,7 +369,7 @@ class UsbAudioControllerControlTransferTest {
             )
         every { session.connection.setInterface(altInterface) } returns true
 
-        assertTrue(UsbAudioController.selectFormat(session, format))
+        assertEquals(UsbAudioController.ControlWriteOutcome.Success, UsbAudioController.selectFormat(session, format))
     }
 
     @Test
@@ -377,7 +386,8 @@ class UsbAudioControllerControlTransferTest {
             )
         val session = fakeSession()
 
-        assertFalse(UsbAudioController.selectFormat(session, format))
+        assertEquals(
+            UsbAudioController.ControlWriteOutcome.Unsupported, UsbAudioController.selectFormat(session, format))
         verify(exactly = 0) { session.connection.setInterface(any()) }
     }
 }

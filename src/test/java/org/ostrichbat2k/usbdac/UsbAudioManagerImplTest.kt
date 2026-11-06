@@ -25,7 +25,10 @@ import android.hardware.usb.UsbManager
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import io.mockk.every
+import io.mockk.justRun
 import io.mockk.mockk
+import io.mockk.mockkObject
+import io.mockk.unmockkObject
 import io.mockk.verify
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.runBlocking
@@ -42,6 +45,7 @@ import org.ostrichbat2k.usbdac.discovery.UsbDeviceDiscovery
 import org.ostrichbat2k.usbdac.protocol.SyncType
 import org.ostrichbat2k.usbdac.protocol.UacPlaybackTopology
 import org.ostrichbat2k.usbdac.protocol.UacStreamFormat
+import org.ostrichbat2k.usbdac.protocol.UsbAudioController
 import org.ostrichbat2k.usbdac.protocol.UsbAudioSession
 
 /**
@@ -599,6 +603,69 @@ class UsbAudioManagerImplTest {
     @Test
     fun `requestClaim fails with no active session`() {
         org.junit.jupiter.api.Assertions.assertEquals(UsbAudioManager.ClaimOutcome.FAILED, manager.requestClaim())
+    }
+
+    @Test
+    fun `interfaceClaimed is false with no session, stays false right after activation, true once requestClaim succeeds`() {
+        assertFalse(manager.interfaceClaimed.value)
+
+        val device = fakeDevice()
+        every { dacActivator.activate(device) } returns UsbDacActivator.Result(fakeSession(device), testFormat, 44100)
+        devicesFlow.value = listOf(UsbAudioDevice(device, hasPermission = true))
+        manager.triggerActivation()
+        runBlocking { manager.awaitActivation() }
+        // activateDac() deliberately hands the interface straight back to HAL right after
+        // activation (see its own doc comment) -- nothing's actually claimed again until real
+        // playback starts.
+        assertFalse(manager.interfaceClaimed.value)
+
+        mockkObject(UsbAudioController)
+        try {
+            every { UsbAudioController.reclaimFromKernel(any()) } returns true
+            manager.requestClaim()
+        } finally {
+            unmockkObject(UsbAudioController)
+        }
+
+        assertTrue(manager.interfaceClaimed.value)
+    }
+
+    @Test
+    fun `setManualClaim(false) releases a claim taken via requestClaim`() {
+        val device = fakeDevice()
+        every { dacActivator.activate(device) } returns UsbDacActivator.Result(fakeSession(device), testFormat, 44100)
+        devicesFlow.value = listOf(UsbAudioDevice(device, hasPermission = true))
+        manager.triggerActivation()
+        runBlocking { manager.awaitActivation() }
+
+        mockkObject(UsbAudioController)
+        try {
+            every { UsbAudioController.reclaimFromKernel(any()) } returns true
+            manager.requestClaim()
+            assertTrue(manager.interfaceClaimed.value)
+
+            // releaseClaim's HAL-handoff prep, same reasoning as UsbClaimControllerImplTest's own
+            // releaseClaim tests -- here it runs for real (UsbVolumeControllerImpl isn't
+            // injectable on this class), so its UsbAudioController calls need stubbing too.
+            every { UsbAudioController.setMute(any(), any()) } returns true
+            every { UsbAudioController.getVolumeRange(any(), any()) } returns null
+            justRun { UsbAudioController.releaseToKernel(any()) }
+
+            manager.setManualClaim(false)
+            manager.awaitClaimSettledForTest()
+
+            assertFalse(manager.interfaceClaimed.value)
+        } finally {
+            unmockkObject(UsbAudioController)
+        }
+    }
+
+    @Test
+    fun `setManualClaim(true) is a safe no-op with no active session`() {
+        manager.setManualClaim(true)
+        manager.awaitClaimSettledForTest()
+
+        assertFalse(manager.interfaceClaimed.value)
     }
 
     @Test

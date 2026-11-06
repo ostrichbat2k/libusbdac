@@ -59,6 +59,8 @@ import android.media.AudioManager
 import android.os.Build
 import androidx.media3.exoplayer.audio.AudioSink
 import androidx.media3.exoplayer.audio.DefaultAudioSink
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -319,10 +321,17 @@ class UsbAudioManagerImpl(
         joinActivationThreadForTest()
         claimController.shutdownExecutorForTest()
         controlWriter.shutdownExecutorForTest()
+        manualClaimExecutor.shutdownNow()
     }
 
-    /** Test-only, no production caller -- see [UsbClaimControllerImpl.awaitClaimSchedulerIdleForTest]. */
+    /**
+     * Test-only, no production caller. Drains [manualClaimExecutor] first -- [setManualClaim]
+     * dispatches there before ever touching [claimController] -- then
+     * [UsbClaimControllerImpl.awaitClaimSchedulerIdleForTest] so a `setManualClaim`-triggered
+     * [releaseClaim]'s own further scheduling has settled too.
+     */
     internal fun awaitClaimSettledForTest() {
+        manualClaimExecutor.submit {}.get(DRAIN_TIMEOUT_SECONDS_FOR_TEST, TimeUnit.SECONDS)
         claimController.awaitClaimSchedulerIdleForTest()
     }
 
@@ -352,6 +361,31 @@ class UsbAudioManagerImpl(
     // that used to lean on them now spell out all three arguments explicitly.
     override fun releaseClaim(delayMs: Long, awaitAndroidTakeover: Boolean, deactivateOnTimeout: Boolean) {
         claimController.releaseClaim(delayMs, awaitAndroidTakeover, deactivateOnTimeout)
+    }
+
+    override val interfaceClaimed: StateFlow<Boolean> = claimController.claimedState
+
+    // Dedicated, same reasoning as UsbControlWriterImpl.volumeExecutor: setManualClaim can block
+    // on real USB I/O (requestClaim always does; releaseClaim's awaitAndroidTakeover=true below
+    // does too) and is driven by a Settings UI toggle on the caller's own thread, which must not
+    // block on that round trip.
+    private val manualClaimExecutor =
+        Executors.newSingleThreadExecutor { r -> Thread(r, "UsbAudioManager-manualClaim").apply { isDaemon = true } }
+
+    override fun setManualClaim(claimed: Boolean) {
+        manualClaimExecutor.execute {
+            if (claimed) {
+                requestClaim()
+            } else {
+                // awaitAndroidTakeover=true: this call exists specifically so interfaceClaimed
+                // reflects reality once it flips, not just the intent to release -- see this
+                // function's own doc comment on UsbAudioManager. deactivateOnTimeout stays false:
+                // a manual release that doesn't get confirmed is still just a release, not a
+                // reason to tear down the whole session the way a track that genuinely needs HAL
+                // right now would.
+                releaseClaim(delayMs = 0, awaitAndroidTakeover = true, deactivateOnTimeout = false)
+            }
+        }
     }
 
     // In-memory only: which bit resolution to prefer when multiple formats are offered. Not
@@ -954,5 +988,11 @@ class UsbAudioManagerImpl(
     /** [UsbDacPreferences.Listener] callback: see [blockPlayback]'s doc comment. */
     override fun onBitPerfectModeChanged() {
         updateBlockPlayback()
+    }
+
+    private companion object {
+        // Generous on purpose, same reasoning as UsbClaimControllerImpl's own identical constant
+        // -- never meant to trip in practice, just to fail loud instead of hanging a test suite.
+        const val DRAIN_TIMEOUT_SECONDS_FOR_TEST = 5L
     }
 }

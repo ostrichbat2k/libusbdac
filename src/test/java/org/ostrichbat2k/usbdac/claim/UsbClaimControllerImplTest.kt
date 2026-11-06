@@ -138,6 +138,31 @@ class UsbClaimControllerImplTest {
     }
 
     @Test
+    fun `claimedState mirrors isClaimed exactly, including through requestClaim and releaseClaim`() {
+        assertFalse(controller.claimedState.value)
+        controller.markAlreadyClaimed()
+        assertEquals(controller.isClaimed(), controller.claimedState.value)
+        assertTrue(controller.claimedState.value)
+
+        controller.markReleased()
+        assertEquals(controller.isClaimed(), controller.claimedState.value)
+        assertFalse(controller.claimedState.value)
+
+        val device = fakeDevice()
+        val session = fakeSession(device)
+        every { UsbAudioController.reclaimFromKernel(session) } returns true
+        controller.requestClaim(session)
+        assertEquals(controller.isClaimed(), controller.claimedState.value)
+        assertTrue(controller.claimedState.value)
+
+        stubAlreadyRecognized(device)
+        activeSession = session
+        controller.releaseClaim(delayMs = 0, awaitAndroidTakeover = false)
+        assertEquals(controller.isClaimed(), controller.claimedState.value)
+        assertFalse(controller.claimedState.value)
+    }
+
+    @Test
     fun `requestClaim returns ALREADY_CLAIMED without touching the device when already claimed`() {
         controller.markAlreadyClaimed()
         val result = controller.requestClaim(fakeSession())

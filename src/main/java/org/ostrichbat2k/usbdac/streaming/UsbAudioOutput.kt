@@ -589,11 +589,18 @@ class UsbAudioOutput(
                 stopStreamingThread()
                 activated = false
                 usbAudioManager.notifyStreamingStopped()
-                // Hand the interface back to Android after a short grace period (see
-                // UsbAudioManager.releaseClaim's doc comment) rather than immediately -- a quick
-                // pause/resume shouldn't pay the real hand-off cost, but genuinely leaving
-                // playback paused should free the device for every other app.
-                usbAudioManager.releaseClaim()
+                // Manual mode (#31): the user has opted out of the courtesy release entirely --
+                // the interface stays claimed, hardware state untouched, so a later resume hits
+                // the fast ALREADY_CLAIMED && hasConfiguredHardware path above instantly, with no
+                // relock needed since nothing forced its state in the meantime. The user decides
+                // whether to hand it back via usbAudioManager.setManualClaim(false) instead.
+                if (!usbSettings.manualReleaseControl) {
+                    // Hand the interface back to Android after a short grace period (see
+                    // UsbAudioManager.releaseClaim's doc comment) rather than immediately -- a
+                    // quick pause/resume shouldn't pay the real hand-off cost, but genuinely
+                    // leaving playback paused should free the device for every other app.
+                    usbAudioManager.releaseClaim()
+                }
             }
         }
     }

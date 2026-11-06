@@ -35,6 +35,7 @@ import org.ostrichbat2k.usbdac.protocol.UacPlaybackTopology
 import org.ostrichbat2k.usbdac.protocol.UacStreamFormat
 import org.ostrichbat2k.usbdac.protocol.UsbAudioController
 import org.ostrichbat2k.usbdac.protocol.UsbAudioSession
+import java.util.concurrent.atomic.AtomicInteger
 
 class UsbControlWriterImplTest {
 
@@ -90,8 +91,8 @@ class UsbControlWriterImplTest {
     private var activeFormat: UacStreamFormat? = format
     private var activeRateHz = 44100
     private var claimResult = ClaimOutcome.RECLAIMED
-    private var requestClaimCalls = 0
-    private var releaseClaimCalls = 0
+    private val requestClaimCalls = AtomicInteger(0)
+    private val releaseClaimCalls = AtomicInteger(0)
     private var controlState: UsbControlState? = null
     private val publishedStates = mutableListOf<UsbControlState?>()
     private val loggedEvents = mutableListOf<String>()
@@ -106,8 +107,8 @@ class UsbControlWriterImplTest {
         activeFormat = format
         activeRateHz = 44100
         claimResult = ClaimOutcome.RECLAIMED
-        requestClaimCalls = 0
-        releaseClaimCalls = 0
+        requestClaimCalls.set(0)
+        releaseClaimCalls.set(0)
         controlState = null
         publishedStates.clear()
 
@@ -118,8 +119,8 @@ class UsbControlWriterImplTest {
                 getActiveSession = { activeSession },
                 getActiveFormat = { activeFormat },
                 getActiveRateHz = { activeRateHz },
-                requestClaim = { requestClaimCalls++; claimResult },
-                releaseClaim = { releaseClaimCalls++ },
+                requestClaim = { requestClaimCalls.incrementAndGet(); claimResult },
+                releaseClaim = { releaseClaimCalls.incrementAndGet() },
                 getControlState = { controlState },
                 publishControlState = { controlState = it; publishedStates += it },
                 log = { loggedEvents += it },
@@ -132,6 +133,20 @@ class UsbControlWriterImplTest {
         // still-pending volume write can fire during a later, unrelated test class's run.
         writer.shutdownExecutorForTest()
         unmockkObject(UsbAudioController)
+    }
+
+    /**
+     * [releaseClaimCalls] is incremented by the writer's background volume-write executor thread,
+     * not a mock -- so it can't be awaited with MockK's `verify(timeout = ...)`. Poll it instead of
+     * asserting synchronously: the write that increments it can still be in flight on the executor
+     * thread even after every mock interaction before it has been observed.
+     */
+    private fun awaitReleaseClaimCalls(expected: Int, timeoutMs: Long = 1000) {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (releaseClaimCalls.get() != expected && System.currentTimeMillis() < deadline) {
+            Thread.sleep(10)
+        }
+        assertEquals(expected, releaseClaimCalls.get())
     }
 
     // ---- refreshControlState ----
@@ -242,7 +257,7 @@ class UsbControlWriterImplTest {
         activeSession = null
         writer.setMuted(true)
         verify(exactly = 0) { UsbAudioController.setMute(any(), any()) }
-        assertEquals(0, requestClaimCalls)
+        assertEquals(0, requestClaimCalls.get())
     }
 
     @Test
@@ -261,7 +276,7 @@ class UsbControlWriterImplTest {
         writer.setMuted(true)
 
         verify(exactly = 0) { UsbAudioController.setMute(any(), any()) }
-        assertEquals(0, releaseClaimCalls)
+        assertEquals(0, releaseClaimCalls.get())
     }
 
     @Test
@@ -277,8 +292,8 @@ class UsbControlWriterImplTest {
             UsbAudioController.setMute(session, true)
             UsbAudioController.getMute(session)
         }
-        assertEquals(1, requestClaimCalls)
-        assertEquals(1, releaseClaimCalls)
+        assertEquals(1, requestClaimCalls.get())
+        assertEquals(1, releaseClaimCalls.get())
         assertEquals("Test DAC", publishedStates.last()!!.deviceName)
     }
 
@@ -329,7 +344,7 @@ class UsbControlWriterImplTest {
         verify(timeout = 1000) { UsbAudioController.setVolume(session, -10, 1) }
         verify(timeout = 1000) { UsbAudioController.setVolume(session, -10, 2) }
         verify(timeout = 1000) { UsbAudioController.getMute(session) } // refreshControlState ran
-        assertEquals(1, releaseClaimCalls)
+        awaitReleaseClaimCalls(1)
     }
 
     @Test
@@ -377,7 +392,7 @@ class UsbControlWriterImplTest {
         activeSession = fakeSession(topology(mixerUnitId = -1))
         writer.setMixerGain(1, 1, -6)
         verify(exactly = 0) { UsbAudioController.setMixerGain(any(), any(), any(), any(), any()) }
-        assertEquals(0, requestClaimCalls)
+        assertEquals(0, requestClaimCalls.get())
     }
 
     @Test
@@ -400,6 +415,6 @@ class UsbControlWriterImplTest {
         writer.setMixerGain(1, 2, -6)
 
         verify { UsbAudioController.setMixerGain(session, 5, 1, 2, -6) }
-        assertEquals(1, releaseClaimCalls)
+        assertEquals(1, releaseClaimCalls.get())
     }
 }

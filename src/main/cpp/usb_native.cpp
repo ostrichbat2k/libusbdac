@@ -27,6 +27,7 @@
 // leaving it in the "no driver bound, nothing claimed" state that proc_setconfig requires.
 
 #include <android/log.h>
+#include <atomic>
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
@@ -108,6 +109,12 @@ struct IsoStream {
     int numUrbs;
     unsigned int bufferLength;
     struct usbdevfs_urb** urbs;
+    // Cumulative across this stream's whole lifetime, written by reapIso() on the streaming
+    // thread and read by getPacketErrorStats() -- plausibly from a different thread (a host
+    // diagnostics screen's own refresh timer), so these need to be atomic, not plain counters.
+    // See #78: exposes processReapedUrb's per-URB packet scan beyond just a logcat line.
+    std::atomic<int64_t> cumulativeBadPackets{0};
+    std::atomic<int64_t> cumulativeShortBytes{0};
 };
 
 // Sane ceilings on caller-supplied sizes. Real usage (see UsbAudioOutput.kt/IsoPacketScheduler.kt)
@@ -361,7 +368,8 @@ Java_org_ostrichbat2k_usbdac_streaming_UsbNative_submitIso(
 // usbdevfs_urb, without a real USB device ever completing one for real (see
 // native-test/usb_native_test.cpp). External linkage (no `static`/anonymous namespace) so that
 // test binary can call it directly.
-int processReapedUrb(const struct usbdevfs_urb* reaped, int packetsPerUrb, int numUrbs) {  // NOLINT(bugprone-easily-swappable-parameters)
+int processReapedUrb(const struct usbdevfs_urb* reaped, int packetsPerUrb, int numUrbs,  // NOLINT(bugprone-easily-swappable-parameters)
+                      int* badPacketsOut = nullptr, int64_t* shortBytesOut = nullptr) {
     if (reaped->status != 0) {
         LOGE("Reaped urb slot %ld with status=%d actual_length=%d",
              (long) (intptr_t) reaped->usercontext, reaped->status, reaped->actual_length);
@@ -404,6 +412,8 @@ int processReapedUrb(const struct usbdevfs_urb* reaped, int packetsPerUrb, int n
              (long) (intptr_t) reaped->usercontext, badPackets, reaped->number_of_packets,
              totalActual, totalExpected);
     }
+    if (badPacketsOut) *badPacketsOut = badPackets;
+    if (shortBytesOut) *shortBytesOut = (int64_t) totalExpected - (int64_t) totalActual;
 
     intptr_t slot = (intptr_t) reaped->usercontext;
     if (slot < 0 || slot >= numUrbs) {
@@ -461,7 +471,30 @@ Java_org_ostrichbat2k_usbdac_streaming_UsbNative_reapIso(JNIEnv* /*env*/, jobjec
         LOGE("REAPURB succeeded but returned a null urb");
         return kReapErrorFatal;
     }
-    return (jint) processReapedUrb(reaped, stream->packetsPerUrb, stream->numUrbs);
+    int badPackets = 0;
+    int64_t shortBytes = 0;
+    int slot = processReapedUrb(reaped, stream->packetsPerUrb, stream->numUrbs, &badPackets, &shortBytes);
+    if (badPackets > 0) {
+        stream->cumulativeBadPackets.fetch_add(badPackets, std::memory_order_relaxed);
+        stream->cumulativeShortBytes.fetch_add(shortBytes, std::memory_order_relaxed);
+    }
+    return (jint) slot;
+}
+
+// See #78: lets a host diagnostics screen tell "occasional dropped USB packets" apart from
+// decoder underrun/ring-buffer-starved glitches, which otherwise look identical above a logcat
+// line. Returns {0, 0} for an unknown/already-closed handle, same as every other getter here.
+extern "C" JNIEXPORT jlongArray JNICALL
+Java_org_ostrichbat2k_usbdac_streaming_UsbNative_getPacketErrorStats(
+        JNIEnv* env, jobject /*thiz*/, jlong handle) {
+    jlongArray result = env->NewLongArray(2);
+    IsoStream* stream = lookupStream(handle);
+    if (!stream || !result) return result;
+    jlong stats[2] = {
+        (jlong) stream->cumulativeBadPackets.load(std::memory_order_relaxed),
+        (jlong) stream->cumulativeShortBytes.load(std::memory_order_relaxed)};
+    env->SetLongArrayRegion(result, 0, 2, stats);
+    return result;
 }
 
 // Shared by cancelIso() and closeIsoStream() -- both need every outstanding URB discarded

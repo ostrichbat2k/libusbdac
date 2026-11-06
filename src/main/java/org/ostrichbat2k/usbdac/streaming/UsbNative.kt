@@ -80,6 +80,14 @@ object UsbNative {
     const val REAP_ERROR_FATAL = -2
 
     /**
+     * Cumulative since [openIsoStream], as `[badPacketCount, shortBytesCount]` --
+     * processReapedUrb's own per-URB packet scan (usb_native.cpp), surfaced beyond just a logcat
+     * line (#78). `[0, 0]` for an unknown/already-closed handle. Safe to call from any thread --
+     * backed by native atomics, since the streaming thread writes these on every [reapIso] call.
+     */
+    external fun getPacketErrorStats(handle: Long): LongArray
+
+    /**
      * Cancels all outstanding URBs, unblocking any in-flight [reapIso] call on another thread.
      * Safe to call concurrently with [reapIso]/[submitIso]; always call this and join() the
      * thread using the stream *before* [closeIsoStream], not after.

@@ -195,6 +195,26 @@ interface UsbAudioManager : UsbDacPreferences.Listener {
     )
 
     /**
+     * Live counterpart of [requestClaim]/[releaseClaim]'s effect on who currently holds the raw
+     * interface -- for a host Settings UI's own on/off control when
+     * [UsbDacPreferences.manualReleaseControl] is on (#31), so it can show (and let the user
+     * change) whether the DAC is currently held by this app or handed to the kernel, instead of
+     * only ever finding out indirectly from whether playback works.
+     */
+    val interfaceClaimed: StateFlow<Boolean>
+
+    /**
+     * Manually claims ([claimed] = true) or releases ([claimed] = false) the interface, for the
+     * Settings UI toggle [manualReleaseControl][UsbDacPreferences.manualReleaseControl] exposes.
+     * Dispatched off the calling thread onto a background executor, same reasoning as
+     * [org.ostrichbat2k.usbdac.control.UsbControlWriter]'s own setters -- both directions can
+     * block on real USB I/O ([requestClaim] always does; the `false` branch awaits Android's own
+     * takeover verification so [interfaceClaimed] reflects reality by the time it flips, not just
+     * the intent to release).
+     */
+    fun setManualClaim(claimed: Boolean)
+
+    /**
      * True whenever a host UI's play control should hold off starting playback rather than let it
      * land on [PlaybackRoute.Fallback] purely because activation hasn't finished yet. False the
      * rest of the time, including whenever there's no DAC in the picture at all, so a host UI

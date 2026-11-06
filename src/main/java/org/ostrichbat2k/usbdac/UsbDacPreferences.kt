@@ -18,6 +18,7 @@
 
 package org.ostrichbat2k.usbdac
 
+import org.ostrichbat2k.usbdac.streaming.RoutingAudioSink
 import org.ostrichbat2k.usbdac.streaming.UsbAudioOutput
 /**
  * User configuration specific to direct USB DAC output. The host app provides its own
@@ -71,6 +72,20 @@ interface UsbDacPreferences {
     val volumeStepPercent: Int
 
     /**
+     * Whether [UsbAudioOutput.pause] should skip its automatic release-to-kernel entirely,
+     * leaving the interface claimed (hardware state untouched) until the user explicitly hands
+     * it back via [UsbAudioManager.setManualClaim]. `false` (Automatic, the default) is today's
+     * existing behavior: a pause releases the claim after a short grace period so Android's own
+     * USB audio HAL can use the device while idle. Does not affect
+     * [RoutingAudioSink.resolveForConfigure]'s forced-fallback release -- that release is
+     * required for a track that genuinely can't play on the DAC to be audible at all, not a
+     * courtesy release of idle time, so it always runs regardless of this setting. Switching this
+     * mid-session doesn't retroactively force a claim or release either way -- it only changes
+     * what the *next* [UsbAudioOutput.pause] call does.
+     */
+    val manualReleaseControl: Boolean
+
+    /**
      * Add a listener to be notified of settings changes.
      *
      * @param listener The listener to add.
@@ -96,6 +111,9 @@ interface UsbDacPreferences {
 
         /** Called when [volumeStepPercent] has changed. */
         fun onVolumeStepPercentChanged() {}
+
+        /** Called when [manualReleaseControl] has changed. */
+        fun onManualReleaseControlChanged() {}
     }
 
     companion object {

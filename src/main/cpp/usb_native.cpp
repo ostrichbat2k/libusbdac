@@ -87,9 +87,13 @@ Java_org_ostrichbat2k_usbdac_streaming_UsbNative_getUsbSpeed(JNIEnv* /*env*/, jo
 // the same uapi struct layout the kernel itself uses (linux/usbdevice_fs.h).
 //
 // Every device actually tested so far streams in *synchronous* isochronous mode (its
-// clock is locked to USB's own SOF timing, confirmed via descriptor parsing), so every
-// packet is exactly wMaxPacketSize bytes -- no per-packet size variation for clock-drift
-// compensation is needed. An Asynchronous device instead reports its own real
+// clock is locked to USB's own SOF timing, confirmed via descriptor parsing). Packet
+// length still varies packet-to-packet by design -- IsoPacketScheduler.kt distributes the
+// fractional samples-per-packet a non-integer sample rate implies (e.g. 44.1kHz needs 44
+// or 45 samples per 1ms packet) -- but that's nominal-rate rounding, not clock-drift
+// compensation: a Synchronous device's own clock already tracks USB's SOF timing exactly,
+// so no feedback-driven adjustment to that distribution is needed. An Asynchronous device
+// instead reports its own real
 // consumption rate back over a dedicated feedback endpoint (UAC 5.12.4.2); submitIsoRead/
 // readIsoSlotData below exist for that second, IN-direction stream (#25) -- opened via
 // the same openIsoStream, reaped via the same reapIso, cancelled/closed via the same

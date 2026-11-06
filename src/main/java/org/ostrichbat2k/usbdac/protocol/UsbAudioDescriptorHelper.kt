@@ -94,9 +94,6 @@ internal object UsbAudioDescriptorHelper {
 
     const val TERMINAL_USB_STREAMING = 0x0101
 
-    // USB Endpoint Descriptor bmAttributes synchronization-type field (bits 3:2).
-    const val SYNC_TYPE_ASYNC = 0x1
-
     /**
      * Shared by [UsbAudioDescriptorParserUac2.parseUac2Playback] and
      * [UsbAudioDescriptorParserUac3.parseUac3Playback]'s own `flushPendingFormat` closures: decides,
@@ -113,6 +110,11 @@ internal object UsbAudioDescriptorHelper {
      * wrongly recorded as non-PCM here instead of dropped entirely. UAC3's caller has no such flag
      * to track (it has nothing else from the walk to set it from) and passes `false` always, which
      * leaves its own non-PCM condition exactly as unrestricted as before this extraction.
+     *
+     * [feedbackEndpointAddress]/[feedbackMaxPacketSize]/[feedbackBInterval] (#25) are `-1`-
+     * sentineled like every other optional field here -- a [UacFeedbackEndpoint] is only built
+     * when the caller found a second, IN-direction endpoint in this same alt setting (see each
+     * parser's own `DESC_TYPE_ENDPOINT` handling).
      */
     fun recordPendingFormat(
         interfaceNumber: Int,
@@ -129,6 +131,9 @@ internal object UsbAudioDescriptorHelper {
         isRawData: Boolean,
         formatsByInterface: MutableMap<Int, MutableList<UacStreamFormat>>,
         nonPcmFormatsByInterface: MutableMap<Int, MutableList<UacNonPcmFormat>>,
+        feedbackEndpointAddress: Int = -1,
+        feedbackMaxPacketSize: Int = -1,
+        feedbackBInterval: Int = -1,
     ) {
         if (altSetting < 0 || endpointAddress < 0) return
         if (bitResolution > 0) {
@@ -142,8 +147,17 @@ internal object UsbAudioDescriptorHelper {
                         clusterDescriptorId = clusterDescriptorId,
                         endpointAddress = endpointAddress,
                         maxPacketSize = maxPacketSize,
-                        isAsync = endpointSync == SYNC_TYPE_ASYNC,
-                        bInterval = bInterval.takeIf { it > 0 } ?: 1))
+                        syncType = SyncType.fromBits(endpointSync),
+                        bInterval = bInterval.takeIf { it > 0 } ?: 1,
+                        feedbackEndpoint =
+                            if (feedbackEndpointAddress >= 0) {
+                                UacFeedbackEndpoint(
+                                    address = feedbackEndpointAddress,
+                                    maxPacketSize = feedbackMaxPacketSize,
+                                    bInterval = feedbackBInterval.takeIf { it > 0 } ?: 1)
+                            } else {
+                                null
+                            }))
         } else if (isTerminalLinked && !isDeclaredPcm) {
             // A real alt setting on our own streaming interface (not some other, e.g. capture,
             // interface that merely shares this AudioStreaming subclass/protocol) -- just not one

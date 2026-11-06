@@ -19,6 +19,41 @@
 package org.ostrichbat2k.usbdac.protocol
 
 import org.ostrichbat2k.usbdac.UsbAudioManager
+
+/**
+ * The USB Audio Class endpoint descriptor's Synchronization Type field (`bmAttributes` bits
+ * 3:2) -- four real, distinct values, not the binary "Asynchronous or not" this codebase
+ * collapsed it to before #25. A Synchronous device locks its own clock to USB SOF and has no
+ * say in timing; an Adaptive device instead adjusts its *own* internal buffering/clock against
+ * the host-paced incoming rate, with no dedicated feedback endpoint; an Asynchronous device runs
+ * a free-running master clock and reports its real consumption rate back over a dedicated
+ * feedback endpoint (see [UacFeedbackEndpoint]) -- the host must track that real rate, not the
+ * nominal one, or risk slow buffer drift. Every device tested so far is [SYNCHRONOUS].
+ */
+enum class SyncType {
+    NONE,
+    ASYNC,
+    ADAPTIVE,
+    SYNCHRONOUS;
+
+    companion object {
+        /** [bits] is `bmAttributes` bits 3:2, always pre-masked to 0-3 by every caller. */
+        fun fromBits(bits: Int): SyncType = entries[bits]
+    }
+}
+
+/**
+ * An Asynchronous device's dedicated feedback endpoint (UAC 5.12.4.2) -- a second, IN-direction
+ * isochronous endpoint in the same alt setting as the main OUT data endpoint, over which the
+ * device periodically reports its own real sample-consumption rate as a fixed-point value (see
+ * [org.ostrichbat2k.usbdac.streaming.FeedbackRateDecoder]). Only ever populated when the
+ * descriptor walk actually found a second, IN-direction endpoint in this alt setting --
+ * independent of [UacStreamFormat.syncType] saying [SyncType.ASYNC], since a confused or
+ * malformed device could decode either without the other; [UsbAudioOutput] is the one place
+ * that requires both together before opening a feedback stream.
+ */
+data class UacFeedbackEndpoint(val address: Int, val maxPacketSize: Int, val bInterval: Int)
+
 /** One selectable PCM format on a UAC streaming interface: one alternate setting. */
 data class UacStreamFormat(
     val alternateSetting: Int,
@@ -27,7 +62,8 @@ data class UacStreamFormat(
     val clusterDescriptorId: Int,
     val endpointAddress: Int,
     val maxPacketSize: Int,
-    val isAsync: Boolean,
+    /** Defaults to the historically-assumed value -- every device tested so far is this. */
+    val syncType: SyncType = SyncType.SYNCHRONOUS,
     /**
      * UAC 1.0 only: the sample rate(s) this format's FORMAT_TYPE descriptor declares directly
      * (empty for UAC 2.0/3.0, which negotiate rate through [UacPlaybackTopology.clockSourceId]
@@ -44,6 +80,8 @@ data class UacStreamFormat(
      * speed alone.
      */
     val bInterval: Int = 1,
+    /** See [UacFeedbackEndpoint]. Null unless the descriptor walk found one (#25). */
+    val feedbackEndpoint: UacFeedbackEndpoint? = null,
 )
 
 /**

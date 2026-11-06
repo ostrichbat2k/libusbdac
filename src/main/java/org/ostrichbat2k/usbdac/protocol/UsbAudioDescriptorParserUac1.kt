@@ -29,7 +29,6 @@ import org.ostrichbat2k.usbdac.protocol.UsbAudioDescriptorHelper.DESC_TYPE_CONFI
 import org.ostrichbat2k.usbdac.protocol.UsbAudioDescriptorHelper.DESC_TYPE_CS_INTERFACE
 import org.ostrichbat2k.usbdac.protocol.UsbAudioDescriptorHelper.DESC_TYPE_ENDPOINT
 import org.ostrichbat2k.usbdac.protocol.UsbAudioDescriptorHelper.DESC_TYPE_INTERFACE
-import org.ostrichbat2k.usbdac.protocol.UsbAudioDescriptorHelper.SYNC_TYPE_ASYNC
 import org.ostrichbat2k.usbdac.protocol.UsbAudioDescriptorHelper.TERMINAL_USB_STREAMING
 import org.ostrichbat2k.usbdac.protocol.UsbAudioDescriptorHelper.UAC1_PROTOCOL
 import org.ostrichbat2k.usbdac.protocol.UsbAudioDescriptorHelper.walk
@@ -84,6 +83,20 @@ internal object UsbAudioDescriptorParserUac1 {
         var pendingEndpointSync = -1
         var pendingMaxPacketSize = -1
         var pendingBInterval = -1
+        // A second, IN-direction endpoint seen in this same alt setting -- the feedback endpoint
+        // (UAC 5.12.4.2) on an Asynchronous device, never the main (always OUT) data endpoint
+        // above (#25).
+        var pendingFeedbackAddress = -1
+        var pendingFeedbackMaxPacketSize = -1
+        var pendingFeedbackBInterval = -1
+        // UAC 1.0's extended (9-byte) endpoint descriptor's own bSynchAddress (offset 8) --
+        // present only when the main endpoint's own descriptor was the full 9 bytes, which the
+        // DESC_TYPE_ENDPOINT branch below only sets when that's true. Used purely as a logged
+        // cross-check against the direction-discovered pendingFeedbackAddress above, never as
+        // the sole resolution mechanism -- UAC 2.0/3.0 have no such field at all (reverted to the
+        // plain 7-byte descriptor), so direction has to be the one mechanism that works for all
+        // three UAC versions.
+        var pendingDeclaredSynchAddress = -1
         var pendingBitResolution = -1
         var pendingSubslotSize = -1
         var pendingSampleRates = emptyList<Int>()
@@ -91,6 +104,12 @@ internal object UsbAudioDescriptorParserUac1 {
 
         fun flushPendingFormat(interfaceNumber: Int) {
             if (pendingAltSetting >= 0 && pendingEndpointAddress >= 0 && pendingBitResolution > 0) {
+                if (pendingDeclaredSynchAddress >= 0 && pendingDeclaredSynchAddress != pendingFeedbackAddress) {
+                    L.w(
+                        "UAC1 bSynchAddress ($pendingDeclaredSynchAddress) disagrees with the " +
+                            "IN endpoint actually found (${pendingFeedbackAddress.takeIf { it >= 0 } ?: "none"}) " +
+                            "on alt setting $pendingAltSetting -- trusting direction, not bSynchAddress")
+                }
                 formatsByInterface
                     .getOrPut(interfaceNumber) { mutableListOf() }
                     .add(
@@ -101,15 +120,28 @@ internal object UsbAudioDescriptorParserUac1 {
                             clusterDescriptorId = -1,
                             endpointAddress = pendingEndpointAddress,
                             maxPacketSize = pendingMaxPacketSize,
-                            isAsync = pendingEndpointSync == SYNC_TYPE_ASYNC,
+                            syncType = SyncType.fromBits(pendingEndpointSync),
                             sampleRates = pendingSampleRates,
-                            bInterval = pendingBInterval.takeIf { it > 0 } ?: 1))
+                            bInterval = pendingBInterval.takeIf { it > 0 } ?: 1,
+                            feedbackEndpoint =
+                                if (pendingFeedbackAddress >= 0) {
+                                    UacFeedbackEndpoint(
+                                        address = pendingFeedbackAddress,
+                                        maxPacketSize = pendingFeedbackMaxPacketSize,
+                                        bInterval = pendingFeedbackBInterval.takeIf { it > 0 } ?: 1)
+                                } else {
+                                    null
+                                }))
             }
             pendingAltSetting = -1
             pendingEndpointAddress = -1
             pendingEndpointSync = -1
             pendingMaxPacketSize = -1
             pendingBInterval = -1
+            pendingFeedbackAddress = -1
+            pendingFeedbackMaxPacketSize = -1
+            pendingFeedbackBInterval = -1
+            pendingDeclaredSynchAddress = -1
             pendingBitResolution = -1
             pendingSubslotSize = -1
             pendingSampleRates = emptyList()
@@ -202,11 +234,31 @@ internal object UsbAudioDescriptorParserUac1 {
                 }
                 DESC_TYPE_ENDPOINT -> {
                     if (currentInterfaceNumber == streamingInterfaceNumber) {
-                        pendingEndpointAddress = bytes.u8(2)
+                        val address = bytes.u8(2)
                         val attributes = bytes.u8(3)
-                        pendingEndpointSync = (attributes shr 2) and 0x3
-                        pendingMaxPacketSize = bytes.u16(4)
-                        pendingBInterval = bytes.u8(6)
+                        val maxPacketSize = bytes.u16(4)
+                        val bInterval = bytes.u8(6)
+                        if (address and UsbConstants.USB_DIR_IN == 0) {
+                            // OUT -- this library only ever streams playback, so the main data
+                            // endpoint is always OUT; see pendingFeedbackAddress's doc comment.
+                            pendingEndpointAddress = address
+                            pendingEndpointSync = (attributes shr 2) and 0x3
+                            pendingMaxPacketSize = maxPacketSize
+                            pendingBInterval = bInterval
+                            // bSynchAddress only exists on UAC 1.0's extended 9-byte endpoint
+                            // descriptor (offset 8) -- bRefresh (offset 7) comes first.
+                            if (bytes.size >= 9) {
+                                pendingDeclaredSynchAddress = bytes.u8(8)
+                            }
+                        } else if (pendingFeedbackAddress < 0) {
+                            pendingFeedbackAddress = address
+                            pendingFeedbackMaxPacketSize = maxPacketSize
+                            pendingFeedbackBInterval = bInterval
+                        } else {
+                            L.w(
+                                "Unexpected second IN endpoint ($address) in interface " +
+                                    "$currentInterfaceNumber alt setting $currentAltSetting -- ignoring")
+                        }
                     }
                 }
             }

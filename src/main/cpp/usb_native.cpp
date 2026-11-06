@@ -86,10 +86,16 @@ Java_org_ostrichbat2k_usbdac_streaming_UsbNative_getUsbSpeed(JNIEnv* /*env*/, jo
 // all, so this submits/reaps USBDEVFS_URB_TYPE_ISO urbs directly via ioctl, built from
 // the same uapi struct layout the kernel itself uses (linux/usbdevice_fs.h).
 //
-// This device streams in *synchronous* isochronous mode (its clock is locked to USB's
-// own SOF timing, confirmed via descriptor parsing), so every packet is exactly
-// wMaxPacketSize bytes -- no per-packet size variation for clock-drift compensation is
-// needed, unlike asynchronous/adaptive mode.
+// Every device actually tested so far streams in *synchronous* isochronous mode (its
+// clock is locked to USB's own SOF timing, confirmed via descriptor parsing), so every
+// packet is exactly wMaxPacketSize bytes -- no per-packet size variation for clock-drift
+// compensation is needed. An Asynchronous device instead reports its own real
+// consumption rate back over a dedicated feedback endpoint (UAC 5.12.4.2); submitIsoRead/
+// readIsoSlotData below exist for that second, IN-direction stream (#25) -- opened via
+// the same openIsoStream, reaped via the same reapIso, cancelled/closed via the same
+// cancelIso/closeIsoStream as the main OUT data stream, since none of those four care
+// which direction a given handle's endpoint is. Only submission (this comment's whole
+// point) and result-readback differ enough to need their own entry points.
 
 struct IsoStream {
     int fd;
@@ -508,4 +514,92 @@ Java_org_ostrichbat2k_usbdac_streaming_UsbNative_closeIsoStream(JNIEnv* /*env*/,
         // Drain whatever the kernel still has queued so it can free its own bookkeeping.
     }
     freeStream(stream);
+}
+
+// The feedback-endpoint (#25) counterpart of submitIso: same validation shape (lookup, slot
+// bounds, per-packet-length overflow check against bufferLength), but this is a read (IN)
+// submission -- there is no [data] to copy in, so the buffer is zeroed instead, exactly like
+// openIsoStream zeroes a freshly-allocated buffer, so a short/failed read never exposes
+// leftover bytes from whatever this URB last carried.
+extern "C" JNIEXPORT jboolean JNICALL
+Java_org_ostrichbat2k_usbdac_streaming_UsbNative_submitIsoRead(
+        JNIEnv* env, jobject /*thiz*/, jlong handle, jint slot, jintArray packetLengths) {
+    IsoStream* stream = lookupStream(handle);
+    if (!stream || slot < 0 || slot >= stream->numUrbs) return JNI_FALSE;
+    if (!packetLengths) {
+        LOGE("submitIsoRead called with a null packetLengths array for slot %d", slot);
+        return JNI_FALSE;
+    }
+    struct usbdevfs_urb* urb = stream->urbs[slot];
+
+    jsize numPackets = env->GetArrayLength(packetLengths);
+    if (numPackets <= 0 || numPackets > stream->packetsPerUrb) {
+        LOGE("Invalid packet count for slot %d: %d (max %d)", slot, numPackets, stream->packetsPerUrb);
+        return JNI_FALSE;
+    }
+
+    jint* lengths = env->GetIntArrayElements(packetLengths, nullptr);
+    if (!lengths) {
+        LOGE("GetIntArrayElements failed for slot %d", slot);
+        return JNI_FALSE;
+    }
+    // Same 64-bit-accumulator overflow reasoning as submitIso's identical loop (#79).
+    uint64_t total = 0;
+    bool negativeLength = false;
+    for (jsize p = 0; p < numPackets && !negativeLength; p++) {
+        jint len = lengths[p];
+        if (len < 0) {
+            negativeLength = true;
+            break;
+        }
+        urb->iso_frame_desc[p].length = (unsigned int) len;
+        total += (uint64_t) len;
+    }
+    env->ReleaseIntArrayElements(packetLengths, lengths, JNI_ABORT);
+    if (negativeLength) {
+        LOGE("Negative packet length in packetLengths for slot %d", slot);
+        return JNI_FALSE;
+    }
+
+    if (total > (uint64_t) stream->bufferLength) {
+        LOGE("Packet total %llu exceeds buffer capacity %u for slot %d", (unsigned long long) total,
+             stream->bufferLength, slot);
+        return JNI_FALSE;
+    }
+    unsigned int totalU = (unsigned int) total;
+    memset(urb->buffer, 0, totalU);
+
+    urb->status = -1;
+    urb->actual_length = 0;
+    urb->buffer_length = (int) totalU;
+    urb->number_of_packets = (int) numPackets;
+
+    int ret = ioctl(stream->fd, USBDEVFS_SUBMITURB, urb);
+    if (ret != 0) {
+        LOGE("SUBMITURB (read) failed for slot %d: errno=%d", slot, errno);
+        return JNI_FALSE;
+    }
+    return JNI_TRUE;
+}
+
+// Copies a just-reaped feedback URB's own payload back to the Kotlin side (#25) -- the first
+// code path in this file that ever reads URB buffer contents back out; processReapedUrb/reapIso
+// only ever inspect actual_length/status for the main audio data path, since that path's actual
+// bytes went the other direction (host to device) and were never meant to be read back.
+extern "C" JNIEXPORT jint JNICALL
+Java_org_ostrichbat2k_usbdac_streaming_UsbNative_readIsoSlotData(
+        JNIEnv* env, jobject /*thiz*/, jlong handle, jint slot, jbyteArray dst) {
+    IsoStream* stream = lookupStream(handle);
+    if (!stream || slot < 0 || slot >= stream->numUrbs || !dst) return -1;
+    struct usbdevfs_urb* urb = stream->urbs[slot];
+    if (urb->actual_length < 0) return -1;
+
+    jsize dstLen = env->GetArrayLength(dst);
+    if (dstLen < 0) return -1;
+    unsigned int available = (unsigned int) urb->actual_length;
+    unsigned int toCopy = (unsigned int) dstLen < available ? (unsigned int) dstLen : available;
+    if (toCopy > 0) {
+        env->SetByteArrayRegion(dst, 0, (jsize) toCopy, (jbyte*) urb->buffer);
+    }
+    return (jint) toCopy;
 }

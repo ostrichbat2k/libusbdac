@@ -91,4 +91,22 @@ object UsbNative {
      * calling [reapIso]/[submitIso] on this handle (confirmed via [cancelIso] + Thread.join()).
      */
     external fun closeIsoStream(handle: Long)
+
+    /**
+     * Submits URB [slot] as an IN (read) transfer of the given [packetLengths] -- the feedback-
+     * endpoint counterpart of [submitIso] (#25): no data copied in (the buffer is zeroed instead,
+     * since this is a read, not a write), everything else identical (lookup, slot bounds,
+     * overflow-checked length sum). [reapIso]/[cancelIso]/[closeIsoStream] work unchanged on a
+     * handle opened for reading -- only submission direction differs.
+     */
+    external fun submitIsoRead(handle: Long, slot: Int, packetLengths: IntArray): Boolean
+
+    /**
+     * Copies up to [dst]'s size of bytes from URB [slot]'s completed transfer into [dst]. Returns
+     * the number of bytes actually copied (the URB's own `actual_length`, capped to [dst].size),
+     * or -1 on an invalid handle/slot. Only meaningful to call right after [reapIso] returns this
+     * [slot] on a handle opened via [openIsoStream] for a feedback (IN) endpoint -- the main audio
+     * data path never reads URB buffer contents back, only [reapIso]'s own success/failure.
+     */
+    external fun readIsoSlotData(handle: Long, slot: Int, dst: ByteArray): Int
 }

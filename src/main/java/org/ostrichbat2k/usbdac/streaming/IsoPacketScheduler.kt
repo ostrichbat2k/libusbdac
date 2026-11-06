@@ -30,25 +30,46 @@ package org.ostrichbat2k.usbdac.streaming
  * *microframe* instead -- see [UsbNative.getUsbSpeed]'s doc comment for why this distinction is
  * essential, not cosmetic: assuming 1000 unconditionally on a high-speed device packs 8x too many
  * samples into each packet slot relative to how much real bus time it actually occupies).
+ *
+ * Single-writer-assumed until #25: only the main streaming thread ever touched this class, so
+ * [nextPacketSampleCount]/[reset] were safe unsynchronized. An Asynchronous device's feedback
+ * thread now calls [updateRate] concurrently with the main thread's own [nextPacketSampleCount]
+ * calls, so every mutable field is guarded by [lock] -- real correctness, not a nice-to-have.
  */
 class IsoPacketScheduler(sampleRateHz: Int, private val packetsPerSecond: Int = 1000) {
-    private val baseSamplesPerPacket = sampleRateHz / packetsPerSecond
-    private val remainderPerPacket = sampleRateHz % packetsPerSecond
+    private val lock = Any()
+    private var baseSamplesPerPacket = sampleRateHz / packetsPerSecond
+    private var remainderPerPacket = sampleRateHz % packetsPerSecond
     private var accumulator = 0
 
     /** Returns the number of samples the next packet should carry. */
-    fun nextPacketSampleCount(): Int {
-        accumulator += remainderPerPacket
-        return if (accumulator >= packetsPerSecond) {
-            accumulator -= packetsPerSecond
-            baseSamplesPerPacket + 1
-        } else {
-            baseSamplesPerPacket
+    fun nextPacketSampleCount(): Int =
+        synchronized(lock) {
+            accumulator += remainderPerPacket
+            if (accumulator >= packetsPerSecond) {
+                accumulator -= packetsPerSecond
+                baseSamplesPerPacket + 1
+            } else {
+                baseSamplesPerPacket
+            }
         }
-    }
 
     fun reset() {
-        accumulator = 0
+        synchronized(lock) { accumulator = 0 }
+    }
+
+    /**
+     * Re-derives the per-packet sample distribution for a feedback-reported real rate (#25) --
+     * called from the feedback thread, never the main streaming thread. Resets [accumulator] too:
+     * an old accumulator value computed against the previous rate's [remainderPerPacket] has no
+     * meaning against the new one.
+     */
+    fun updateRate(sampleRateHz: Int) {
+        synchronized(lock) {
+            baseSamplesPerPacket = sampleRateHz / packetsPerSecond
+            remainderPerPacket = sampleRateHz % packetsPerSecond
+            accumulator = 0
+        }
     }
 }
 

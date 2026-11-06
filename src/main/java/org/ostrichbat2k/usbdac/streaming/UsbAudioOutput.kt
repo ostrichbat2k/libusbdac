@@ -22,6 +22,7 @@ import org.ostrichbat2k.usbdac.UsbAudioManager
 import org.ostrichbat2k.usbdac.UsbAudioTuning
 import org.ostrichbat2k.usbdac.UsbDacPreferences
 import org.ostrichbat2k.usbdac.control.UsbVolumeController
+import org.ostrichbat2k.usbdac.protocol.SyncType
 import org.ostrichbat2k.usbdac.protocol.UacStreamFormat
 import org.ostrichbat2k.usbdac.protocol.UsbAudioController
 import org.ostrichbat2k.usbdac.protocol.UsbAudioSession
@@ -149,6 +150,14 @@ class UsbAudioOutput(
     private var streamThread: Thread? = null
     @Volatile private var streaming = false
     @Volatile private var lastUrbSubmittedAtMs = 0L
+    // Feedback-clocked async support (#25) -- see UacFeedbackEndpoint's own doc comment. Stay at
+    // their zero/null/false defaults whenever this format isn't SyncType.ASYNC with a feedback
+    // endpoint, or when opening the feedback stream itself failed; a feedback failure never
+    // affects the main fields above -- see stopStreamingThread's mirrored-but-independent
+    // shutdown of these.
+    private var feedbackHandle = 0L
+    private var feedbackThread: Thread? = null
+    @Volatile private var feedbackStreaming = false
     // Only ever read/written from the single native streaming thread -- not actually volatile for
     // cross-thread visibility, just convenient to declare alongside the other stream-lifetime state.
     private var underrunCount = 0
@@ -1143,16 +1152,107 @@ class UsbAudioOutput(
                     name = "UsbAudioOutput-stream"
                     start()
                 }
+
+        startFeedbackThreadIfApplicable(fd, scheduler)
+    }
+
+    /**
+     * Opens and starts the feedback-endpoint reader thread (#25) when [format] is
+     * [SyncType.ASYNC] and declares a [UacFeedbackEndpoint] -- a second, independent blocking
+     * native loop on a second handle/fd pair, same [UsbNative.openIsoStream]/[UsbNative.reapIso]
+     * pattern [startStreamingThread]'s own main loop already uses, just reading instead of
+     * writing. [scheduler] is the exact same instance the main loop paces packets against --
+     * captured here by closure, not promoted to an instance field, since both threads are started
+     * from within this one call to [startStreamingThread] and never need to reach it from
+     * anywhere else.
+     *
+     * Every failure here (open failed, fatal reap error) is logged and leaves this thread/handle
+     * stopped, but never touches [streaming]/[isoHandle]/the main loop -- a feedback failure
+     * means the scheduler stops getting corrected and stays at whatever rate was last set, not
+     * that playback itself is at risk.
+     */
+    private fun startFeedbackThreadIfApplicable(fd: Int, scheduler: IsoPacketScheduler) {
+        val feedback = format.feedbackEndpoint
+        if (format.syncType != SyncType.ASYNC || feedback == null) return
+
+        val handle =
+            UsbNative.openIsoStream(
+                fd,
+                feedback.address,
+                feedback.maxPacketSize,
+                UsbAudioTuning.FEEDBACK_PACKETS_PER_URB,
+                UsbAudioTuning.FEEDBACK_NUM_URBS)
+        if (handle == 0L) {
+            L.w("UsbAudioOutput: failed to open feedback iso stream -- continuing without rate correction")
+            return
+        }
+        L.i("UsbAudioOutput: opened feedback iso stream endpoint=${feedback.address} handle=$handle")
+        feedbackHandle = handle
+        feedbackStreaming = true
+
+        val packetLengths = IntArray(UsbAudioTuning.FEEDBACK_PACKETS_PER_URB) { feedback.maxPacketSize }
+        val buffer = ByteArray(feedback.maxPacketSize)
+
+        fun resubmit(slot: Int) {
+            val ok =
+                UsbNative.submitIsoRead(handle, slot, packetLengths) ||
+                    UsbNative.submitIsoRead(handle, slot, packetLengths)
+            if (!ok) {
+                L.w("UsbAudioOutput: feedback submitIsoRead failed twice for slot $slot -- this URB stays unsubmitted")
+            }
+        }
+
+        feedbackThread =
+            Thread {
+                    android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
+                    L.i("UsbAudioOutput: feedback thread starting")
+                    for (slot in 0 until UsbAudioTuning.FEEDBACK_NUM_URBS) resubmit(slot)
+
+                    while (feedbackStreaming) {
+                        val slot = UsbNative.reapIso(handle)
+                        if (!feedbackStreaming) break
+                        if (slot < 0) {
+                            if (slot == UsbNative.REAP_ERROR_FATAL) {
+                                L.e("UsbAudioOutput: feedback reapIso() reported a fatal error -- stopping the feedback thread only")
+                                break
+                            }
+                            continue
+                        }
+                        val bytesRead = UsbNative.readIsoSlotData(handle, slot, buffer)
+                        if (bytesRead > 0) {
+                            val decoded = FeedbackRateDecoder.decode(buffer.copyOf(bytesRead), sampleRateHz)
+                            if (decoded != null) scheduler.updateRate(decoded)
+                        }
+                        resubmit(slot)
+                    }
+                    L.i("UsbAudioOutput: feedback thread exiting")
+                }
+                .apply {
+                    isDaemon = true
+                    name = "UsbAudioOutput-feedback"
+                    start()
+                }
     }
 
     private fun stopStreamingThread() {
-        if (!streaming && isoHandle == 0L) return
+        if (!streaming && isoHandle == 0L && !feedbackStreaming && feedbackHandle == 0L) return
         streaming = false
         if (isoHandle != 0L) {
             UsbNative.cancelIso(isoHandle)
         }
+        feedbackStreaming = false
+        if (feedbackHandle != 0L) {
+            UsbNative.cancelIso(feedbackHandle)
+        }
         streamThread?.join(UsbAudioTuning.STREAM_THREAD_JOIN_TIMEOUT_MS)
-        if (isStreamThreadStuck(streamThread)) {
+        feedbackThread?.join(UsbAudioTuning.STREAM_THREAD_JOIN_TIMEOUT_MS)
+
+        // The feedback stream (#25) is shut down independently of the main one below: a stuck
+        // feedback thread must never block freeing the main stream, and vice versa -- the same
+        // documented-but-structurally-unfixed concurrent-close contract #76 already tracks for a
+        // single stream applies separately to each of these two, not jointly.
+        val mainStuck = isStreamThreadStuck(streamThread)
+        if (mainStuck) {
             // cancelIso() failed to unblock the thread's native call within the timeout --
             // freeing isoHandle now would race a still-running reapIso()/submitIso() over memory
             // closeIsoStream() frees underneath it, a genuine use-after-free (confirmed,
@@ -1165,13 +1265,29 @@ class UsbAudioOutput(
                 "UsbAudioOutput: streaming thread did not stop within " +
                     "${UsbAudioTuning.STREAM_THREAD_JOIN_TIMEOUT_MS}ms of cancelIso() -- leaving " +
                     "the native stream open rather than risk a use-after-free")
-            return
+        } else {
+            streamThread = null
+            if (isoHandle != 0L) {
+                UsbNative.closeIsoStream(isoHandle)
+                isoHandle = 0L
+            }
         }
-        streamThread = null
-        if (isoHandle != 0L) {
-            UsbNative.closeIsoStream(isoHandle)
-            isoHandle = 0L
+
+        val feedbackStuck = isStreamThreadStuck(feedbackThread)
+        if (feedbackStuck) {
+            L.e(
+                "UsbAudioOutput: feedback thread did not stop within " +
+                    "${UsbAudioTuning.STREAM_THREAD_JOIN_TIMEOUT_MS}ms of cancelIso() -- leaving " +
+                    "the native feedback stream open rather than risk a use-after-free")
+        } else {
+            feedbackThread = null
+            if (feedbackHandle != 0L) {
+                UsbNative.closeIsoStream(feedbackHandle)
+                feedbackHandle = 0L
+            }
         }
+
+        if (mainStuck) return
         // Stream genuinely stopped (not a transient pause-silence gap, which doesn't call this at
         // all) -- clear rather than leave the pipeline visualizer showing numbers frozen from a
         // track that isn't playing anymore.

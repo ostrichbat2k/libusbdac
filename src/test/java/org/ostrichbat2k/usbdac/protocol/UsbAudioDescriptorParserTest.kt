@@ -261,7 +261,9 @@ class UsbAudioDescriptorParserUac3Test {
         // bInterval=4: distinct from the real-devices-tested default of 1, to actually exercise
         // parsing it rather than coincidentally matching UacStreamFormat's own default -- see #61.
         // sync bits = ASYNC
-        val endpoint = D.endpoint(address = 0x83, attributes = 0x05, maxPacketSize = 196, bInterval = 4)
+        // 0x03: an OUT endpoint, as every real playback data endpoint must be (#25 now reads the
+        // address's direction bit to tell the main data endpoint apart from a feedback endpoint).
+        val endpoint = D.endpoint(address = 0x03, attributes = 0x05, maxPacketSize = 196, bInterval = 4)
         return config + acIface + input + clock + mixer + output + asIface + asGeneral + endpoint
     }
 
@@ -284,9 +286,9 @@ class UsbAudioDescriptorParserUac3Test {
         assertEquals(24, format.bitResolution)
         assertEquals(4, format.subslotSize)
         assertEquals(32, format.clusterDescriptorId)
-        assertEquals(0x83, format.endpointAddress)
+        assertEquals(0x03, format.endpointAddress)
         assertEquals(196, format.maxPacketSize)
-        assertTrue(format.isAsync)
+        assertEquals(SyncType.ASYNC, format.syncType)
         assertEquals(4, format.bInterval)
     }
 
@@ -319,7 +321,7 @@ class UsbAudioDescriptorParserUac3Test {
         val power = D.uac3PowerDomain(id = 9, d1RawUnits = 10, d2RawUnits = 20, entities = listOf(1, 4))
         val asIface = D.iface(1, 0, 1, 2, 0x30)
         val asGeneral = D.uac3AsGeneral(1, 32, 4, 24)
-        val endpoint = D.endpoint(0x83, 0x05, 196)
+        val endpoint = D.endpoint(0x03, 0x05, 196) // OUT -- see the other earPodsLikeConfig() fixture's comment
         val topology =
             UsbAudioDescriptorParserUac3.parseUac3Playback(
                 config + acIface + input + clock + output + power + asIface + asGeneral + endpoint)!!

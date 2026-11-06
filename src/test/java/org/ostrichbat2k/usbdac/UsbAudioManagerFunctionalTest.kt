@@ -40,6 +40,7 @@ import org.ostrichbat2k.usbdac.activation.UsbDacActivator
 import org.ostrichbat2k.usbdac.control.UsbVolumeControllerImpl
 import org.ostrichbat2k.usbdac.discovery.UsbAudioDevice
 import org.ostrichbat2k.usbdac.discovery.UsbDeviceDiscovery
+import org.ostrichbat2k.usbdac.protocol.SyncType
 import org.ostrichbat2k.usbdac.protocol.UacPlaybackTopology
 import org.ostrichbat2k.usbdac.protocol.UacStreamFormat
 import org.ostrichbat2k.usbdac.protocol.UsbAudioController
@@ -94,7 +95,7 @@ class UsbAudioManagerFunctionalTest {
             clusterDescriptorId = -1,
             endpointAddress = 0x02,
             maxPacketSize = 192,
-            isAsync = true,
+            syncType = SyncType.ASYNC,
         )
 
     private lateinit var context: Context

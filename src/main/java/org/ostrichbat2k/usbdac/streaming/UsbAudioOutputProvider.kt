@@ -327,21 +327,26 @@ class UsbAudioOutputProvider(
     ): Pair<UacStreamFormat, UsbAudioOutput.InputConversion> {
         val isFloatInput = config.encoding == C.ENCODING_PCM_FLOAT
         val isPaddedInput = !isFloatInput && paddedConfigs.remove(config)
+        // Both branches below should be unreachable in practice: getFormatSupport() already
+        // gated on exactly this same match existing before DefaultAudioSink ever calls
+        // getAudioOutput() for this config. Failing loudly here instead of silently picking an
+        // arbitrary device format (bitResolution/subslotSize mismatched against what the caller
+        // actually needs) turns a future desync between getFormatSupport()/matchingFormat()/
+        // wideIntTargetFormat() into a visible, diagnosable error instead of distorted audio or
+        // invalid packet sizing with only a warning log to notice by.
         val target =
             if (isFloatInput || isPaddedInput) {
                 wideIntTargetFormat(channels, config.sampleRate)
-                    ?: allFormats.first().also {
-                        L.w(
-                            "UsbAudioOutputProvider: no narrow-int conversion target at " +
-                                "${config.sampleRate}Hz, using ${it.bitResolution}-bit")
-                    }
+                    ?: error(
+                        "UsbAudioOutputProvider: no narrow-int conversion target at " +
+                            "${config.sampleRate}Hz -- getFormatSupport should have reported " +
+                            "UNSUPPORTED for this config before getAudioOutput() was ever called")
             } else {
                 allFormats.firstOrNull { encodingFor(it.subslotSize) == config.encoding }
-                    ?: allFormats.first().also {
-                        L.w(
-                            "UsbAudioOutputProvider: no format matches " +
-                                "encoding=${config.encoding}, using ${it.bitResolution}-bit")
-                    }
+                    ?: error(
+                        "UsbAudioOutputProvider: no format matches encoding=${config.encoding} " +
+                            "-- getFormatSupport should have reported UNSUPPORTED for this " +
+                            "config before getAudioOutput() was ever called")
             }
         val conversion =
             when {

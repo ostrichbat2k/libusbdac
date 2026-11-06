@@ -31,6 +31,7 @@ import org.ostrichbat2k.usbdac.protocol.UsbAudioDescriptorHelper.DESC_TYPE_ENDPO
 import org.ostrichbat2k.usbdac.protocol.UsbAudioDescriptorHelper.DESC_TYPE_INTERFACE
 import org.ostrichbat2k.usbdac.protocol.UsbAudioDescriptorHelper.TERMINAL_USB_STREAMING
 import org.ostrichbat2k.usbdac.protocol.UsbAudioDescriptorHelper.UAC1_PROTOCOL
+import org.ostrichbat2k.usbdac.protocol.UsbAudioDescriptorHelper.feedbackEndpointOrNull
 import org.ostrichbat2k.usbdac.protocol.UsbAudioDescriptorHelper.walk
 import android.hardware.usb.UsbConstants
 import timber.log.Timber as L
@@ -55,6 +56,10 @@ import timber.log.Timber as L
  * continuous-range form, bSamFreqType=0, is skipped.)
  */
 internal object UsbAudioDescriptorParserUac1 {
+
+    // UAC 1.0's extended (9-byte) endpoint descriptor's own bSynchAddress field -- bRefresh
+    // (offset 7) comes first. See pendingDeclaredSynchAddress's doc comment below.
+    private const val ENDPOINT_BSYNCHADDRESS_OFFSET = 8
 
     fun parseUac1Playback(configBytes: ByteArray): UacPlaybackTopology? = parseUac1Playback(walk(configBytes))
 
@@ -124,14 +129,8 @@ internal object UsbAudioDescriptorParserUac1 {
                             sampleRates = pendingSampleRates,
                             bInterval = pendingBInterval.takeIf { it > 0 } ?: 1,
                             feedbackEndpoint =
-                                if (pendingFeedbackAddress >= 0) {
-                                    UacFeedbackEndpoint(
-                                        address = pendingFeedbackAddress,
-                                        maxPacketSize = pendingFeedbackMaxPacketSize,
-                                        bInterval = pendingFeedbackBInterval.takeIf { it > 0 } ?: 1)
-                                } else {
-                                    null
-                                }))
+                                feedbackEndpointOrNull(
+                                    pendingFeedbackAddress, pendingFeedbackMaxPacketSize, pendingFeedbackBInterval)))
             }
             pendingAltSetting = -1
             pendingEndpointAddress = -1
@@ -246,9 +245,9 @@ internal object UsbAudioDescriptorParserUac1 {
                             pendingMaxPacketSize = maxPacketSize
                             pendingBInterval = bInterval
                             // bSynchAddress only exists on UAC 1.0's extended 9-byte endpoint
-                            // descriptor (offset 8) -- bRefresh (offset 7) comes first.
-                            if (bytes.size >= 9) {
-                                pendingDeclaredSynchAddress = bytes.u8(8)
+                            // descriptor -- bRefresh (offset 7) comes first.
+                            if (bytes.size > ENDPOINT_BSYNCHADDRESS_OFFSET) {
+                                pendingDeclaredSynchAddress = bytes.u8(ENDPOINT_BSYNCHADDRESS_OFFSET)
                             }
                         } else if (pendingFeedbackAddress < 0) {
                             pendingFeedbackAddress = address

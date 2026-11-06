@@ -217,7 +217,10 @@ internal data class CachedUacFormat(
     val clusterDescriptorId: Int,
     val endpointAddress: Int,
     val maxPacketSize: Int,
-    /** [SyncType] ordinal -- see this file's class doc comment on why -1-sentineled Ints, not Room @TypeConverters, is this file's convention for optional/enum fields. */
+    /**
+     * [SyncType] ordinal -- see this file's class doc comment on why -1-sentineled Ints, not Room
+     * @TypeConverters, is this file's convention for optional/enum fields.
+     */
     val syncType: Int,
     val sampleRatesEncoded: String,
     val bInterval: Int,

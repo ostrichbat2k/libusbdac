@@ -1190,8 +1190,24 @@ class UsbAudioOutput(
         feedbackHandle = handle
         feedbackStreaming = true
 
-        val packetLengths = IntArray(UsbAudioTuning.FEEDBACK_PACKETS_PER_URB) { feedback.maxPacketSize }
-        val buffer = ByteArray(feedback.maxPacketSize)
+        feedbackThread =
+            Thread { runFeedbackLoop(handle, feedback.maxPacketSize, scheduler) }
+                .apply {
+                    isDaemon = true
+                    name = "UsbAudioOutput-feedback"
+                    start()
+                }
+    }
+
+    /**
+     * The feedback thread's body, split out of [startFeedbackThreadIfApplicable] purely to keep
+     * that function's own cyclomatic complexity within detekt's threshold -- behaves identically
+     * either way, since [handle]/[maxPacketSize]/[scheduler] are exactly what the closure captured
+     * before this split.
+     */
+    private fun runFeedbackLoop(handle: Long, maxPacketSize: Int, scheduler: IsoPacketScheduler) {
+        val packetLengths = IntArray(UsbAudioTuning.FEEDBACK_PACKETS_PER_URB) { maxPacketSize }
+        val buffer = ByteArray(maxPacketSize)
 
         fun resubmit(slot: Int) {
             val ok =
@@ -1202,40 +1218,36 @@ class UsbAudioOutput(
             }
         }
 
-        feedbackThread =
-            Thread {
-                    android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
-                    L.i("UsbAudioOutput: feedback thread starting")
-                    for (slot in 0 until UsbAudioTuning.FEEDBACK_NUM_URBS) resubmit(slot)
+        android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
+        L.i("UsbAudioOutput: feedback thread starting")
+        for (slot in 0 until UsbAudioTuning.FEEDBACK_NUM_URBS) resubmit(slot)
 
-                    while (feedbackStreaming) {
-                        val slot = UsbNative.reapIso(handle)
-                        if (!feedbackStreaming) break
-                        if (slot < 0) {
-                            if (slot == UsbNative.REAP_ERROR_FATAL) {
-                                L.e("UsbAudioOutput: feedback reapIso() reported a fatal error -- stopping the feedback thread only")
-                                break
-                            }
-                            continue
-                        }
-                        val bytesRead = UsbNative.readIsoSlotData(handle, slot, buffer)
-                        if (bytesRead > 0) {
-                            val decoded = FeedbackRateDecoder.decode(buffer.copyOf(bytesRead), sampleRateHz)
-                            if (decoded != null) scheduler.updateRate(decoded)
-                        }
-                        resubmit(slot)
-                    }
-                    L.i("UsbAudioOutput: feedback thread exiting")
+        while (feedbackStreaming) {
+            val slot = UsbNative.reapIso(handle)
+            if (!feedbackStreaming) break
+            if (slot < 0) {
+                if (slot == UsbNative.REAP_ERROR_FATAL) {
+                    L.e(
+                        "UsbAudioOutput: feedback reapIso() reported a fatal error -- stopping " +
+                            "the feedback thread only")
+                    break
                 }
-                .apply {
-                    isDaemon = true
-                    name = "UsbAudioOutput-feedback"
-                    start()
-                }
+                continue
+            }
+            val bytesRead = UsbNative.readIsoSlotData(handle, slot, buffer)
+            if (bytesRead > 0) {
+                val decoded = FeedbackRateDecoder.decode(buffer.copyOf(bytesRead), sampleRateHz)
+                if (decoded != null) scheduler.updateRate(decoded)
+            }
+            resubmit(slot)
+        }
+        L.i("UsbAudioOutput: feedback thread exiting")
     }
 
     private fun stopStreamingThread() {
-        if (!streaming && isoHandle == 0L && !feedbackStreaming && feedbackHandle == 0L) return
+        val mainIdle = !streaming && isoHandle == 0L
+        val feedbackIdle = !feedbackStreaming && feedbackHandle == 0L
+        if (mainIdle && feedbackIdle) return
         streaming = false
         if (isoHandle != 0L) {
             UsbNative.cancelIso(isoHandle)

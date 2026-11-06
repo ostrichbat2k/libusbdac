@@ -53,6 +53,10 @@ internal object FeedbackRateDecoder {
     // to Hz means multiplying by the 1ms frame rate, not just dividing by the fixed-point scale.
     private const val FRAMES_PER_SECOND = 1000
 
+    private const val FULL_SPEED_PAYLOAD_BYTES = 3
+    private const val HIGH_SPEED_PAYLOAD_BYTES = 4
+    private const val BITS_PER_BYTE = 8
+
     /**
      * Returns the decoded rate in Hz, or null if [raw] is an unexpected length or none of its
      * candidate decodings land within [toleranceFraction] of [nominalRateHz]. Callers must treat
@@ -66,8 +70,9 @@ internal object FeedbackRateDecoder {
     ): Int? {
         val candidates =
             when (raw.size) {
-                3 -> listOf(decodeFixedPoint(raw, FRACTIONAL_BITS_10_14))
-                4 -> listOf(decodeFixedPoint(raw, FRACTIONAL_BITS_16_16), decodeFixedPoint(raw, FRACTIONAL_BITS_10_14))
+                FULL_SPEED_PAYLOAD_BYTES -> listOf(decodeFixedPoint(raw, FRACTIONAL_BITS_10_14))
+                HIGH_SPEED_PAYLOAD_BYTES ->
+                    listOf(decodeFixedPoint(raw, FRACTIONAL_BITS_16_16), decodeFixedPoint(raw, FRACTIONAL_BITS_10_14))
                 else -> return null
             }
         return candidates.firstOrNull { isWithinTolerance(it, nominalRateHz, toleranceFraction) }
@@ -81,7 +86,7 @@ internal object FeedbackRateDecoder {
     private fun decodeFixedPoint(raw: ByteArray, fractionalBits: Int): Int {
         var rawValue = 0L
         for (i in raw.indices) {
-            rawValue = rawValue or (raw.u8(i).toLong() shl (8 * i))
+            rawValue = rawValue or (raw.u8(i).toLong() shl (BITS_PER_BYTE * i))
         }
         return (rawValue.toDouble() * FRAMES_PER_SECOND / (1L shl fractionalBits)).roundToInt()
     }

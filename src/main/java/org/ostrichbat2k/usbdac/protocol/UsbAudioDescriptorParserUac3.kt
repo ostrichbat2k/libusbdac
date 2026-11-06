@@ -32,6 +32,7 @@ import org.ostrichbat2k.usbdac.protocol.UsbAudioDescriptorHelper.RAW_DATA_BYTE_M
 import org.ostrichbat2k.usbdac.protocol.UsbAudioDescriptorHelper.TERMINAL_USB_STREAMING
 import org.ostrichbat2k.usbdac.protocol.UsbAudioDescriptorHelper.UAC2_PROTOCOL
 import org.ostrichbat2k.usbdac.protocol.UsbAudioDescriptorHelper.UAC3_PROTOCOL
+import org.ostrichbat2k.usbdac.protocol.UsbAudioDescriptorHelper.feedbackEndpointOrNull
 import org.ostrichbat2k.usbdac.protocol.UsbAudioDescriptorHelper.recordPendingFormat
 import org.ostrichbat2k.usbdac.protocol.UsbAudioDescriptorHelper.walk
 import android.hardware.usb.UsbConstants
@@ -234,9 +235,9 @@ internal object UsbAudioDescriptorParserUac3 {
                 isRawData = pendingIsRawData,
                 formatsByInterface = formatsByInterface,
                 nonPcmFormatsByInterface = nonPcmFormatsByInterface,
-                feedbackEndpointAddress = pendingFeedbackAddress,
-                feedbackMaxPacketSize = pendingFeedbackMaxPacketSize,
-                feedbackBInterval = pendingFeedbackBInterval)
+                feedbackEndpoint =
+                    feedbackEndpointOrNull(
+                        pendingFeedbackAddress, pendingFeedbackMaxPacketSize, pendingFeedbackBInterval))
             pendingAltSetting = -1
             pendingEndpointAddress = -1
             pendingEndpointSync = -1

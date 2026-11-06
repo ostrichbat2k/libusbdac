@@ -268,7 +268,8 @@ internal class UsbDacActivatorImpl(
         // disconnecting a driver resets the interface to alt-setting 0 as a side effect, undoing
         // whatever alt-setting was just selected. So this must stay before selectFormat, not after.
         UsbAudioController.reassertKernelEviction(session)
-        val formatOk = UsbAudioController.selectFormat(session, format)
+        val formatOk =
+            UsbAudioController.selectFormat(session, format) == UsbAudioController.ControlWriteOutcome.Success
         log("Alt-setting ${format.alternateSetting} (${format.bitResolution}-bit) selected: ok=$formatOk")
 
         // UAC 1.0's Sampling Frequency Control lives on the streaming endpoint itself, which

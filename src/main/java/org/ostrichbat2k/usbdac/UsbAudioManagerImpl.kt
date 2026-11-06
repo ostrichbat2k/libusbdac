@@ -774,7 +774,7 @@ class UsbAudioManagerImpl(
             // can race to re-claim the interface, and evicting it again right before
             // selectFormat is safe/cheap insurance against that.
             UsbAudioController.reassertKernelEviction(session)
-            ok = UsbAudioController.selectFormat(session, format)
+            ok = UsbAudioController.selectFormat(session, format) == UsbAudioController.ControlWriteOutcome.Success
             if (ok) {
                 updateActiveSessionState { it.copy(format = format) }
                 diagnosticLogger.log("Switched to ${format.bitResolution}-bit (alt=${format.alternateSetting}) for upcoming track")

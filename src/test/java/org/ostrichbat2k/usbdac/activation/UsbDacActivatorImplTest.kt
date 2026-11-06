@@ -148,16 +148,18 @@ class UsbDacActivatorImplTest {
         every { UsbAudioController.wakePowerDomain(any(), any(), any(), any()) } just Runs
         every { UsbAudioController.setClockFrequency(any(), any()) } returns true
         every { UsbAudioController.getMute(any()) } returns false
-        every { UsbAudioController.setMute(any(), any()) } returns true
+        every { UsbAudioController.setMute(any(), any()) } returns UsbAudioController.ControlWriteOutcome.Success
         every { UsbAudioController.getVolume(any(), any()) } returns 0
         every { UsbAudioController.getVolumeRange(any(), any()) } returns (0 to 0)
         every { UsbAudioController.defaultVolumeTarget(any()) } returns 0
-        every { UsbAudioController.setVolume(any(), any(), any()) } returns true
+        every { UsbAudioController.setVolume(any(), any(), any()) } returns
+            UsbAudioController.ControlWriteOutcome.Success
         every { UsbAudioController.getMixerGain(any(), any(), any(), any()) } returns 0
         every { UsbAudioController.getMixerGainRange(any(), any(), any(), any()) } returns (0 to 0)
-        every { UsbAudioController.setMixerGain(any(), any(), any(), any(), any()) } returns true
+        every { UsbAudioController.setMixerGain(any(), any(), any(), any(), any()) } returns
+            UsbAudioController.ControlWriteOutcome.Success
         every { UsbAudioController.reassertKernelEviction(any()) } just Runs
-        every { UsbAudioController.selectFormat(any(), any()) } returns true
+        every { UsbAudioController.selectFormat(any(), any()) } returns UsbAudioController.ControlWriteOutcome.Success
         every { UsbAudioController.setUac1EndpointSampleRate(any(), any(), any()) } returns true
         every { UsbAudioController.getClockValid(any()) } returns true
         every { UsbAudioController.release(any()) } just Runs
@@ -550,7 +552,8 @@ class UsbDacActivatorImplTest {
     fun `a failed alternate-setting selection releases the session and returns null even if the clock was set`() {
         val device = fakeDevice()
         stubHappyPath(device, topology())
-        every { UsbAudioController.selectFormat(any(), any()) } returns false
+        every { UsbAudioController.selectFormat(any(), any()) } returns
+            UsbAudioController.ControlWriteOutcome.TransferFailed
 
         val result = activator.activate(device)
 

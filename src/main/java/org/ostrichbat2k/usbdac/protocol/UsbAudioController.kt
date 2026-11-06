@@ -99,6 +99,28 @@ internal object UsbAudioController {
     private const val FU_VOLUME_CONTROL = 0x02
     private const val AC_POWER_DOMAIN_CONTROL = 0x02
 
+    /**
+     * A control-transfer write's outcome, replacing a bare `Boolean` for [setVolume]/[setMute]/
+     * [setMixerGain]/[selectFormat] -- see [UsbAudioManager.ClaimOutcome] for the precedent this
+     * follows. [TransferFailed] deliberately lumps together a transient I/O stall, the device
+     * being gone, and a permission revocation mid-call: Android's own
+     * `UsbDeviceConnection.controlTransfer()`/`setInterface()` public API doesn't surface enough
+     * detail to tell those apart beyond "the transfer didn't go through" -- a negative/`false`
+     * result either way, with no further errno-style breakdown available to this layer.
+     */
+    sealed interface ControlWriteOutcome {
+        /** The device accepted the write (or at least didn't report a transport-level failure). */
+        data object Success : ControlWriteOutcome
+
+        /** This session's topology has no such control at all (no Feature/Mixer Unit, no such
+         * alternate setting) -- calling the write was a logic error, not a hardware hiccup. */
+        data object Unsupported : ControlWriteOutcome
+
+        /** The underlying USB transfer itself failed -- see this type's own doc comment for why
+         * this can't be broken down any further than that. */
+        data object TransferFailed : ControlWriteOutcome
+    }
+
     /** The CUR request's bRequest byte for [topology]'s UAC version and GET/SET direction. */
     internal fun curRequest(topology: UacPlaybackTopology, get: Boolean): Int =
         if (topology.uacVersion == 1 && get) UAC1_REQUEST_GET_CUR else UAC_REQUEST_CUR
@@ -572,9 +594,9 @@ internal object UsbAudioController {
     }
 
     /** Sets the Feature Unit's mute state for [channel] (0=master, 1=left, 2=right). */
-    fun setMute(session: UsbAudioSession, muted: Boolean, channel: Int = 0): Boolean {
+    fun setMute(session: UsbAudioSession, muted: Boolean, channel: Int = 0): ControlWriteOutcome {
         val unitId = session.topology.outputFeatureUnitId
-        if (unitId < 0) return false
+        if (unitId < 0) return ControlWriteOutcome.Unsupported
         val wValue = (FU_MUTE_CONTROL shl 8) or channel
         val wIndex = (unitId shl 8) or session.controlInterface.id
         val buffer = byteArrayOf(if (muted) 1 else 0)
@@ -582,7 +604,7 @@ internal object UsbAudioController {
             session.connection.controlTransfer(
                 REQ_TYPE_CLASS_INTERFACE_SET, UAC_REQUEST_CUR, wValue, wIndex, buffer, buffer.size, 1000)
         L.i("SET_CUR mute (unit=$unitId ch=$channel) to $muted: result=$result")
-        return result >= 0
+        return if (result >= 0) ControlWriteOutcome.Success else ControlWriteOutcome.TransferFailed
     }
 
     /** Reads the Feature Unit's volume for [channel] (0=master, 1=left, 2=right), in 1/256 dB. */
@@ -646,9 +668,9 @@ internal object UsbAudioController {
     fun defaultVolumeTarget(range: Pair<Int, Int>?): Int = range?.let { (it.first + it.second) / 2 } ?: 0
 
     /** Sets the Feature Unit's volume for [channel] (0=master, 1=left, 2=right), in 1/256 dB. */
-    fun setVolume(session: UsbAudioSession, value: Int, channel: Int): Boolean {
+    fun setVolume(session: UsbAudioSession, value: Int, channel: Int): ControlWriteOutcome {
         val unitId = session.topology.outputFeatureUnitId
-        if (unitId < 0) return false
+        if (unitId < 0) return ControlWriteOutcome.Unsupported
         val wValue = (FU_VOLUME_CONTROL shl 8) or channel
         val wIndex = (unitId shl 8) or session.controlInterface.id
         val buffer = byteArrayOf((value and 0xFF).toByte(), ((value shr 8) and 0xFF).toByte())
@@ -656,7 +678,7 @@ internal object UsbAudioController {
             session.connection.controlTransfer(
                 REQ_TYPE_CLASS_INTERFACE_SET, UAC_REQUEST_CUR, wValue, wIndex, buffer, buffer.size, 1000)
         L.i("SET_CUR volume (unit=$unitId ch=$channel) to $value: result=$result")
-        return result >= 0
+        return if (result >= 0) ControlWriteOutcome.Success else ControlWriteOutcome.TransferFailed
     }
 
     /**
@@ -723,7 +745,7 @@ internal object UsbAudioController {
         inputChannel: Int,
         outputChannel: Int,
         value: Int,
-    ): Boolean {
+    ): ControlWriteOutcome {
         val wValue = (inputChannel shl 8) or outputChannel
         val wIndex = (mixerUnitId shl 8) or session.controlInterface.id
         val buffer = byteArrayOf((value and 0xFF).toByte(), ((value shr 8) and 0xFF).toByte())
@@ -733,7 +755,7 @@ internal object UsbAudioController {
         L.i(
             "SET_CUR mixer gain (unit=$mixerUnitId in=$inputChannel out=$outputChannel) to " +
                 "$value: result=$result")
-        return result >= 0
+        return if (result >= 0) ControlWriteOutcome.Success else ControlWriteOutcome.TransferFailed
     }
 
     /** Reads a UAC 3.0 Power Domain's current state (0=D0/full power, 1=D1, 2=D2), or null. */
@@ -801,14 +823,14 @@ internal object UsbAudioController {
     }
 
     /** Switches the streaming interface to the alternate setting for [format]. */
-    fun selectFormat(session: UsbAudioSession, format: UacStreamFormat): Boolean {
+    fun selectFormat(session: UsbAudioSession, format: UacStreamFormat): ControlWriteOutcome {
         val iface = session.streamingAltSettings[format.alternateSetting]
         if (iface == null) {
             L.w("No interface for alternate setting ${format.alternateSetting}")
-            return false
+            return ControlWriteOutcome.Unsupported
         }
         val ok = session.connection.setInterface(iface)
         L.i("setInterface(alt=${format.alternateSetting}, ${format.bitResolution}-bit): $ok")
-        return ok
+        return if (ok) ControlWriteOutcome.Success else ControlWriteOutcome.TransferFailed
     }
 }

@@ -1127,6 +1127,7 @@ class UsbAudioOutput(
                         // new StateFlow value (and the GC churn that implies) on every single
                         // URB, which happens ~125 times/sec.
                         if (submitted % 20 == 0) {
+                            val packetErrorStats = UsbNative.getPacketErrorStats(handle)
                             usbAudioManager.reportPipelineStats(
                                 UsbPipelineStats(
                                     atMs = System.currentTimeMillis(),
@@ -1134,7 +1135,9 @@ class UsbAudioOutput(
                                     reapErrors = reapErrors,
                                     underrunCount = underrunCount,
                                     bufferedBytes = ringBuffer.availableToRead(),
-                                    bufferCapacityBytes = ringBuffer.availableToRead() + ringBuffer.availableToWrite()))
+                                    bufferCapacityBytes = ringBuffer.availableToRead() + ringBuffer.availableToWrite(),
+                                    badPacketCount = packetErrorStats[0],
+                                    shortBytesCount = packetErrorStats[1]))
                         }
                         if (submitted % 500 == 0) {
                             val realElapsedMs = (System.nanoTime() - streamStartNs) / 1_000_000L

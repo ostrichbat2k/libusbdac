@@ -36,4 +36,12 @@ data class UsbPipelineStats(
     val underrunCount: Int,
     val bufferedBytes: Int,
     val bufferCapacityBytes: Int,
+    // Cumulative, same reasoning as urbsSubmitted above -- native's own per-packet scan
+    // (processReapedUrb in usb_native.cpp) already distinguishes "occasional dropped USB
+    // packets" from other glitch causes (decoder underrun, ring buffer starved) via logcat only;
+    // these surface that same distinction to a host diagnostics screen instead of leaving it
+    // there. badPacketCount: packets that completed short or failed outright. shortBytesCount:
+    // how many fewer bytes actually reached the device than were requested, cumulatively.
+    val badPacketCount: Long = 0L,
+    val shortBytesCount: Long = 0L,
 )

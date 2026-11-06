@@ -126,7 +126,6 @@
     <ID>MaxLineLength:UsbAudioController.kt$UsbAudioController$internal</ID>
     <ID>MaxLineLength:UsbAudioControllerControlTransferTest.kt$UsbAudioControllerControlTransferTest$0x21</ID>
     <ID>MaxLineLength:UsbAudioControllerControlTransferTest.kt$UsbAudioControllerControlTransferTest$assertEquals(0 to 100, UsbAudioController.getMixerGainRange(session, mixerUnitId = 7, inputChannel = 3, outputChannel = 1))</ID>
-    <ID>MaxLineLength:UsbAudioControllerControlTransferTest.kt$UsbAudioControllerControlTransferTest$assertTrue(UsbAudioController.setMixerGain(session, mixerUnitId = 7, inputChannel = 3, outputChannel = 1, value = -256))</ID>
     <ID>MaxLineLength:UsbAudioControllerControlTransferTest.kt$UsbAudioControllerControlTransferTest$private</ID>
     <ID>MaxLineLength:UsbAudioControllerControlTransferTest.kt$UsbAudioControllerControlTransferTest$session.connection.controlTransfer(0x21, 0x01, 0x0100, 0x0200, match&lt;ByteArray&gt; { it.contentEquals(le(48000, 4)) }, 4, 1000)</ID>
     <ID>MaxLineLength:UsbAudioControllerControlTransferTest.kt$UsbAudioControllerControlTransferTest$session.connection.controlTransfer(0x21, 0x01, 0x0100, 0x0300, match&lt;ByteArray&gt; { it.contentEquals(byteArrayOf(1)) }, 1, 1000)</ID>

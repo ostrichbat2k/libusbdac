@@ -647,7 +647,7 @@ class UsbAudioManagerImplTest {
             // releaseClaim's HAL-handoff prep, same reasoning as UsbClaimControllerImplTest's own
             // releaseClaim tests -- here it runs for real (UsbVolumeControllerImpl isn't
             // injectable on this class), so its UsbAudioController calls need stubbing too.
-            every { UsbAudioController.setMute(any(), any()) } returns true
+            every { UsbAudioController.setMute(any(), any()) } returns UsbAudioController.ControlWriteOutcome.Success
             every { UsbAudioController.getVolumeRange(any(), any()) } returns null
             justRun { UsbAudioController.releaseToKernel(any()) }
 

@@ -37,6 +37,7 @@
 #include <mutex>
 #include <new>
 #include <sys/ioctl.h>
+#include <thread>
 #include <unordered_map>
 
 #define LOG_TAG "UsbNative"
@@ -115,6 +116,11 @@ struct IsoStream {
     // See #78: exposes processReapedUrb's per-URB packet scan beyond just a logcat line.
     std::atomic<int64_t> cumulativeBadPackets{0};
     std::atomic<int64_t> cumulativeShortBytes{0};
+    // How many entry points below are currently using this stream, after having found it via
+    // acquireStream() -- closeIsoStream() waits for this to drop to zero before freeing anything
+    // (#76). Never read/written without going through acquireStream/StreamOpGuard or
+    // closeIsoStream's own wait loop.
+    std::atomic<int> activeOps{0};
 };
 
 // Sane ceilings on caller-supplied sizes. Real usage (see UsbAudioOutput.kt/IsoPacketScheduler.kt)
@@ -152,11 +158,35 @@ std::mutex g_streamsMutex;
 std::unordered_map<int64_t, IsoStream*> g_streams;
 int64_t g_nextHandle = 1;
 
-IsoStream* lookupStream(jlong handle) {
+// Finds the stream for [handle] and marks it as having one more operation in flight, so
+// closeIsoStream (possibly running concurrently on another thread) knows to wait for this call
+// to finish touching it before freeing anything (#76). The increment happens under the same
+// mutex closeIsoStream erases the handle under, so a handle this returns non-null for can never
+// be the one a concurrent closeIsoStream is about to (or already did) erase -- that race is
+// resolved entirely by map-lookup ordering, before activeOps ever comes into it. Every non-null
+// return must be matched by exactly one release, via [StreamOpGuard] below.
+IsoStream* acquireStream(jlong handle) {
     std::lock_guard<std::mutex> lock(g_streamsMutex);
     auto it = g_streams.find((int64_t) handle);
-    return it != g_streams.end() ? it->second : nullptr;
+    if (it == g_streams.end()) return nullptr;
+    IsoStream* stream = it->second;
+    stream->activeOps.fetch_add(1, std::memory_order_acq_rel);
+    return stream;
 }
+
+// RAII counterpart of acquireStream() -- declare one of these right after every successful
+// acquireStream() call, before touching the stream, so the release happens on every return path
+// (including an early one) without needing to spell it out at each one (#76).
+class StreamOpGuard {
+public:
+    explicit StreamOpGuard(IsoStream* stream) : stream_(stream) {}
+    ~StreamOpGuard() { stream_->activeOps.fetch_sub(1, std::memory_order_acq_rel); }
+    StreamOpGuard(const StreamOpGuard&) = delete;
+    StreamOpGuard& operator=(const StreamOpGuard&) = delete;
+
+private:
+    IsoStream* stream_;
+};
 }  // namespace
 
 static void freeStream(IsoStream* stream) {
@@ -281,8 +311,10 @@ extern "C" JNIEXPORT jboolean JNICALL
 Java_org_ostrichbat2k_usbdac_streaming_UsbNative_submitIso(
         JNIEnv* env, jobject /*thiz*/, jlong handle, jint slot, jbyteArray data,  // NOLINT(bugprone-easily-swappable-parameters)
         jintArray packetLengths) {
-    IsoStream* stream = lookupStream(handle);
-    if (!stream || slot < 0 || slot >= stream->numUrbs) return JNI_FALSE;
+    IsoStream* stream = acquireStream(handle);
+    if (!stream) return JNI_FALSE;
+    StreamOpGuard guard(stream);
+    if (slot < 0 || slot >= stream->numUrbs) return JNI_FALSE;
     if (!data || !packetLengths) {
         // GetArrayLength/GetByteArrayRegion/GetIntArrayElements on a null jarray is undefined
         // behavior at the JNI boundary, not a Java-level NullPointerException -- this must be
@@ -450,8 +482,9 @@ int reapErrorCodeForErrno(int err) {
 // REAP_ERROR_FATAL on the Kotlin side) on failure.
 extern "C" JNIEXPORT jint JNICALL
 Java_org_ostrichbat2k_usbdac_streaming_UsbNative_reapIso(JNIEnv* /*env*/, jobject /*thiz*/, jlong handle) {
-    IsoStream* stream = lookupStream(handle);
+    IsoStream* stream = acquireStream(handle);
     if (!stream) return kReapErrorFatal;
+    StreamOpGuard guard(stream);
 
     struct usbdevfs_urb* reaped = nullptr;
     int ret = ioctl(stream->fd, USBDEVFS_REAPURB, &reaped);
@@ -488,8 +521,9 @@ extern "C" JNIEXPORT jlongArray JNICALL
 Java_org_ostrichbat2k_usbdac_streaming_UsbNative_getPacketErrorStats(
         JNIEnv* env, jobject /*thiz*/, jlong handle) {
     jlongArray result = env->NewLongArray(2);
-    IsoStream* stream = lookupStream(handle);
+    IsoStream* stream = acquireStream(handle);
     if (!stream || !result) return result;
+    StreamOpGuard guard(stream);
     jlong stats[2] = {
         (jlong) stream->cumulativeBadPackets.load(std::memory_order_relaxed),
         (jlong) stream->cumulativeShortBytes.load(std::memory_order_relaxed)};
@@ -525,8 +559,9 @@ static void discardAllUrbs(IsoStream* stream) {
 // another thread, unlike closeIsoStream.
 extern "C" JNIEXPORT void JNICALL
 Java_org_ostrichbat2k_usbdac_streaming_UsbNative_cancelIso(JNIEnv* /*env*/, jobject /*thiz*/, jlong handle) {
-    IsoStream* stream = lookupStream(handle);
+    IsoStream* stream = acquireStream(handle);
     if (!stream) return;
+    StreamOpGuard guard(stream);
     discardAllUrbs(stream);
 }
 
@@ -548,13 +583,24 @@ Java_org_ostrichbat2k_usbdac_streaming_UsbNative_closeIsoStream(JNIEnv* /*env*/,
             return;
         }
         stream = it->second;
+        // Erasing now, under the same mutex acquireStream() takes for its own lookup, is what
+        // stops any *new* call from ever getting a pointer to this stream again -- see
+        // acquireStream's own doc comment. Anything that already got one, racing in on another
+        // thread just before this, is covered by the activeOps wait below instead (#76).
         g_streams.erase(it);
     }
 
     // Callers are required to have already called cancelIso() + joined before this (see this
-    // function's own doc comment) -- discarding again here is a harmless no-op safety net, not
-    // load-bearing, same as the original duplicated loop was.
+    // function's own doc comment), so activeOps is already expected to be 0 by the time the wait
+    // below runs. This discard pass and that wait exist purely as hardening against a future
+    // caller or bug that violates that contract (#76) -- not the normal path, but if it ever
+    // happens, this still unblocks a reapIso() call stuck in REAPURB on another thread instead of
+    // freeing the memory out from under it.
     discardAllUrbs(stream);
+    while (stream->activeOps.load(std::memory_order_acquire) != 0) {
+        std::this_thread::yield();
+    }
+
     struct usbdevfs_urb* reaped = nullptr;
     while (ioctl(stream->fd, USBDEVFS_REAPURBNDELAY, &reaped) == 0) {
         // Drain whatever the kernel still has queued so it can free its own bookkeeping.
@@ -570,8 +616,10 @@ Java_org_ostrichbat2k_usbdac_streaming_UsbNative_closeIsoStream(JNIEnv* /*env*/,
 extern "C" JNIEXPORT jboolean JNICALL
 Java_org_ostrichbat2k_usbdac_streaming_UsbNative_submitIsoRead(
         JNIEnv* env, jobject /*thiz*/, jlong handle, jint slot, jintArray packetLengths) {
-    IsoStream* stream = lookupStream(handle);
-    if (!stream || slot < 0 || slot >= stream->numUrbs) return JNI_FALSE;
+    IsoStream* stream = acquireStream(handle);
+    if (!stream) return JNI_FALSE;
+    StreamOpGuard guard(stream);
+    if (slot < 0 || slot >= stream->numUrbs) return JNI_FALSE;
     if (!packetLengths) {
         LOGE("submitIsoRead called with a null packetLengths array for slot %d", slot);
         return JNI_FALSE;
@@ -635,8 +683,10 @@ Java_org_ostrichbat2k_usbdac_streaming_UsbNative_submitIsoRead(
 extern "C" JNIEXPORT jint JNICALL
 Java_org_ostrichbat2k_usbdac_streaming_UsbNative_readIsoSlotData(
         JNIEnv* env, jobject /*thiz*/, jlong handle, jint slot, jbyteArray dst) {
-    IsoStream* stream = lookupStream(handle);
-    if (!stream || slot < 0 || slot >= stream->numUrbs || !dst) return -1;
+    IsoStream* stream = acquireStream(handle);
+    if (!stream) return -1;
+    StreamOpGuard guard(stream);
+    if (slot < 0 || slot >= stream->numUrbs || !dst) return -1;
     struct usbdevfs_urb* urb = stream->urbs[slot];
     if (urb->actual_length < 0) return -1;
 

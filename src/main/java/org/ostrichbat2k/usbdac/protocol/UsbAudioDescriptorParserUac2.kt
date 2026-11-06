@@ -34,6 +34,7 @@ import org.ostrichbat2k.usbdac.protocol.UsbAudioDescriptorHelper.FORMAT_BIT_PCM
 import org.ostrichbat2k.usbdac.protocol.UsbAudioDescriptorHelper.RAW_DATA_BYTE_MASK
 import org.ostrichbat2k.usbdac.protocol.UsbAudioDescriptorHelper.TERMINAL_USB_STREAMING
 import org.ostrichbat2k.usbdac.protocol.UsbAudioDescriptorHelper.UAC2_PROTOCOL
+import org.ostrichbat2k.usbdac.protocol.UsbAudioDescriptorHelper.feedbackEndpointOrNull
 import org.ostrichbat2k.usbdac.protocol.UsbAudioDescriptorHelper.recordPendingFormat
 import org.ostrichbat2k.usbdac.protocol.UsbAudioDescriptorHelper.walk
 import android.hardware.usb.UsbConstants
@@ -90,6 +91,12 @@ internal object UsbAudioDescriptorParserUac2 {
         var pendingEndpointSync = -1
         var pendingMaxPacketSize = -1
         var pendingBInterval = -1
+        // A second, IN-direction endpoint seen in this same alt setting -- the feedback endpoint
+        // (UAC 5.12.4.2) on an Asynchronous device, never the main (always OUT) data endpoint
+        // above. See UsbAudioDescriptorHelper.recordPendingFormat's doc comment (#25).
+        var pendingFeedbackAddress = -1
+        var pendingFeedbackMaxPacketSize = -1
+        var pendingFeedbackBInterval = -1
         var pendingBitResolution = -1
         var pendingSubslotSize = -1
         var isPendingTerminalLinked = false
@@ -119,12 +126,18 @@ internal object UsbAudioDescriptorParserUac2 {
                 isDeclaredPcm = pendingFormatIsPcm,
                 isRawData = pendingIsRawData,
                 formatsByInterface = formatsByInterface,
-                nonPcmFormatsByInterface = nonPcmFormatsByInterface)
+                nonPcmFormatsByInterface = nonPcmFormatsByInterface,
+                feedbackEndpoint =
+                    feedbackEndpointOrNull(
+                        pendingFeedbackAddress, pendingFeedbackMaxPacketSize, pendingFeedbackBInterval))
             pendingAltSetting = -1
             pendingEndpointAddress = -1
             pendingEndpointSync = -1
             pendingMaxPacketSize = -1
             pendingBInterval = -1
+            pendingFeedbackAddress = -1
+            pendingFeedbackMaxPacketSize = -1
+            pendingFeedbackBInterval = -1
             pendingBitResolution = -1
             pendingSubslotSize = -1
             isPendingTerminalLinked = false
@@ -212,11 +225,26 @@ internal object UsbAudioDescriptorParserUac2 {
                 }
                 DESC_TYPE_ENDPOINT -> {
                     if (currentInterfaceNumber == streamingInterfaceNumber) {
-                        pendingEndpointAddress = bytes.u8(2)
+                        val address = bytes.u8(2)
                         val attributes = bytes.u8(3)
-                        pendingEndpointSync = (attributes shr 2) and 0x3
-                        pendingMaxPacketSize = bytes.u16(4)
-                        pendingBInterval = bytes.u8(6)
+                        val maxPacketSize = bytes.u16(4)
+                        val bInterval = bytes.u8(6)
+                        if (address and UsbConstants.USB_DIR_IN == 0) {
+                            // OUT -- this library only ever streams playback, so the main data
+                            // endpoint is always OUT; see recordPendingFormat's doc comment.
+                            pendingEndpointAddress = address
+                            pendingEndpointSync = (attributes shr 2) and 0x3
+                            pendingMaxPacketSize = maxPacketSize
+                            pendingBInterval = bInterval
+                        } else if (pendingFeedbackAddress < 0) {
+                            pendingFeedbackAddress = address
+                            pendingFeedbackMaxPacketSize = maxPacketSize
+                            pendingFeedbackBInterval = bInterval
+                        } else {
+                            L.w(
+                                "Unexpected second IN endpoint ($address) in interface " +
+                                    "$currentInterfaceNumber alt setting $currentAltSetting -- ignoring")
+                        }
                     }
                 }
             }

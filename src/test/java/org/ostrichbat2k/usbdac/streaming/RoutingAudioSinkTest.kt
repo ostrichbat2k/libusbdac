@@ -36,6 +36,7 @@ import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.ostrichbat2k.usbdac.UsbAudioManager
 import org.ostrichbat2k.usbdac.control.UsbControlState
+import org.ostrichbat2k.usbdac.protocol.SyncType
 import org.ostrichbat2k.usbdac.protocol.UacStreamFormat
 
 /**
@@ -60,7 +61,7 @@ class RoutingAudioSinkTest {
             clusterDescriptorId = -1,
             endpointAddress = 0x02,
             maxPacketSize = 192,
-            isAsync = true,
+            syncType = SyncType.ASYNC,
         )
 
     private fun controlStateWithBitResolution(bitResolution: Int) =

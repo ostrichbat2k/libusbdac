@@ -75,6 +75,29 @@ class IsoPacketSchedulerTest {
 
         assertEquals(fromScratch, afterReset)
     }
+
+    @Test
+    fun `updateRate re-derives the distribution for a new rate, as if freshly constructed`() {
+        val scheduler = IsoPacketScheduler(sampleRateHz = 44100, packetsPerSecond = 1000)
+        repeat(7) { scheduler.nextPacketSampleCount() } // advance into the cycle, accumulator != 0
+        scheduler.updateRate(48000)
+
+        val afterUpdate = List(20) { scheduler.nextPacketSampleCount() }
+        val fresh = IsoPacketScheduler(sampleRateHz = 48000, packetsPerSecond = 1000)
+        val fromScratch = List(20) { fresh.nextPacketSampleCount() }
+
+        assertEquals(fromScratch, afterUpdate)
+    }
+
+    @Test
+    fun `updateRate's new distribution still sums exactly to the new rate over one period`() {
+        val scheduler = IsoPacketScheduler(sampleRateHz = 44100, packetsPerSecond = 1000)
+        scheduler.updateRate(96000)
+
+        var total = 0
+        repeat(1000) { total += scheduler.nextPacketSampleCount() }
+        assertEquals(96000, total)
+    }
 }
 
 class IsoPacingTest {

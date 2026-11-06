@@ -33,6 +33,7 @@ import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.ostrichbat2k.usbdac.UsbAudioManager
 import org.ostrichbat2k.usbdac.UsbDacPreferences
+import org.ostrichbat2k.usbdac.protocol.SyncType
 import org.ostrichbat2k.usbdac.protocol.UacPlaybackTopology
 import org.ostrichbat2k.usbdac.protocol.UacStreamFormat
 import org.ostrichbat2k.usbdac.protocol.UsbAudioController
@@ -55,7 +56,7 @@ class UsbVolumeControllerImplTest {
             clusterDescriptorId = -1,
             endpointAddress = 0x02,
             maxPacketSize = 192,
-            isAsync = true,
+            syncType = SyncType.ASYNC,
         )
 
     private fun controlState(volumeRange: Pair<Int, Int>? = -12800 to 0) =

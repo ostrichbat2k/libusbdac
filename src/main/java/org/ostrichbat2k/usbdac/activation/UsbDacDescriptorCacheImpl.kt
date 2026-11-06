@@ -19,6 +19,8 @@
 package org.ostrichbat2k.usbdac.activation
 
 import org.ostrichbat2k.usbdac.UsbAudioManager
+import org.ostrichbat2k.usbdac.protocol.SyncType
+import org.ostrichbat2k.usbdac.protocol.UacFeedbackEndpoint
 import org.ostrichbat2k.usbdac.protocol.UacPlaybackTopology
 import org.ostrichbat2k.usbdac.protocol.UacStreamFormat
 import org.ostrichbat2k.usbdac.protocol.UsbAudioSession
@@ -157,9 +159,18 @@ private fun CachedUacFormat.toDomain() =
         clusterDescriptorId = clusterDescriptorId,
         endpointAddress = endpointAddress,
         maxPacketSize = maxPacketSize,
-        isAsync = isAsync,
+        syncType = SyncType.entries[syncType],
         sampleRates = sampleRatesEncoded.decodeInts(),
-        bInterval = bInterval)
+        bInterval = bInterval,
+        feedbackEndpoint =
+            if (feedbackEndpointAddress >= 0) {
+                UacFeedbackEndpoint(
+                    address = feedbackEndpointAddress,
+                    maxPacketSize = feedbackMaxPacketSize,
+                    bInterval = feedbackBInterval)
+            } else {
+                null
+            })
 
 private fun UacStreamFormat.toEntity(deviceKey: String) =
     CachedUacFormat(
@@ -170,9 +181,12 @@ private fun UacStreamFormat.toEntity(deviceKey: String) =
         clusterDescriptorId = clusterDescriptorId,
         endpointAddress = endpointAddress,
         maxPacketSize = maxPacketSize,
-        isAsync = isAsync,
+        syncType = syncType.ordinal,
         sampleRatesEncoded = sampleRates.joinToString(","),
-        bInterval = bInterval)
+        bInterval = bInterval,
+        feedbackEndpointAddress = feedbackEndpoint?.address ?: -1,
+        feedbackMaxPacketSize = feedbackEndpoint?.maxPacketSize ?: -1,
+        feedbackBInterval = feedbackEndpoint?.bInterval ?: -1)
 
 @Entity(tableName = "usb_dac_topology")
 internal data class CachedUacTopology(
@@ -203,9 +217,17 @@ internal data class CachedUacFormat(
     val clusterDescriptorId: Int,
     val endpointAddress: Int,
     val maxPacketSize: Int,
-    val isAsync: Boolean,
+    /**
+     * [SyncType] ordinal -- see this file's class doc comment on why -1-sentineled Ints, not Room
+     * @TypeConverters, is this file's convention for optional/enum fields.
+     */
+    val syncType: Int,
     val sampleRatesEncoded: String,
     val bInterval: Int,
+    /** See [UacFeedbackEndpoint]. -1 (all three fields) means none was found (#25). */
+    val feedbackEndpointAddress: Int = -1,
+    val feedbackMaxPacketSize: Int = -1,
+    val feedbackBInterval: Int = -1,
 )
 
 @Dao
@@ -231,11 +253,12 @@ internal interface DescriptorCacheDao {
     }
 }
 
-// Bumped to 2 for #61's new CachedUacFormat.bInterval column -- fallbackToDestructiveMigration
+// Bumped to 2 for #61's new CachedUacFormat.bInterval column, then to 3 for #25's isAsync ->
+// syncType rename plus the three new feedbackEndpoint* columns -- fallbackToDestructiveMigration
 // above means this just wipes and recreates the cache on next open rather than needing an
 // explicit Migration, acceptable for a pure performance cache (see this class's own doc comment
 // on why a stale/missing entry is a one-tap-equivalent cost, not a correctness risk).
-@Database(entities = [CachedUacTopology::class, CachedUacFormat::class], version = 2, exportSchema = false)
+@Database(entities = [CachedUacTopology::class, CachedUacFormat::class], version = 3, exportSchema = false)
 internal abstract class DescriptorCacheDatabase : RoomDatabase() {
     abstract fun dao(): DescriptorCacheDao
 }

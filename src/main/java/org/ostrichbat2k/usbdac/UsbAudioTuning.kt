@@ -155,4 +155,26 @@ internal object UsbAudioTuning {
      * device) and this timeout is reached.
      */
     const val STREAM_THREAD_JOIN_TIMEOUT_MS = 2000L
+
+    /**
+     * How many in-flight URBs the feedback stream (#25) keeps outstanding -- far smaller than
+     * [NUM_URBS] since feedback packets arrive much less often than audio data (one roughly per
+     * USB frame/microframe interval, carrying only a handful of bytes) and losing a few in a row
+     * to scheduling jitter just means the rate correction goes briefly stale, not that audio data
+     * itself is at risk.
+     */
+    const val FEEDBACK_NUM_URBS = 2
+
+    /** One feedback sample per URB -- there's nothing to batch, unlike the main audio data path. */
+    const val FEEDBACK_PACKETS_PER_URB = 1
+
+    /**
+     * [org.ostrichbat2k.usbdac.streaming.FeedbackRateDecoder]'s sanity-check band: a decoded
+     * candidate rate is only trusted if it's within this fraction of the nominal negotiated rate.
+     * The on-wire feedback format is genuinely ambiguous (see that class's own doc comment) --
+     * this is deliberately generous (+-10%) since a real device's own clock drift should only
+     * ever be a tiny fraction of this, so the band exists to reject outright garbage/misdecodes,
+     * not to track genuine drift tightly.
+     */
+    const val FEEDBACK_RATE_TOLERANCE_FRACTION = 0.1
 }

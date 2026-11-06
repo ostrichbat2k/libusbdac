@@ -36,6 +36,7 @@ import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
+import org.ostrichbat2k.usbdac.protocol.SyncType
 import org.ostrichbat2k.usbdac.protocol.UacPlaybackTopology
 import org.ostrichbat2k.usbdac.protocol.UacStreamFormat
 import org.ostrichbat2k.usbdac.protocol.UsbAudioController
@@ -71,7 +72,7 @@ class UsbDacActivatorImplTest {
             clusterDescriptorId = clusterDescriptorId,
             endpointAddress = 0x02,
             maxPacketSize = 192,
-            isAsync = true,
+            syncType = SyncType.ASYNC,
             sampleRates = sampleRates,
         )
 

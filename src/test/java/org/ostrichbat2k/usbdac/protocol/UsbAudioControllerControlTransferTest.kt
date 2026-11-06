@@ -348,7 +348,7 @@ class UsbAudioControllerControlTransferTest {
                 clusterDescriptorId = -1,
                 endpointAddress = 0x02,
                 maxPacketSize = 192,
-                isAsync = true,
+                syncType = SyncType.ASYNC,
             )
         val session =
             UsbAudioSession(
@@ -373,7 +373,7 @@ class UsbAudioControllerControlTransferTest {
                 clusterDescriptorId = -1,
                 endpointAddress = 0x02,
                 maxPacketSize = 192,
-                isAsync = true,
+                syncType = SyncType.ASYNC,
             )
         val session = fakeSession()
 

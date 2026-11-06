@@ -43,7 +43,7 @@ class UsbAudioDescriptorHelperTest {
         interfaceNumber: Int = 1,
         altSetting: Int = 1,
         endpointAddress: Int = 0x02,
-        endpointSync: Int = UsbAudioDescriptorHelper.SYNC_TYPE_ASYNC,
+        endpointSync: Int = SyncType.ASYNC.ordinal,
         maxPacketSize: Int = 192,
         bInterval: Int = 1,
         bitResolution: Int = 24,
@@ -75,20 +75,20 @@ class UsbAudioDescriptorHelperTest {
 
     @Test
     fun `a positive bitResolution is recorded as a PCM format`() {
-        val (formats, nonPcm) = record(bitResolution = 24, subslotSize = 4, endpointSync = UsbAudioDescriptorHelper.SYNC_TYPE_ASYNC)
+        val (formats, nonPcm) = record(bitResolution = 24, subslotSize = 4, endpointSync = SyncType.ASYNC.ordinal)
 
         assertEquals(1, formats.getValue(1).size)
         assertTrue(nonPcm.isEmpty())
         val format = formats.getValue(1).single()
         assertEquals(24, format.bitResolution)
         assertEquals(4, format.subslotSize)
-        assertTrue(format.isAsync)
+        assertEquals(SyncType.ASYNC, format.syncType)
     }
 
     @Test
-    fun `isAsync is false when the endpoint's sync type isn't SYNC_TYPE_ASYNC`() {
-        val (formats, _) = record(bitResolution = 16, endpointSync = 0x3 /* e.g. synchronous */)
-        assertFalse(formats.getValue(1).single().isAsync)
+    fun `syncType reflects the endpoint's raw sync bits, not just an async-or-not flag`() {
+        val (formats, _) = record(bitResolution = 16, endpointSync = SyncType.SYNCHRONOUS.ordinal)
+        assertEquals(SyncType.SYNCHRONOUS, formats.getValue(1).single().syncType)
     }
 
     @Test

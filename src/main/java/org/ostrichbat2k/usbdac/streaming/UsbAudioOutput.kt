@@ -550,6 +550,7 @@ class UsbAudioOutput(
                 // stream just because their own one-off control write finished -- see
                 // notifyStreamingStarted's doc comment.
                 usbAudioManager.notifyStreamingStarted()
+                usbAudioManager.setDirectPlaybackActive(true)
             } else {
                 usbAudioManager.releaseClaim()
             }
@@ -566,6 +567,7 @@ class UsbAudioOutput(
                 stopStreamingThread()
                 activated = false
                 usbAudioManager.notifyStreamingStopped()
+                usbAudioManager.setDirectPlaybackActive(false)
                 // Manual mode (#31): the user has opted out of the courtesy release entirely --
                 // the interface stays claimed, hardware state untouched, so a later resume hits
                 // the fast ALREADY_CLAIMED && hasConfiguredHardware path above instantly, with no
@@ -734,6 +736,7 @@ class UsbAudioOutput(
             if (activated) {
                 activated = false
                 usbAudioManager.notifyStreamingStopped()
+                usbAudioManager.setDirectPlaybackActive(false)
                 // The player is genuinely done with this instance -- release immediately rather
                 // than waiting out the usual grace period, which exists only to absorb a quick
                 // pause/resume that this is specifically not.

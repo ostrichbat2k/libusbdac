@@ -476,6 +476,25 @@ class UsbAudioManagerImplTest {
         assertNull(manager.pipelineStats.value)
     }
 
+    @Test
+    fun `setDirectPlaybackActive never throws, even when building a real AudioTrack isn't possible here`() {
+        // See this method's own doc comment on UsbAudioManager -- a plain JVM test environment
+        // with no Robolectric can't construct a real android.media.AudioTrack (it throws "not
+        // mocked"), same root issue as UsbIsoStreamEngine's setUrgentAudioPriority. The method's
+        // own try/catch must swallow that, not let it escape and crash the caller (the real
+        // UsbAudioOutput play()/pause()/release() lifecycle this is wired into).
+        manager.setDirectPlaybackActive(true)
+        manager.setDirectPlaybackActive(false)
+        manager.setDirectPlaybackActive(true)
+    }
+
+    @Test
+    fun `onUsbEnabledChanged(false) tears down the silent direct-playback track without throwing`() {
+        manager.setDirectPlaybackActive(true)
+        every { usbSettings.enabled } returns false
+        manager.onUsbEnabledChanged()
+    }
+
     // ---- ensureFormatActive's real body (an active session, not the no-session early return) ----
 
     private val testFormatAlt2 =

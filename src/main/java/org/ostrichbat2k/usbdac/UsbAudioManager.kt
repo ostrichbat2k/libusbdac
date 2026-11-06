@@ -136,6 +136,21 @@ interface UsbAudioManager : UsbDacPreferences.Listener {
     fun notifyStreamingStopped()
 
     /**
+     * Keeps (or stops keeping) a silent, inaudible [android.media.AudioTrack] actively playing
+     * for as long as direct USB output itself is actually streaming -- not meant for host-app
+     * callers.
+     *
+     * Direct USB output ([org.ostrichbat2k.usbdac.streaming.UsbAudioOutput]) bypasses
+     * AudioTrack/AudioFlinger entirely for the real signal (see
+     * [org.ostrichbat2k.usbdac.streaming.UsbAudioOutput]'s own class doc comment) -- so with no
+     * AudioTrack at all, Android's media-button/Bluetooth-AVRCP active-session routing has
+     * nothing to recognize as "this app is actually playing audio right now", even though this
+     * app's own `MediaSession` already reports a playing state. Idempotent: calling with the same
+     * value as last time is a cheap no-op either way.
+     */
+    fun setDirectPlaybackActive(active: Boolean)
+
+    /**
      * See [org.ostrichbat2k.usbdac.claim.UsbClaimController.beginClaimAttempt] -- exposed on this
      * facade so [org.ostrichbat2k.usbdac.streaming.UsbAudioOutput] can bracket its whole
      * `activateAndStream()` attempt with this and [endClaimAttempt], not just [requestClaim]

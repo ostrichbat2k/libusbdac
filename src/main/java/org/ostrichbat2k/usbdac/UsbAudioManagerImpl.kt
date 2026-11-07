@@ -298,11 +298,23 @@ class UsbAudioManagerImpl(
     override fun setDirectPlaybackActive(active: Boolean) {
         synchronized(directPlaybackTrackLock) {
             try {
+                // A fresh AudioTrack every time, not a cached one just paused/resumed in place --
+                // confirmed on real hardware that reusing one let another app's MediaSession
+                // permanently win Android's media-button routing (AudioPlayerStateMonitor /
+                // MediaSessionStack, in the platform framework) even after this app won audio
+                // focus back and was visibly, genuinely playing: that routing promotes a UID to
+                // the front of its list only when a *new* AudioPlaybackConfiguration (keyed by
+                // player instance, not UID) becomes active, not merely on an existing one
+                // resuming -- see https://issuetracker.google.com/issues/65344811 and
+                // https://issuetracker.google.com/issues/65175978 for the same root cause hit by
+                // other apps, and this method's own doc comment for why this track exists at all.
+                directPlaybackTrack?.let {
+                    it.pause()
+                    it.release()
+                }
+                directPlaybackTrack = null
                 if (active) {
-                    (directPlaybackTrack ?: buildSilentDirectPlaybackTrack().also { directPlaybackTrack = it })
-                        .play()
-                } else {
-                    directPlaybackTrack?.pause()
+                    directPlaybackTrack = buildSilentDirectPlaybackTrack().also { it.play() }
                 }
             } catch (e: RuntimeException) {
                 // Best-effort: this track exists only so Android's media-button routing sees an

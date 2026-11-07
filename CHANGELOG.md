@@ -8,9 +8,17 @@ Pin to an exact tag or commit rather than a version range.
 
 ## [Unreleased]
 
+## [v0.2.0] - 2026-11-07
+
 ### Added
 - Properly modeled all isochronous sync types (Synchronous/Adaptive/
   Asynchronous) and added real feedback-clocked async support (#89).
+- Added a manual DAC release-control mode, opting out of auto-release-to-
+  kernel on pause (#31).
+- Kept a silent `AudioTrack` playing during direct USB output, winning
+  back hardware media-key routing after another app's session takes it
+  (Auxio#41).
+- Exposed per-URB packet-error counters to Kotlin diagnostics (#78).
 
 ### Fixed
 - Cross-thread session/claim state mutations made atomic (#81).
@@ -35,14 +43,37 @@ Pin to an exact tag or commit rather than a version range.
   volume on resume (#37).
 - Resolved the unit test suite's flakiness, root cause and contributing
   leaks (#55).
+- Don't discard the padded-24-bit flag on the first `getAudioOutput()`
+  call after a seek-triggered flush reuses the same `OutputConfig`
+  instance (#101).
+- Rebuild the silent direct-playback `AudioTrack` fresh on every
+  activation instead of reusing a paused one, fixing media-key routing
+  regressing after an app-switch-and-back (#102).
+- Protected the native isochronous handle table against a concurrent
+  close (#76).
+- Fail loudly instead of silently guessing when no device format matches
+  (#72).
+- Log previously-ignored `DISCARDURB` failures instead of swallowing them
+  (#77).
+- Resolved `UsbControlWriterImplTest`'s flaky background-executor timing
+  race (#80).
 
 ### Changed
 - Migrated unit tests from JUnit4 to JUnit6 (Jupiter) (#48).
+- Gave `UsbAudioController`'s control-transfer functions typed failure
+  reasons instead of a bare `Boolean`/`null` (#63).
+- Extracted a dedicated `UsbIsoStreamEngine` + `UsbNativeBridge` component
+  owning native handle lifetime, the URB loop, and position tracking,
+  previously embedded directly in `UsbAudioOutput` (#73).
 
 ### Infrastructure
 - Added detekt static analysis with a pre-existing-debt baseline (#33).
 - Added clang-tidy static analysis (#35).
 - Added a PR-triggered CI workflow (#45, #52, #53).
+- Filled README onboarding gaps: threading contract, host setup
+  requirements, troubleshooting, tested-hardware caveats (#65).
+- Removed unused `androidTest` dependencies with no corresponding
+  instrumented test source (#66).
 
 ## [v0.1.0] - 2026-11-01
 

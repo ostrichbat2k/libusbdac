@@ -134,6 +134,9 @@ class UsbAudioManagerFunctionalTest {
                 every { abxTestMode } returns false
                 every { volumeDb = any() } answers { volumeDbBacking = it.invocation.args[0] as Int? }
                 every { volumeDb } answers { volumeDbBacking }
+                // 100% = uncapped, so this suite's own dB assertions aren't altered by the
+                // safety-cap clamp UsbControlWriterImpl.setVolume now also applies.
+                every { maxVolumePercent } returns 100
             }
         devicesFlow = MutableStateFlow(emptyList())
         discovery = mockk(relaxed = true) { every { devices } returns devicesFlow }

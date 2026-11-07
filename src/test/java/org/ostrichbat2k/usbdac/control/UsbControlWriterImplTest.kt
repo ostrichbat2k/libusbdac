@@ -101,6 +101,10 @@ class UsbControlWriterImplTest {
     @BeforeEach
     fun setUp() {
         mockkObject(UsbAudioController)
+        // Pass-through: this suite asserts against the raw requested dB values it sets up
+        // itself, so the new safety clamp (also mocked, since UsbAudioController is a
+        // mockkObject here) shouldn't alter them -- equivalent to a 100% (uncapped) setting.
+        every { UsbAudioController.capToMaxPercent(any(), any(), any()) } answers { firstArg() }
         usbSettings = mockk(relaxed = true)
         volumeController = mockk(relaxed = true)
         activeSession = null

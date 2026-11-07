@@ -66,8 +66,12 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
@@ -230,6 +234,7 @@ class UsbAudioManagerImpl(
             context,
             usbManager,
             descriptorCache,
+            usbSettings,
             getPreferredBitResolution = { preferredBitResolution },
             onCapabilities = { _capabilities.value = it },
             log = diagnosticLogger::log,
@@ -1067,6 +1072,30 @@ class UsbAudioManagerImpl(
     /** [UsbDacPreferences.Listener] callback: see [blockPlayback]'s doc comment. */
     override fun onBitPerfectModeChanged() {
         updateBlockPlayback()
+    }
+
+    private val _volumeSafetyExceeded =
+        MutableSharedFlow<Unit>(extraBufferCapacity = 1, onBufferOverflow = BufferOverflow.DROP_OLDEST)
+    override val volumeSafetyExceeded: SharedFlow<Unit> = _volumeSafetyExceeded.asSharedFlow()
+
+    override fun reportVolumeSafetyViolation() {
+        _volumeSafetyExceeded.tryEmit(Unit)
+    }
+
+    /**
+     * [UsbDacPreferences.Listener] callback: a lowered cap must correct whatever's actually
+     * playing right now, not just the next write -- otherwise "at any point in time" would only
+     * hold until the next unrelated volume change or track boundary. Every write-time clamp
+     * elsewhere (see [org.ostrichbat2k.usbdac.protocol.UsbAudioController.capToMaxPercent]'s call
+     * sites) only re-checks when something else triggers a write; this is the one that reacts to
+     * the cap itself changing. No-op if nothing's currently playing bit-perfect (no live volume
+     * to correct) or the current volume is already within the new cap.
+     */
+    override fun onMaxVolumePercentChanged() {
+        val state = controlState.value ?: return
+        val current = state.volume ?: return
+        val capped = UsbAudioController.capToMaxPercent(current, state.volumeRange, usbSettings.maxVolumePercent)
+        if (capped != current) controlWriter.setVolume(capped)
     }
 
     private companion object {

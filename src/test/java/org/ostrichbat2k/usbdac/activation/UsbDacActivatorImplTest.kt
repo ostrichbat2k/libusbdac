@@ -36,6 +36,7 @@ import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
+import org.ostrichbat2k.usbdac.UsbDacPreferences
 import org.ostrichbat2k.usbdac.protocol.SyncType
 import org.ostrichbat2k.usbdac.protocol.UacPlaybackTopology
 import org.ostrichbat2k.usbdac.protocol.UacStreamFormat
@@ -169,6 +170,7 @@ class UsbDacActivatorImplTest {
     private lateinit var context: Context
     private lateinit var usbManager: UsbManager
     private lateinit var descriptorCache: UsbDacDescriptorCache
+    private lateinit var usbSettings: UsbDacPreferences
     private val capabilities = mutableListOf<UsbDeviceCapabilities?>()
     private var preferredBitResolution = 24
     private lateinit var activator: UsbDacActivatorImpl
@@ -185,6 +187,11 @@ class UsbDacActivatorImplTest {
         context = mockk(relaxed = true)
         usbManager = mockk(relaxed = true)
         descriptorCache = mockk(relaxed = true)
+        usbSettings = mockk(relaxed = true)
+        // Pass-through: this test suite asserts against defaultVolumeTarget's own stubbed
+        // results directly, so capToMaxPercent (also mocked, since UsbAudioController is a
+        // mockkObject here) shouldn't alter them -- equivalent to a 100% (uncapped) setting.
+        every { UsbAudioController.capToMaxPercent(any(), any(), any()) } answers { firstArg() }
         capabilities.clear()
         preferredBitResolution = 24
         activator =
@@ -192,6 +199,7 @@ class UsbDacActivatorImplTest {
                 context = context,
                 usbManager = usbManager,
                 descriptorCache = descriptorCache,
+                usbSettings = usbSettings,
                 getPreferredBitResolution = { preferredBitResolution },
                 onCapabilities = { capabilities += it },
                 log = {},

@@ -180,16 +180,24 @@ internal class UsbControlWriterImpl(
      * every intermediate step.
      */
     override fun setVolume(valueDb: Int) {
-        pendingVolumeDb = valueDb
+        // Clamped against UsbDacPreferences.maxVolumePercent before anything else touches it --
+        // this is the one place every real volume change (physical keys/system UI via
+        // MediaSessionHolder, the Settings screen's own raw slider) actually lands, so it's the
+        // single enforcement point that makes the cap hold regardless of caller.
+        val cappedDb =
+            UsbAudioController.capToMaxPercent(valueDb, getControlState()?.volumeRange, usbSettings.maxVolumePercent)
+        pendingVolumeDb = cappedDb
         // Reflect the requested value immediately so callers (the volume key's system UI, the
         // Settings screen slider) don't have to wait on the hardware round-trip just to show
         // where the user asked the slider to go; refreshControlState below corrects this to the
         // real read-back value once the write actually lands.
-        publishControlState(getControlState()?.copy(volume = valueDb))
+        publishControlState(getControlState()?.copy(volume = cappedDb))
         // Persisted so the next activation (new session, app restart, DAC reconnect) starts from
-        // here instead of a fixed default -- see [UsbAudioOutput]'s constructor.
-        usbSettings.volumeDb = valueDb
-        volumeController.mirrorDbToStreamMusic(valueDb)
+        // here instead of a fixed default -- see [UsbAudioOutput]'s constructor. Persisting the
+        // already-capped value, not the raw request, so a later lowered cap can't be bypassed by
+        // whatever was stored before it changed.
+        usbSettings.volumeDb = cappedDb
+        volumeController.mirrorDbToStreamMusic(cappedDb)
         scheduleVolumeWrite()
     }
 

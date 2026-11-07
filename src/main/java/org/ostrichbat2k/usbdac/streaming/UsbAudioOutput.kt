@@ -106,19 +106,6 @@ class UsbAudioOutput(
         DROP_PADDING_BYTE,
     }
 
-    private companion object {
-        // factor(i) = 1.0 - (i+1)/UsbAudioTuning.UNDERRUN_FADE_FRAMES for the common case where a short read's
-        // fade window is the full UsbAudioTuning.UNDERRUN_FADE_FRAMES (true whenever the read has at least that
-        // many real frames in it, the overwhelming majority of underruns) -- computed once here
-        // rather than with a floating-point division per frame per channel on every single
-        // underrun on the real-time native streaming thread. Only the rare case where the read
-        // itself is shorter than UsbAudioTuning.UNDERRUN_FADE_FRAMES still computes its own (necessarily
-        // differently-shaped) factors on the fly -- see fadeTailToSilence.
-        val UNDERRUN_FADE_FACTORS = DoubleArray(UsbAudioTuning.UNDERRUN_FADE_FRAMES) { i ->
-            1.0 - (i + 1).toDouble() / UsbAudioTuning.UNDERRUN_FADE_FRAMES
-        }
-    }
-
     private val bytesPerFrame = channels * format.subslotSize
     // Computed in Long first -- confirmed, reproduced: at 32-bit/2ch/96000Hz (the float-decode
     // conversion target now reachable via UsbAudioOutputProvider.wideIntTargetFormat preferring
@@ -135,32 +122,22 @@ class UsbAudioOutput(
     // (never shrunk) to fit the largest buffer ExoPlayer has handed write() so far.
     private var floatConversionBuffer = ByteArray(0)
     private var paddingDropBuffer = ByteArray(0)
-    // Frames actually handed to the device via a paced, submitted URB -- i.e. audibly played,
-    // not just sitting in [ringBuffer]. [getPositionUs] MUST report this, not [framesWritten]:
-    // DefaultAudioSink.hasAudioOutputPendingData() compares its own written-frame count against
-    // audioOutput.getPositionUs() to decide whether there's still unplayed data. Reporting
-    // framesWritten there made that comparison always ~equal, so hasPendingData() was false (and
-    // isEnded() true) up to UsbAudioTuning.RING_BUFFER_MS early -- DefaultAudioSink believed playout had already
-    // finished while up to 5s of real audio was still draining out of the ring buffer, and
-    // permanently stopped calling write() as a result. Confirmed via instrumentation: write()
-    // call count froze completely (not just slowed) the moment this desync crossed zero.
-    @Volatile private var framesOutput = 0L
 
-    private var isoHandle = 0L
-    private var streamThread: Thread? = null
-    @Volatile private var streaming = false
-    @Volatile private var lastUrbSubmittedAtMs = 0L
-    // Feedback-clocked async support (#25) -- see UacFeedbackEndpoint's own doc comment. Stay at
-    // their zero/null/false defaults whenever this format isn't SyncType.ASYNC with a feedback
-    // endpoint, or when opening the feedback stream itself failed; a feedback failure never
-    // affects the main fields above -- see stopStreamingThread's mirrored-but-independent
-    // shutdown of these.
-    private var feedbackHandle = 0L
-    private var feedbackThread: Thread? = null
-    @Volatile private var feedbackStreaming = false
-    // Only ever read/written from the single native streaming thread -- not actually volatile for
-    // cross-thread visibility, just convenient to declare alongside the other stream-lifetime state.
-    private var underrunCount = 0
+    // Owns the native handle(s), the URB submit/reap loop(s), and frames-output position
+    // accounting -- see UsbIsoStreamEngine's own class doc comment for why this is a separate
+    // class (#73). `paused` is read fresh on every URB, not captured once here -- see that
+    // class's own doc comment for why that has to stay live.
+    private val streamEngine =
+        UsbIsoStreamEngine(
+            session = session,
+            format = format,
+            channels = channels,
+            sampleRateHz = sampleRateHz,
+            ringBuffer = ringBuffer,
+            paused = { paused },
+            reportPipelineStats = usbAudioManager::reportPipelineStats,
+        )
+
     // The isochronous schedule can't actually stop (the USB clock must keep ticking), so "pause"
     // means substituting silence for whatever's next, *without* draining it out of [ringBuffer] --
     // otherwise up to UsbAudioTuning.RING_BUFFER_MS of already-decoded audio keeps playing out audibly after
@@ -573,6 +550,7 @@ class UsbAudioOutput(
                 // stream just because their own one-off control write finished -- see
                 // notifyStreamingStarted's doc comment.
                 usbAudioManager.notifyStreamingStarted()
+                usbAudioManager.setDirectPlaybackActive(true)
             } else {
                 usbAudioManager.releaseClaim()
             }
@@ -589,11 +567,19 @@ class UsbAudioOutput(
                 stopStreamingThread()
                 activated = false
                 usbAudioManager.notifyStreamingStopped()
-                // Hand the interface back to Android after a short grace period (see
-                // UsbAudioManager.releaseClaim's doc comment) rather than immediately -- a quick
-                // pause/resume shouldn't pay the real hand-off cost, but genuinely leaving
-                // playback paused should free the device for every other app.
-                usbAudioManager.releaseClaim()
+                usbAudioManager.setDirectPlaybackActive(false)
+                // Manual mode (#31): the user has opted out of the courtesy release entirely --
+                // the interface stays claimed, hardware state untouched, so a later resume hits
+                // the fast ALREADY_CLAIMED && hasConfiguredHardware path above instantly, with no
+                // relock needed since nothing forced its state in the meantime. The user decides
+                // whether to hand it back via usbAudioManager.setManualClaim(false) instead.
+                if (!usbSettings.manualReleaseControl) {
+                    // Hand the interface back to Android after a short grace period (see
+                    // UsbAudioManager.releaseClaim's doc comment) rather than immediately -- a
+                    // quick pause/resume shouldn't pay the real hand-off cost, but genuinely
+                    // leaving playback paused should free the device for every other app.
+                    usbAudioManager.releaseClaim()
+                }
             }
         }
     }
@@ -733,7 +719,7 @@ class UsbAudioOutput(
         L.i("UsbAudioOutput: flush()")
         ringBuffer.clear()
         framesWritten = 0L
-        framesOutput = 0L
+        streamEngine.resetPosition()
     }
 
     override fun stop() {
@@ -750,6 +736,7 @@ class UsbAudioOutput(
             if (activated) {
                 activated = false
                 usbAudioManager.notifyStreamingStopped()
+                usbAudioManager.setDirectPlaybackActive(false)
                 // The player is genuinely done with this instance -- release immediately rather
                 // than waiting out the usual grace period, which exists only to absorb a quick
                 // pause/resume that this is specifically not.
@@ -785,7 +772,17 @@ class UsbAudioOutput(
     override fun getBufferSizeInFrames(): Long =
         ((ringBuffer.availableToWrite() + ringBuffer.availableToRead()) / bytesPerFrame).toLong()
 
-    override fun getPositionUs(): Long = framesOutput * 1_000_000L / sampleRateHz
+    // [streamEngine.framesOutput] is frames actually handed to the device via a paced, submitted
+    // URB -- i.e. audibly played, not just sitting in [ringBuffer] -- and MUST be what's reported
+    // here, not [framesWritten]: DefaultAudioSink.hasAudioOutputPendingData() compares its own
+    // written-frame count against audioOutput.getPositionUs() to decide whether there's still
+    // unplayed data. Reporting framesWritten there made that comparison always ~equal, so
+    // hasPendingData() was false (and isEnded() true) up to UsbAudioTuning.RING_BUFFER_MS early --
+    // DefaultAudioSink believed playout had already finished while up to 5s of real audio was
+    // still draining out of the ring buffer, and permanently stopped calling write() as a result.
+    // Confirmed via instrumentation: write() call count froze completely (not just slowed) the
+    // moment this desync crossed zero.
+    override fun getPositionUs(): Long = streamEngine.framesOutput * 1_000_000L / sampleRateHz
 
     override fun getPlaybackParameters(): PlaybackParameters = PlaybackParameters.DEFAULT
 
@@ -815,7 +812,8 @@ class UsbAudioOutput(
         // pause() released it -- nothing will ever make lastUrbSubmittedAtMs move on its own in
         // this state (streaming itself is false), so the check below alone would never catch it.
         if (!paused && !activated) return true
-        return streaming && (System.currentTimeMillis() - lastUrbSubmittedAtMs) > UsbAudioTuning.STALL_THRESHOLD_MS
+        return streamEngine.streaming &&
+            (System.currentTimeMillis() - streamEngine.lastUrbSubmittedAtMs) > UsbAudioTuning.STALL_THRESHOLD_MS
     }
 
     override fun addListener(listener: AudioOutput.Listener) {}
@@ -832,479 +830,11 @@ class UsbAudioOutput(
 
     override fun setPreferredDevice(preferredDevice: AudioDeviceInfo?) {}
 
-    private fun startStreamingThread() {
-        if (streaming) return
-        val fd = session.connection.fileDescriptor
+    /** See [UsbIsoStreamEngine.start] -- the native handle lifetime/URB loop/position tracking live there (#73). */
+    private fun startStreamingThread() = streamEngine.start()
 
-        // THE pacing fix: a high-speed device schedules one iso packet per 125us *microframe*,
-        // not per 1ms frame -- confirmed via UsbNative.getUsbSpeed on real hardware (this FiiO
-        // device negotiates high-speed). Assuming 1000 packets/sec unconditionally (true only for
-        // full-speed) packed a full millisecond's worth of samples into a slot the device only
-        // actually allots 125us of real playback-clock time to -- the USBDEVFS-level transfer
-        // still completes with zero errors either way (the wire itself has no problem physically
-        // carrying that many bytes in one microframe), but the device's own internal clock
-        // consumes its receive buffer at the *real*, correct sample rate regardless of how fast
-        // we hand it data, so this meant feeding it audio 8x faster than it could actually play
-        // the data back -- invisible to every error counter this code has, since the corruption
-        // happens inside the device's own silicon once its buffer can't absorb the overfill
-        // anymore, not on the USB wire. Confirmed, reproduced: audible crackle that was worse and
-        // more frequent at 96kHz than 44.1/48kHz, consistent with the *absolute* excess bytes/sec
-        // being larger at a higher sample rate against the same fixed-size device buffer.
-        //
-        // packetsPerUrb is scaled up by the same factor as packetsPerSecond (see
-        // UsbAudioTuning.BASE_PACKETS_PER_URB's doc comment) so the *real* amount of audio -- and host-controller
-        // lookahead cushion -- one URB represents stays the same regardless of negotiated speed;
-        // only each packet's own content size shrinks to match its true, shorter duration.
-        val usbSpeed = UsbNative.getUsbSpeed(fd)
-        val speedName =
-            when (usbSpeed) {
-                1 -> "low"
-                2 -> "full"
-                3 -> "high"
-                4 -> "wireless"
-                5 -> "super"
-                6 -> "super+"
-                else -> "unknown"
-            }
-        val pacing = IsoPacing.forSpeed(usbSpeed, UsbAudioTuning.BASE_PACKETS_PER_URB, format.bInterval)
-        val packetsPerSecond = pacing.packetsPerSecond
-        val packetDurationNs = pacing.packetDurationNs
-        val packetsPerUrb = pacing.packetsPerUrb
-
-        val handle =
-            UsbNative.openIsoStream(fd, format.endpointAddress, format.maxPacketSize, packetsPerUrb, UsbAudioTuning.NUM_URBS)
-        if (handle == 0L) {
-            L.w("UsbAudioOutput: failed to open iso stream")
-            return
-        }
-        L.i(
-            "UsbAudioOutput: opened iso stream fd=$fd endpoint=${format.endpointAddress} " +
-                "maxPacketSize=${format.maxPacketSize} handle=$handle usbSpeed=$speedName " +
-                "bInterval=${format.bInterval} (pacing $packetsPerSecond packets/sec, " +
-                "${packetDurationNs / 1000}us/packet, $packetsPerUrb packets/urb)")
-        isoHandle = handle
-        val scheduler = IsoPacketScheduler(sampleRateHz, packetsPerSecond)
-        val frameBytes = bytesPerFrame
-
-        // Reused across every call instead of allocating a fresh ByteArray/IntArray each time --
-        // this runs every URB, indefinitely, for the entire stream. Confirmed, reproduced:
-        // audible crackling that could start spontaneously a minute or more into otherwise-clean
-        // playback, and got worse at higher data rates (96kHz) -- consistent with the garbage
-        // from thousands of allocations a minute eventually triggering a GC pause long enough to
-        // stall this time-critical thread past the lookahead the in-flight URBs provide, starving
-        // the device's isochronous schedule. Sized for the largest a packet can ever be for this
-        // sampleRateHz (IsoPacketScheduler's Bresenham remainder adds at most one extra sample).
-        val maxBytesPerPacket = (sampleRateHz / packetsPerSecond + 1) * frameBytes
-        val urbBuffer = ByteArray(packetsPerUrb * maxBytesPerPacket)
-        val packetLengths = IntArray(packetsPerUrb)
-        // What's currently loaded into each URB slot, for framesOutput to credit once reapIso()
-        // confirms *that* slot's URB actually completed -- not when it was merely submitted (#71).
-        // Reused across this stream's whole lifetime the same way urbBuffer/packetLengths are:
-        // indexed by slot, overwritten every time that slot is resubmitted.
-        val slotFrames = LongArray(UsbAudioTuning.NUM_URBS)
-        val slotCreditable = BooleanArray(UsbAudioTuning.NUM_URBS)
-
-        /**
-         * Ramps the last [UsbAudioTuning.UNDERRUN_FADE_FRAMES] frames of real audio already in [buf] (ending at
-         * [readBytes]) down to silence, in place, instead of leaving the hard edge
-         * [PcmRingBuffer.readOrZeroPad]'s zero-padding creates right at that boundary.
-         *
-         * A real underrun's audible symptom isn't the padding itself -- confirmed, reproduced: a
-         * *fully* empty read (zero real bytes, the whole URB zero-padded) is inaudible, just a
-         * fraction more silence before sound starts/resumes. It's specifically a *partial* read
-         * (some real signal, then a dead stop at [readBytes]) that's heard as a click/crackle,
-         * because real waveforms essentially never cross zero exactly at that boundary -- cutting
-         * straight to silence there is a genuine discontinuity, not just an early mute. Fading the
-         * tail down smoothly removes that discontinuity without changing anything else about how
-         * underruns are handled (still logged, still rate-limited, still just silence beyond
-         * [readBytes]) -- it only asks "how do the last few real samples transition into that
-         * silence" instead of "do they transition at all".
-         */
-        fun fadeTailToSilence(buf: ByteArray, readBytes: Int) {
-            val subslot = format.subslotSize
-            val totalFrames = readBytes / frameBytes
-            val fadeFrames = minOf(UsbAudioTuning.UNDERRUN_FADE_FRAMES, totalFrames)
-            if (fadeFrames <= 0) return
-            val signBit = 1L shl (subslot * 8 - 1)
-            val maxValue = signBit - 1
-            val minValue = -signBit
-            for (i in 0 until fadeFrames) {
-                val frameIndex = totalFrames - fadeFrames + i
-                // Reaches exactly 0 at the last faded frame, right where the zero-padded region
-                // -- already silent -- begins, so the two halves meet smoothly instead of at a
-                // sudden edge. Uses the precomputed table whenever fadeFrames is the usual full
-                // UsbAudioTuning.UNDERRUN_FADE_FRAMES window; only the rare shorter-read case (fadeFrames <
-                // UsbAudioTuning.UNDERRUN_FADE_FRAMES) still divides on the fly, since that shape isn't in the
-                // table.
-                val factor =
-                    if (fadeFrames == UsbAudioTuning.UNDERRUN_FADE_FRAMES) {
-                        UNDERRUN_FADE_FACTORS[i]
-                    } else {
-                        1.0 - (i + 1).toDouble() / fadeFrames
-                    }
-                val frameOffset = frameIndex * frameBytes
-                for (ch in 0 until channels) {
-                    val sampleOffset = frameOffset + ch * subslot
-                    var sample = 0L
-                    for (b in 0 until subslot) {
-                        sample = sample or ((buf[sampleOffset + b].toLong() and 0xFF) shl (8 * b))
-                    }
-                    if (sample and signBit != 0L) sample -= (signBit shl 1)
-                    val faded = (sample * factor).toLong().coerceIn(minValue, maxValue)
-                    for (b in 0 until subslot) {
-                        buf[sampleOffset + b] = ((faded shr (8 * b)) and 0xFF).toByte()
-                    }
-                }
-            }
-        }
-
-        /** Fills [urbBuffer]/[packetLengths] in place; returns how many bytes of [urbBuffer] are used. */
-        fun buildUrb(): Int {
-            var total = 0
-            for (p in 0 until packetsPerUrb) {
-                val bytes = scheduler.nextPacketSampleCount() * frameBytes
-                packetLengths[p] = bytes
-                total += bytes
-            }
-            if (!paused) {
-                val read = ringBuffer.readOrZeroPad(urbBuffer, total)
-                // A genuine underrun (decoder/renderer thread couldn't keep up, ring buffer ran
-                // dry) rather than the deliberate pause-silence case above -- heard as a click/
-                // crackle, since real audio briefly drops to silence mid-stream. Rate-limited:
-                // this is checking a hunch that this is rate-dependent (more bytes/sec to decode
-                // in real time at 96kHz than 44.1/48kHz for the same ring buffer *time* depth), so
-                // what matters is whether it happens at all and roughly how often, not a line per
-                // occurrence.
-                if (read < total) {
-                    underrunCount++
-                    if (underrunCount == 1 || underrunCount % 50 == 0) {
-                        L.w(
-                            "UsbAudioOutput: ring buffer underrun #$underrunCount -- wanted $total " +
-                                "bytes, had $read (short by ${total - read})")
-                    }
-                    // Only a partial read has a real edge to smooth -- a fully empty one is
-                    // already just silence, nothing to fade (see fadeTailToSilence's doc comment).
-                    if (read > 0) fadeTailToSilence(urbBuffer, read)
-                }
-            } else {
-                // Reused buffer may still hold real audio from a prior, unpaused call -- must
-                // explicitly silence it rather than relying on a fresh zero-filled array.
-                urbBuffer.fill(0, 0, total)
-            }
-            return total
-        }
-
-        streaming = true
-        lastUrbSubmittedAtMs = System.currentTimeMillis()
-        streamThread =
-            Thread {
-                    // Default thread priority competes on equal footing with the decoder/GC/UI
-                    // for CPU time -- fine at 44.1/48kHz's lower data rate (~176-192 KB/s), but
-                    // confirmed, reproduced at 96kHz (~384 KB/s): audible crackling through the
-                    // DAC specifically (clean on speaker, same files), with zero errors anywhere
-                    // in the native USB transfer layer (no reap errors, no short/failed packets,
-                    // ring buffer never empty) -- i.e. real, correctly-paced data was being
-                    // submitted, just not always with enough real-time precision under
-                    // scheduling contention to avoid an audible gap at the higher data rate.
-                    // THREAD_PRIORITY_URGENT_AUDIO is the standard Android fix for exactly this:
-                    // the same elevated real-time scheduling class AudioTrack's own internal
-                    // mixer thread runs at, so this thread gets prioritized the same way a real
-                    // audio output thread would.
-                    android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
-                    L.i("UsbAudioOutput: streaming thread starting ($sampleRateHz Hz)")
-                    for (slot in 0 until UsbAudioTuning.NUM_URBS) {
-                        val total = buildUrb()
-                        // Retry once immediately before giving up on this slot -- see #59: a
-                        // slot that's never submitted here never enters the reap/resubmit
-                        // rotation at all, permanently shrinking it by one for the rest of the
-                        // stream's life. A device not yet fully settled right after claim is the
-                        // one case actually seen to fail transiently this early (see
-                        // UsbAudioTuning.DAC_SETTLE_DELAY_MS's own history); a second attempt a
-                        // few microseconds later costs nothing against that.
-                        val ok =
-                            UsbNative.submitIso(handle, slot, urbBuffer, packetLengths) ||
-                                UsbNative.submitIso(handle, slot, urbBuffer, packetLengths)
-                        if (!ok) {
-                            L.e(
-                                "UsbAudioOutput: initial submitIso failed twice for slot $slot " +
-                                    "-- this URB stays unsubmitted")
-                        } else {
-                            // Credited once reapIso() confirms this slot's URB actually
-                            // completed, in the steady-state loop below -- not now (#71). Prefill
-                            // always runs right after startStreamingThread() was called with
-                            // paused already confirmed false, so always creditable, same as the
-                            // old unconditional credit here.
-                            slotFrames[slot] = (total / frameBytes).toLong()
-                            slotCreditable[slot] = true
-                        }
-                    }
-
-                    // USBDEVFS_REAPURB is supposed to block until a submitted URB has genuinely
-                    // completed in real USB bus time, so correct real-time pacing should come for
-                    // free from the kernel/host controller blocking on it. Confirmed, on a real
-                    // device, that assumption doesn't hold on its own: reapIso() was observed
-                    // completing URBs roughly 7x faster than real time allows (now understood: on
-                    // this high-speed device, the true packet duration is 125us, and this
-                    // mismeasurement -- taken against an assumed 1ms -- was actually consistent
-                    // with that, within measurement noise, rather than a genuinely unexplained
-                    // host-controller quirk). Pacing explicitly against wall-clock time here,
-                    // rather than trusting reapIso()'s own timing, is still the right approach
-                    // regardless -- it just needs packetDurationNs to be correct for this
-                    // device's real negotiated speed (see above) to actually pace against the
-                    // real rate instead of papering over the symptom with an equally-wrong delay.
-                    val streamStartNs = System.nanoTime()
-                    val urbRealTimeNs = packetsPerUrb * packetDurationNs
-                    var urbsPaced = 0L
-                    var submitted = 0
-                    var reapErrors = 0
-                    while (streaming) {
-                        val slot = UsbNative.reapIso(handle)
-                        if (!streaming) break
-                        if (slot < 0) {
-                            reapErrors++
-                            if (slot == UsbNative.REAP_ERROR_FATAL) {
-                                // The stream cannot produce anything more (device gone, most
-                                // likely) -- see #60: looping back to reapIso() here is exactly
-                                // the busy-spin this check exists to stop. isStalled() (already
-                                // polled by callers, e.g. play()'s retry path) picks this up on
-                                // its own once lastUrbSubmittedAtMs stops advancing, so nothing
-                                // further needs to be signalled from here.
-                                L.e("UsbAudioOutput: reapIso() reported a fatal error -- stopping the streaming thread")
-                                break
-                            }
-                            continue
-                        }
-
-                        // This slot's URB has now genuinely completed (reapIso() returning it is
-                        // exactly that confirmation) -- credit framesOutput for whatever was
-                        // loaded into it back when IT was submitted (prefill above, or a previous
-                        // trip through this loop), not for the new content built below (#71:
-                        // submission time != completion time -- crediting at submission there
-                        // reported playback as running ahead of what the device had actually
-                        // consumed, by up to the whole prefill depth).
-                        if (slotCreditable[slot]) {
-                            framesOutput += slotFrames[slot]
-                        }
-
-                        urbsPaced++
-                        val waitNs = (streamStartNs + urbsPaced * urbRealTimeNs) - System.nanoTime()
-                        if (waitNs > 0) {
-                            Thread.sleep(waitNs / 1_000_000L, (waitNs % 1_000_000L).toInt())
-                        }
-
-                        val total = buildUrb()
-                        // Retry once immediately before giving up on this slot -- see #59: unlike
-                        // every other slot, which keeps cycling through reapIso() even after a
-                        // failed resubmit (so a future reap just finds it still full of stale
-                        // data), a slot that's never resubmitted here never comes back through
-                        // reapIso() at all, permanently shrinking the rotation by one.
-                        val resubmitted =
-                            UsbNative.submitIso(handle, slot, urbBuffer, packetLengths) ||
-                                UsbNative.submitIso(handle, slot, urbBuffer, packetLengths)
-                        if (!resubmitted) {
-                            // Lost for good now -- same reasoning as the fatal reapIso() branch
-                            // above: stop rather than keep draining the ring buffer into a
-                            // shrinking, eventually-empty set of URB slots.
-                            L.e(
-                                "UsbAudioOutput: submitIso() failed twice in a row for slot " +
-                                    "$slot -- stopping the streaming thread")
-                            break
-                        }
-                        submitted++
-                        lastUrbSubmittedAtMs = System.currentTimeMillis()
-                        // Recorded now, credited above next time this slot comes back around
-                        // through reapIso() confirming it completed. Not creditable while paused:
-                        // this is synthetic silence standing in for the USB clock's unstoppable
-                        // schedule, not real consumed track audio -- see [paused]'s doc comment.
-                        // Crediting it would let getPositionUs() catch up to framesWritten
-                        // mid-pause and re-trigger the exact premature-isEnded() stall this
-                        // counter exists to prevent.
-                        slotFrames[slot] = (total / frameBytes).toLong()
-                        slotCreditable[slot] = !paused
-                        // ~20 URBs at this class's ~8ms-of-real-audio-per-URB pacing (see
-                        // UsbAudioTuning.BASE_PACKETS_PER_URB) is roughly a 160ms cadence -- frequent enough
-                        // for a live pipeline visualizer to feel real-time without pushing a
-                        // new StateFlow value (and the GC churn that implies) on every single
-                        // URB, which happens ~125 times/sec.
-                        if (submitted % 20 == 0) {
-                            usbAudioManager.reportPipelineStats(
-                                UsbPipelineStats(
-                                    atMs = System.currentTimeMillis(),
-                                    urbsSubmitted = submitted.toLong(),
-                                    reapErrors = reapErrors,
-                                    underrunCount = underrunCount,
-                                    bufferedBytes = ringBuffer.availableToRead(),
-                                    bufferCapacityBytes = ringBuffer.availableToRead() + ringBuffer.availableToWrite()))
-                        }
-                        if (submitted % 500 == 0) {
-                            val realElapsedMs = (System.nanoTime() - streamStartNs) / 1_000_000L
-                            val pacedMs = urbsPaced * urbRealTimeNs / 1_000_000L
-                            L.i(
-                                "UsbAudioOutput: $submitted URBs submitted, $reapErrors reap " +
-                                    "errors, ${ringBuffer.availableToRead()} bytes buffered, " +
-                                    "${pacedMs}ms of audio paced over ${realElapsedMs}ms real time")
-                        }
-                    }
-                    L.i("UsbAudioOutput: streaming thread exiting ($submitted submitted, $reapErrors reap errors)")
-                }
-                .apply {
-                    isDaemon = true
-                    name = "UsbAudioOutput-stream"
-                    start()
-                }
-
-        startFeedbackThreadIfApplicable(fd, scheduler)
-    }
-
-    /**
-     * Opens and starts the feedback-endpoint reader thread (#25) when [format] is
-     * [SyncType.ASYNC] and declares a [UacFeedbackEndpoint] -- a second, independent blocking
-     * native loop on a second handle/fd pair, same [UsbNative.openIsoStream]/[UsbNative.reapIso]
-     * pattern [startStreamingThread]'s own main loop already uses, just reading instead of
-     * writing. [scheduler] is the exact same instance the main loop paces packets against --
-     * captured here by closure, not promoted to an instance field, since both threads are started
-     * from within this one call to [startStreamingThread] and never need to reach it from
-     * anywhere else.
-     *
-     * Every failure here (open failed, fatal reap error) is logged and leaves this thread/handle
-     * stopped, but never touches [streaming]/[isoHandle]/the main loop -- a feedback failure
-     * means the scheduler stops getting corrected and stays at whatever rate was last set, not
-     * that playback itself is at risk.
-     */
-    private fun startFeedbackThreadIfApplicable(fd: Int, scheduler: IsoPacketScheduler) {
-        val feedback = format.feedbackEndpoint
-        if (format.syncType != SyncType.ASYNC || feedback == null) return
-
-        val handle =
-            UsbNative.openIsoStream(
-                fd,
-                feedback.address,
-                feedback.maxPacketSize,
-                UsbAudioTuning.FEEDBACK_PACKETS_PER_URB,
-                UsbAudioTuning.FEEDBACK_NUM_URBS)
-        if (handle == 0L) {
-            L.w("UsbAudioOutput: failed to open feedback iso stream -- continuing without rate correction")
-            return
-        }
-        L.i("UsbAudioOutput: opened feedback iso stream endpoint=${feedback.address} handle=$handle")
-        feedbackHandle = handle
-        feedbackStreaming = true
-
-        feedbackThread =
-            Thread { runFeedbackLoop(handle, feedback.maxPacketSize, scheduler) }
-                .apply {
-                    isDaemon = true
-                    name = "UsbAudioOutput-feedback"
-                    start()
-                }
-    }
-
-    /**
-     * The feedback thread's body, split out of [startFeedbackThreadIfApplicable] purely to keep
-     * that function's own cyclomatic complexity within detekt's threshold -- behaves identically
-     * either way, since [handle]/[maxPacketSize]/[scheduler] are exactly what the closure captured
-     * before this split.
-     */
-    private fun runFeedbackLoop(handle: Long, maxPacketSize: Int, scheduler: IsoPacketScheduler) {
-        val packetLengths = IntArray(UsbAudioTuning.FEEDBACK_PACKETS_PER_URB) { maxPacketSize }
-        val buffer = ByteArray(maxPacketSize)
-
-        fun resubmit(slot: Int) {
-            val ok =
-                UsbNative.submitIsoRead(handle, slot, packetLengths) ||
-                    UsbNative.submitIsoRead(handle, slot, packetLengths)
-            if (!ok) {
-                L.w("UsbAudioOutput: feedback submitIsoRead failed twice for slot $slot -- this URB stays unsubmitted")
-            }
-        }
-
-        android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
-        L.i("UsbAudioOutput: feedback thread starting")
-        for (slot in 0 until UsbAudioTuning.FEEDBACK_NUM_URBS) resubmit(slot)
-
-        while (feedbackStreaming) {
-            val slot = UsbNative.reapIso(handle)
-            if (!feedbackStreaming) break
-            if (slot < 0) {
-                if (slot == UsbNative.REAP_ERROR_FATAL) {
-                    L.e(
-                        "UsbAudioOutput: feedback reapIso() reported a fatal error -- stopping " +
-                            "the feedback thread only")
-                    break
-                }
-                continue
-            }
-            val bytesRead = UsbNative.readIsoSlotData(handle, slot, buffer)
-            if (bytesRead > 0) {
-                val decoded = FeedbackRateDecoder.decode(buffer.copyOf(bytesRead), sampleRateHz)
-                if (decoded != null) scheduler.updateRate(decoded)
-            }
-            resubmit(slot)
-        }
-        L.i("UsbAudioOutput: feedback thread exiting")
-    }
-
-    private fun stopStreamingThread() {
-        val mainIdle = !streaming && isoHandle == 0L
-        val feedbackIdle = !feedbackStreaming && feedbackHandle == 0L
-        if (mainIdle && feedbackIdle) return
-        streaming = false
-        if (isoHandle != 0L) {
-            UsbNative.cancelIso(isoHandle)
-        }
-        feedbackStreaming = false
-        if (feedbackHandle != 0L) {
-            UsbNative.cancelIso(feedbackHandle)
-        }
-        streamThread?.join(UsbAudioTuning.STREAM_THREAD_JOIN_TIMEOUT_MS)
-        feedbackThread?.join(UsbAudioTuning.STREAM_THREAD_JOIN_TIMEOUT_MS)
-
-        // The feedback stream (#25) is shut down independently of the main one below: a stuck
-        // feedback thread must never block freeing the main stream, and vice versa -- the same
-        // documented-but-structurally-unfixed concurrent-close contract #76 already tracks for a
-        // single stream applies separately to each of these two, not jointly.
-        val mainStuck = isStreamThreadStuck(streamThread)
-        if (mainStuck) {
-            // cancelIso() failed to unblock the thread's native call within the timeout --
-            // freeing isoHandle now would race a still-running reapIso()/submitIso() over memory
-            // closeIsoStream() frees underneath it, a genuine use-after-free (confirmed,
-            // reproduced -- see UsbAudioTuning.STREAM_THREAD_JOIN_TIMEOUT_MS's doc comment).
-            // Leaking the handle and the stuck thread is the safe failure mode here: [streaming]
-            // is already false, so nothing further gets submitted from this instance, and a
-            // later call into this same function (e.g. a retried pause()/release()) will attempt
-            // the same cancel-and-join sequence again rather than being permanently blocked.
-            L.e(
-                "UsbAudioOutput: streaming thread did not stop within " +
-                    "${UsbAudioTuning.STREAM_THREAD_JOIN_TIMEOUT_MS}ms of cancelIso() -- leaving " +
-                    "the native stream open rather than risk a use-after-free")
-        } else {
-            streamThread = null
-            if (isoHandle != 0L) {
-                UsbNative.closeIsoStream(isoHandle)
-                isoHandle = 0L
-            }
-        }
-
-        val feedbackStuck = isStreamThreadStuck(feedbackThread)
-        if (feedbackStuck) {
-            L.e(
-                "UsbAudioOutput: feedback thread did not stop within " +
-                    "${UsbAudioTuning.STREAM_THREAD_JOIN_TIMEOUT_MS}ms of cancelIso() -- leaving " +
-                    "the native feedback stream open rather than risk a use-after-free")
-        } else {
-            feedbackThread = null
-            if (feedbackHandle != 0L) {
-                UsbNative.closeIsoStream(feedbackHandle)
-                feedbackHandle = 0L
-            }
-        }
-
-        if (mainStuck) return
-        // Stream genuinely stopped (not a transient pause-silence gap, which doesn't call this at
-        // all) -- clear rather than leave the pipeline visualizer showing numbers frozen from a
-        // track that isn't playing anymore.
-        usbAudioManager.reportPipelineStats(null)
-    }
+    /** See [UsbIsoStreamEngine.stop] -- the native handle lifetime/URB loop/position tracking live there (#73). */
+    private fun stopStreamingThread() = streamEngine.stop()
 
     /**
      * Whether [thread] is still running after [stopStreamingThread]'s join -- i.e.
@@ -1313,6 +843,11 @@ class UsbAudioOutput(
      * can drive this one decision directly without needing to reference [UsbNative] at all (see
      * [UsbAudioTuning.STREAM_THREAD_JOIN_TIMEOUT_MS]'s doc comment for why this must gate whether
      * [stopStreamingThread] is allowed to free the native stream).
+     *
+     * Kept here, not forwarded to [UsbIsoStreamEngine]'s own identical private check, so this
+     * existing test seam (see [org.ostrichbat2k.usbdac.streaming.UsbAudioOutputVolumeRestoreTest])
+     * keeps working exactly as it did before #73's extraction -- this function was never actually
+     * part of what moved.
      */
     internal fun isStreamThreadStuck(thread: Thread?): Boolean = thread?.isAlive == true
 }

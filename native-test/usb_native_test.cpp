@@ -21,6 +21,7 @@
 
 #include <cerrno>
 #include <climits>
+#include <cstdint>
 #include <cstring>
 #include <vector>
 
@@ -44,7 +45,8 @@ void Java_org_ostrichbat2k_usbdac_streaming_UsbNative_closeIsoStream(JNIEnv*, jo
 // Not extern "C" -- usb_native.cpp declares these with plain C++ linkage (internal helpers with
 // external linkage, never called from Kotlin/JNI directly), so these forward declarations must
 // match that exactly for the linker to resolve them.
-int processReapedUrb(const struct usbdevfs_urb* reaped, int packetsPerUrb, int numUrbs);
+int processReapedUrb(const struct usbdevfs_urb* reaped, int packetsPerUrb, int numUrbs,
+                      int* badPacketsOut = nullptr, int64_t* shortBytesOut = nullptr);
 int reapErrorCodeForErrno(int err);
 
 namespace {
@@ -434,10 +436,35 @@ TEST(ProcessReapedUrb, CountsAndLogsShortOrFailedPackets) {
 
     std::string log;
     usb_native_test::LogCapture capture(&log);
-    int slot = processReapedUrb(u, 4, 4);
+    int badPackets = -1;
+    int64_t shortBytes = -1;
+    int slot = processReapedUrb(u, 4, 4, &badPackets, &shortBytes);
     EXPECT_EQ(slot, 0);
     EXPECT_NE(log.find("2/3 packets short/failed"), std::string::npos) << "actual log: " << log;
     EXPECT_NE(log.find("140/300 bytes actually delivered"), std::string::npos) << "actual log: " << log;
+    EXPECT_EQ(badPackets, 2);
+    EXPECT_EQ(shortBytes, 160);  // 300 expected - 140 actually delivered, see #78.
+}
+
+TEST(ProcessReapedUrb, OutParamsDefaultToZeroWhenEveryPacketIsClean) {
+    FakeUrb urb(/*numPackets=*/2);
+    struct usbdevfs_urb* u = urb.get();
+    u->number_of_packets = 2;
+    u->iso_frame_desc[0] = {/*length=*/48, /*actual_length=*/48, /*status=*/0};
+    u->iso_frame_desc[1] = {/*length=*/48, /*actual_length=*/48, /*status=*/0};
+
+    int badPackets = -1;
+    int64_t shortBytes = -1;
+    processReapedUrb(u, 4, 4, &badPackets, &shortBytes);
+    EXPECT_EQ(badPackets, 0);
+    EXPECT_EQ(shortBytes, 0);
+}
+
+TEST(ProcessReapedUrb, OutParamsAreOptional) {
+    // Every other call site in this file omits them -- confirms the default arguments compile
+    // and don't crash on a null out-param.
+    FakeUrb urb(/*numPackets=*/0);
+    EXPECT_NO_FATAL_FAILURE(processReapedUrb(urb.get(), 4, 4));
 }
 
 TEST(ProcessReapedUrb, AllCleanPacketsLogsNothingAboutBadPackets) {

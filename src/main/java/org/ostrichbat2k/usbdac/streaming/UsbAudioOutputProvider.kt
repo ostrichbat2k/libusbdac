@@ -27,7 +27,6 @@ import android.media.AudioFormat
 import androidx.media3.common.C
 import androidx.media3.exoplayer.audio.AudioOutput
 import androidx.media3.exoplayer.audio.AudioOutputProvider
-import java.util.Collections
 import java.util.IdentityHashMap
 import timber.log.Timber as L
 
@@ -75,6 +74,11 @@ class UsbAudioOutputProvider(
         // to a 3-byte device format by dropping its bottom byte -- see
         // isPaddedTwentyFourBitContent's doc comment for why 24, not e.g. 25.
         const val MAX_PADDABLE_BITS = 24
+
+        // See paddedConfigs' own doc comment -- this bounds its memory, not real concurrent
+        // track-switch depth (which the "upcoming track can run ahead" case this field already
+        // documents only ever needs 2 of at once in practice).
+        const val PADDED_CONFIGS_CAPACITY = 8
     }
 
     // Bridges getOutputConfig()'s knowledge of a specific track's real Format (and therefore
@@ -87,11 +91,21 @@ class UsbAudioOutputProvider(
     // upcoming track's getOutputConfig() can run ahead of an earlier one's getAudioOutput().
     // Keyed by identity on the exact OutputConfig instance DefaultAudioSink round-trips
     // unchanged (confirmed by reading its own source: getOutputConfig()'s return value is what's
-    // later passed into getAudioOutput() as-is) -- entries are removed once consumed in
-    // getAudioOutput() so this can't grow unbounded. Not synchronized: like allFormats and every
-    // other field on this class, only ever touched from ExoPlayer's own single playback thread.
-    private val paddedConfigs =
-        Collections.newSetFromMap(IdentityHashMap<AudioOutputProvider.OutputConfig, Boolean>())
+    // later passed into getAudioOutput() as-is).
+    //
+    // Non-destructive lookup, bounded by eviction order instead of removing an entry the first
+    // time it's consumed -- confirmed, reproduced on real hardware: seeking within a track calls
+    // DefaultAudioSink.flush() directly (not reconfigureAndFlush(), which is the only path that
+    // calls getOutputConfig() again), so the *same* OutputConfig instance from before the seek
+    // gets handed to getAudioOutput() a second time once the sink rebuilds its AudioOutput. A
+    // remove-on-consume design (the original approach here) finds nothing on that second call --
+    // already removed by the first -- and silently falls back to the genuinely-32-bit alt-setting
+    // for what's still actually padded 24-bit content. PADDED_CONFIGS_CAPACITY bounds memory
+    // instead: in practice at most a couple of tracks' configs are ever in flight at once (see
+    // this comment's own "upcoming track can run ahead" note above), so this is generous headroom
+    // not a real behavioral limit.
+    private val paddedConfigs = IdentityHashMap<AudioOutputProvider.OutputConfig, Boolean>()
+    private val paddedConfigsOrder = ArrayDeque<AudioOutputProvider.OutputConfig>()
 
     // Every format this device's streaming interface declares (one per alt-setting, typically one
     // per bit depth) -- matched against per-track, not narrowed down to a single one up front.
@@ -301,7 +315,11 @@ class UsbAudioOutputProvider(
                 .setVirtualDeviceId(formatConfig.virtualDeviceId)
                 .build()
         if (isPadded) {
-            paddedConfigs += config
+            paddedConfigs[config] = true
+            paddedConfigsOrder.addLast(config)
+            if (paddedConfigsOrder.size > PADDED_CONFIGS_CAPACITY) {
+                paddedConfigs.remove(paddedConfigsOrder.removeFirst())
+            }
         }
         return config
     }
@@ -313,35 +331,41 @@ class UsbAudioOutputProvider(
      *
      * [config.encoding][AudioOutputProvider.OutputConfig.encoding] `== C.ENCODING_PCM_32BIT` is
      * ambiguous between "genuinely 32-bit" and "24-bit padded into a 32-bit container" (#67) --
-     * [paddedConfigs] (removed here, not just checked: this [config] is spent once an
-     * [AudioOutput] is actually built for it) is what [getOutputConfig] left behind to
-     * disambiguate it. A padded [config] whose resolved target still comes back 4 bytes wide
-     * means [wideIntTargetFormat]'s own `>= 3` filter found no alt-setting narrower than the
-     * literal container already matches -- i.e. the device has no 24-bit alt-setting at all, so
-     * this is routed to the same 32-bit alt-setting a genuinely-32-bit track would use anyway
-     * (still exactly lossless, just not bandwidth-optimal), and [UsbAudioOutput] has nothing to
-     * drop: the real bytes it receives already exactly match that target's own 4-byte container.
+     * [paddedConfigs] (checked here, not consumed: see its own doc comment for why a seek's
+     * repeat [getAudioOutput] call for the very same [config] instance needs this flag to still
+     * be there) is what [getOutputConfig] left behind to disambiguate it. A padded [config] whose
+     * resolved target still comes back 4 bytes wide means [wideIntTargetFormat]'s own `>= 3`
+     * filter found no alt-setting narrower than the literal container already matches -- i.e. the
+     * device has no 24-bit alt-setting at all, so this is routed to the same 32-bit alt-setting a
+     * genuinely-32-bit track would use anyway (still exactly lossless, just not bandwidth-
+     * optimal), and [UsbAudioOutput] has nothing to drop: the real bytes it receives already
+     * exactly match that target's own 4-byte container.
      */
     private fun resolveTarget(
         config: AudioOutputProvider.OutputConfig,
     ): Pair<UacStreamFormat, UsbAudioOutput.InputConversion> {
         val isFloatInput = config.encoding == C.ENCODING_PCM_FLOAT
-        val isPaddedInput = !isFloatInput && paddedConfigs.remove(config)
+        val isPaddedInput = !isFloatInput && paddedConfigs.containsKey(config)
+        // Both branches below should be unreachable in practice: getFormatSupport() already
+        // gated on exactly this same match existing before DefaultAudioSink ever calls
+        // getAudioOutput() for this config. Failing loudly here instead of silently picking an
+        // arbitrary device format (bitResolution/subslotSize mismatched against what the caller
+        // actually needs) turns a future desync between getFormatSupport()/matchingFormat()/
+        // wideIntTargetFormat() into a visible, diagnosable error instead of distorted audio or
+        // invalid packet sizing with only a warning log to notice by.
         val target =
             if (isFloatInput || isPaddedInput) {
                 wideIntTargetFormat(channels, config.sampleRate)
-                    ?: allFormats.first().also {
-                        L.w(
-                            "UsbAudioOutputProvider: no narrow-int conversion target at " +
-                                "${config.sampleRate}Hz, using ${it.bitResolution}-bit")
-                    }
+                    ?: error(
+                        "UsbAudioOutputProvider: no narrow-int conversion target at " +
+                            "${config.sampleRate}Hz -- getFormatSupport should have reported " +
+                            "UNSUPPORTED for this config before getAudioOutput() was ever called")
             } else {
                 allFormats.firstOrNull { encodingFor(it.subslotSize) == config.encoding }
-                    ?: allFormats.first().also {
-                        L.w(
-                            "UsbAudioOutputProvider: no format matches " +
-                                "encoding=${config.encoding}, using ${it.bitResolution}-bit")
-                    }
+                    ?: error(
+                        "UsbAudioOutputProvider: no format matches encoding=${config.encoding} " +
+                            "-- getFormatSupport should have reported UNSUPPORTED for this " +
+                            "config before getAudioOutput() was ever called")
             }
         val conversion =
             when {

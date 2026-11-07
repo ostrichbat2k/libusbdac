@@ -22,6 +22,7 @@ import org.ostrichbat2k.usbdac.UsbAudioManager
 import org.ostrichbat2k.usbdac.protocol.UsbAudioSession
 import org.ostrichbat2k.usbdac.streaming.UsbAudioOutput
 import android.hardware.usb.UsbDevice
+import kotlinx.coroutines.flow.StateFlow
 
 /**
  * Everything the rest of the library decides about *who* currently holds the raw USB interface --
@@ -53,6 +54,9 @@ internal interface UsbClaimController {
 
     /** Whether we currently hold the raw interface claim right now. */
     fun isClaimed(): Boolean
+
+    /** Live counterpart of [isClaimed] -- see [UsbAudioManager.interfaceClaimed] (#31). */
+    val claimedState: StateFlow<Boolean>
 
     /**
      * True, exactly once, if the Feature Unit's hardware mute/volume was forced to a HAL-handoff

@@ -26,6 +26,7 @@ import org.ostrichbat2k.usbdac.protocol.UsbAudioController
 import org.ostrichbat2k.usbdac.protocol.UsbAudioSession
 import org.ostrichbat2k.usbdac.streaming.UsbAudioOutput
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 
 internal class UsbControlWriterImpl(
     private val usbSettings: UsbDacPreferences,
@@ -141,7 +142,15 @@ internal class UsbControlWriterImpl(
     private val volumeExecutor =
         Executors.newSingleThreadExecutor { r -> Thread(r, "UsbAudioControl-Volume").apply { isDaemon = true } }
     @Volatile private var pendingVolumeDb: Int? = null
-    @Volatile private var volumeWriteInFlight = false
+
+    // AtomicBoolean, not a bare @Volatile Boolean: scheduleVolumeWrite() is called both from the
+    // caller's thread (via setVolume) and recursively from volumeExecutor's own background thread
+    // once a write finishes -- a plain check-then-act (`if (volumeWriteInFlight) return` then a
+    // separate `volumeWriteInFlight = true`) lets both sides read false in the same window and
+    // both proceed, queuing a redundant extra hardware round trip instead of coalescing onto one.
+    // compareAndSet makes the check-and-claim a single atomic step. Same reasoning as
+    // UsbClaimControllerImpl.activeStreamCount's AtomicInteger-not-@Volatile comment.
+    private val volumeWriteInFlight = AtomicBoolean(false)
 
     // Test-only: volumeExecutor is a real background thread with no production shutdown path
     // (this instance is meant to live for the whole process) -- without this, a test's own
@@ -185,16 +194,15 @@ internal class UsbControlWriterImpl(
     }
 
     private fun scheduleVolumeWrite() {
-        if (volumeWriteInFlight) return
         val target = pendingVolumeDb ?: return
         val session = getActiveSession() ?: return
         val format = getActiveFormat() ?: return
-        volumeWriteInFlight = true
+        if (!volumeWriteInFlight.compareAndSet(false, true)) return
         volumeExecutor.execute {
             // See setMuted's identical reasoning: a volume write needs the interface claimed the
             // same as real streaming does.
             if (requestClaim() == ClaimOutcome.FAILED) {
-                volumeWriteInFlight = false
+                volumeWriteInFlight.set(false)
                 return@execute
             }
             // Was hardcoded 0..2 (master + stereo) -- see UsbDacActivatorImpl.activate's
@@ -206,7 +214,7 @@ internal class UsbControlWriterImpl(
             log("User set volume=$target")
             refreshControlState(session, format, session.device.productName ?: session.device.deviceName)
             releaseClaim()
-            volumeWriteInFlight = false
+            volumeWriteInFlight.set(false)
             if (pendingVolumeDb != target) {
                 // Something more recent arrived while this write was in flight -- go straight to
                 // it instead of waiting for the next external setVolume call to notice.

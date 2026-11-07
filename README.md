@@ -25,9 +25,29 @@ music player (this fork's USB DAC work: [ostrichbat2k/Auxio](https://github.com/
 branch `dev`). Confirmed working end-to-end on real hardware as a
 standalone library, consumed by Auxio as a git submodule.
 
-Devices tested against: a FiiO Snowsky Tiny A (UAC2), a generic "AB13X USB
-Audio" dongle (UAC1, 8000/48000 Hz only), and wired EarPods presenting a
-UAC3 interface.
+Devices tested against: a FiiO Snowsky Tiny A (UAC2, High-Speed), a
+generic "AB13X USB Audio" dongle (UAC1, Full-Speed, 8000/48000 Hz only),
+and wired EarPods presenting a UAC3 interface (Full-Speed). Every device
+seen so far negotiates Synchronous or Adaptive isochronous mode -- the
+Asynchronous/feedback-clocked path added for #25 has no real-hardware
+verification yet; it only activates for a genuinely Asynchronous device
+with a feedback endpoint, and every other device takes the unchanged,
+already-verified code path. DSD alt-settings are parsed and shown in the
+`UsbDeviceCapabilities` snapshot but are never actually played back --
+`UsbAudioOutputProvider` only matches PCM formats for playback routing.
+
+## Versioning
+
+This project is **pre-1.0**: it follows no formal semver guarantee yet, and
+a breaking API change may land between tags without a major-version bump.
+If you depend on this via JitPack, pin to an exact tag or commit
+(`com.github.ostrichbat2k:libusbdac:<tag-or-sha>`) rather than a version
+range. See [CHANGELOG.md](CHANGELOG.md) for what changed between releases,
+including unreleased changes on `master`.
+
+Going-forward policy (informal, until 1.0): a `0.x` bump may break the
+public API; reaching `1.0` is this project's commitment to semver from
+then on.
 
 ## Features
 
@@ -80,6 +100,44 @@ UAC3 interface.
   permission for it (requested through the normal
   `UsbManager`/`ACTION_USB_PERMISSION` flow) -- no root required.
 - `androidx.media3:media3-exoplayer` on the host app's classpath.
+
+### Host manifest / setup
+
+The library's own `AndroidManifest.xml` declares nothing -- USB host
+support is optional per-device, so whether to declare
+`<uses-feature android:name="android.hardware.usb.host" android:required="..."/>`
+is the host app's call (`required="false"` if the app should still install
+on devices without USB host support, falling back to no DAC output at
+all).
+
+Device discovery is runtime-only: `UsbDeviceDiscoveryImpl` registers its
+own `BroadcastReceiver` for `ACTION_USB_DEVICE_ATTACHED`/`_DETACHED` when
+`UsbAudioManager.start()` is called, and polls `UsbManager.deviceList` for
+devices already attached at that point. There is no manifest-declared
+`<uses-feature>`-plus-`usb_device_filter.xml`-plus attach `<intent-filter>`
+auto-launch support -- the host app has to already be running (or add that
+manifest wiring itself) for `start()` to ever get called in response to a
+device being plugged in while the app isn't.
+
+## Threading
+
+`UsbAudioManager`'s public `StateFlow` properties (`capabilities`,
+`playbackRoute`, `controlState`, `pipelineStats`, `diagnosticLog`,
+`devices`, `blockPlayback`) are safe to collect from any thread or
+coroutine context -- `StateFlow`'s own value publication is thread-safe,
+and several of them are updated from background threads internally (the
+activation thread, the streaming thread, a dedicated volume-write
+executor), not just from the thread that called into the manager.
+
+Every mutating entry point (`start()`, `requestPermission()`,
+`triggerActivation()`, `releaseClaim()`, and `UsbControlWriter`'s
+`setVolume`/`setMuted`/`setMixerGain`) can also be called from any thread
+-- each one hands off to its own internal background thread/executor
+rather than assuming the caller's thread, so there's no required
+dispatcher to call them from. The one exception is `awaitActivation()`,
+a `suspend fun` meant to be called from a coroutine (see "Using it"
+above) -- it suspends for the real hardware activation round-trip rather
+than blocking a thread.
 
 ## Architecture
 
@@ -177,6 +235,62 @@ can grant the new app focus and let it start opening the device before
 this app's own focus-loss callback even arrives, so every millisecond this
 library still holds the claim after that point is a millisecond more that
 the other app's first attempt is likely to fail.
+
+## Troubleshooting
+
+`diagnosticLog`/`UsbDiagnosticLog` is a most-recent-first, timestamped log
+of activation events (attach, permission, claim, descriptor parse,
+session ready, every reason a fallback happened) -- read it first for
+"why isn't bit-perfect mode active for this device/track." A clean
+"DAC session ready" line followed by `playbackRoute` reporting
+`PlaybackRoute.Direct` for the current track means it *is* working as
+intended; most "it's not working" reports turn out to be a device/track
+combination that was always going to fall back (see "What happens with
+an unsupported device" below), not a bug.
+
+`pipelineStats`/`UsbPipelineStats` is a live ring-buffer/USB-transfer
+snapshot (`null` whenever nothing is genuinely streaming) -- `urbsSubmitted`
+climbing steadily at the expected rate with `reapErrors`/`underrunCount`
+at or near zero is healthy; a nonzero/climbing `underrunCount` with
+`bufferedBytes` near zero points at the ring buffer starving (upstream
+decode/IO falling behind), while `reapErrors` climbing instead points at
+the USB transfer layer itself (device removed, cable fault, hub issue).
+
+**What happens with an unsupported device**: a device with no
+`USB_CLASS_AUDIO` interface at all never appears in `devices` -- it's
+filtered out at discovery, silently, with no log line and no error,
+since it's simply not a USB audio device as far as this library is
+concerned. A device that *does* declare a USB Audio Class interface but
+fails descriptor parsing (malformed/unusual-enough descriptors) logs the
+failure to `diagnosticLog` and `UsbDacActivator.activate()` returns
+`null` -- the device shows up in `devices`, permission can be granted for
+it, but activation never succeeds and every track falls back to the host
+app's normal audio path. Neither case throws an exception out of the
+public API.
+
+An Asynchronous-sync-type device (see "Status" above) is not an
+unsupported-device case -- it's expected to activate and stream normally,
+just without real-hardware verification of the feedback-clocked rate
+correction yet.
+
+## Known limitations
+
+- The Asynchronous/feedback-clocked isochronous path (#25) has no
+  real-hardware verification -- every device tested so far is
+  Synchronous or Adaptive.
+- DSD alt-settings are parsed and shown in the `UsbDeviceCapabilities`
+  snapshot but are never selected for playback; only PCM formats are
+  matched for routing.
+- Non-default `bInterval` values are parsed and used for pacing, but
+  haven't been exercised against a device that actually declares one
+  other than the common case.
+- The streaming-loop hardening work (lost URB slots, busy-spin on device
+  loss -- see the CHANGELOG) is real-hardware-verified for the specific
+  failure modes it targeted, not exhaustively fuzzed against every way a
+  device can misbehave mid-stream.
+- Multichannel (>2-channel) output is implemented (channel masks, Feature
+  Unit/Mixer Unit loops all scale with the device's real channel count)
+  but not hardware-verified against actual >2-channel hardware.
 
 ## Building
 

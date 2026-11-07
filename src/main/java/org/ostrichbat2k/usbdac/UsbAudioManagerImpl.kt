@@ -55,10 +55,15 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
+import android.media.AudioAttributes
+import android.media.AudioFormat
 import android.media.AudioManager
+import android.media.AudioTrack
 import android.os.Build
 import androidx.media3.exoplayer.audio.AudioSink
 import androidx.media3.exoplayer.audio.DefaultAudioSink
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -100,6 +105,12 @@ class UsbAudioManagerImpl(
 ) : UsbAudioManager {
     private val usbManager = context.getSystemService(Context.USB_SERVICE) as UsbManager
     private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+    // See setDirectPlaybackActive's own doc comment. Guards both the lazy-create and the
+    // play()/pause() toggle as one unit -- play() and pause() land on different callers'
+    // threads (UsbAudioOutput's own activationExecutor vs whatever thread calls pause()/
+    // release()), so this can't just be a bare atomic/volatile field.
+    private val directPlaybackTrackLock = Object()
+    private var directPlaybackTrack: AudioTrack? = null
     private val descriptorCache: UsbDacDescriptorCache = UsbDacDescriptorCacheImpl(context)
     // Scoped to this app's own package rather than a fixed literal -- the host app's package
     // name is the natural, always-unique namespace for this broadcast action, and matches what
@@ -283,6 +294,68 @@ class UsbAudioManagerImpl(
     /** The inverse of [notifyStreamingStarted] -- call before, not after, releasing anything. */
     override fun notifyStreamingStopped() = claimController.notifyStreamingStopped()
 
+    @Suppress("TooGenericExceptionCaught") // Deliberately broad -- see this function's own doc comment.
+    override fun setDirectPlaybackActive(active: Boolean) {
+        synchronized(directPlaybackTrackLock) {
+            try {
+                // A fresh AudioTrack every time, not a cached one just paused/resumed in place --
+                // confirmed on real hardware that reusing one let another app's MediaSession
+                // permanently win Android's media-button routing (AudioPlayerStateMonitor /
+                // MediaSessionStack, in the platform framework) even after this app won audio
+                // focus back and was visibly, genuinely playing: that routing promotes a UID to
+                // the front of its list only when a *new* AudioPlaybackConfiguration (keyed by
+                // player instance, not UID) becomes active, not merely on an existing one
+                // resuming -- see https://issuetracker.google.com/issues/65344811 and
+                // https://issuetracker.google.com/issues/65175978 for the same root cause hit by
+                // other apps, and this method's own doc comment for why this track exists at all.
+                directPlaybackTrack?.let {
+                    it.pause()
+                    it.release()
+                }
+                directPlaybackTrack = null
+                if (active) {
+                    directPlaybackTrack = buildSilentDirectPlaybackTrack().also { it.play() }
+                }
+            } catch (e: RuntimeException) {
+                // Best-effort: this track exists only so Android's media-button routing sees an
+                // actually-playing AudioTrack (see this method's own doc comment) -- a failure
+                // building or toggling it must never take down the real DAC stream over it.
+                L.w("UsbAudioManagerImpl: failed to update the silent direct-playback track: ${e.message}")
+            }
+        }
+    }
+
+    /**
+     * A short, silent, infinitely-looped [AudioTrack] -- content/format genuinely don't matter
+     * here (nothing audible ever reaches it, see [setDirectPlaybackActive]'s own doc comment),
+     * just real playing state. [AudioTrack.MODE_STATIC] + [AudioTrack.setLoopPoints] (loop count
+     * `-1` == forever) keeps it playing indefinitely off one single `write()`, with no dedicated
+     * feeder thread needed the way [AudioTrack.MODE_STREAM] would require.
+     */
+    private fun buildSilentDirectPlaybackTrack(): AudioTrack {
+        val frameCount = DIRECT_PLAYBACK_TRACK_FRAMES
+        val track =
+            AudioTrack.Builder()
+                .setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                        .build())
+                .setAudioFormat(
+                    AudioFormat.Builder()
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .setSampleRate(DIRECT_PLAYBACK_TRACK_SAMPLE_RATE_HZ)
+                        .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                        .build())
+                .setBufferSizeInBytes(frameCount * 2)
+                .setTransferMode(AudioTrack.MODE_STATIC)
+                .build()
+        track.write(ShortArray(frameCount), 0, frameCount)
+        track.setVolume(0f)
+        track.setLoopPoints(0, frameCount, -1)
+        return track
+    }
+
     override fun beginClaimAttempt() = claimController.beginClaimAttempt()
 
     override fun endClaimAttempt() = claimController.endClaimAttempt()
@@ -319,10 +392,17 @@ class UsbAudioManagerImpl(
         joinActivationThreadForTest()
         claimController.shutdownExecutorForTest()
         controlWriter.shutdownExecutorForTest()
+        manualClaimExecutor.shutdownNow()
     }
 
-    /** Test-only, no production caller -- see [UsbClaimControllerImpl.awaitClaimSchedulerIdleForTest]. */
+    /**
+     * Test-only, no production caller. Drains [manualClaimExecutor] first -- [setManualClaim]
+     * dispatches there before ever touching [claimController] -- then
+     * [UsbClaimControllerImpl.awaitClaimSchedulerIdleForTest] so a `setManualClaim`-triggered
+     * [releaseClaim]'s own further scheduling has settled too.
+     */
     internal fun awaitClaimSettledForTest() {
+        manualClaimExecutor.submit {}.get(DRAIN_TIMEOUT_SECONDS_FOR_TEST, TimeUnit.SECONDS)
         claimController.awaitClaimSchedulerIdleForTest()
     }
 
@@ -352,6 +432,31 @@ class UsbAudioManagerImpl(
     // that used to lean on them now spell out all three arguments explicitly.
     override fun releaseClaim(delayMs: Long, awaitAndroidTakeover: Boolean, deactivateOnTimeout: Boolean) {
         claimController.releaseClaim(delayMs, awaitAndroidTakeover, deactivateOnTimeout)
+    }
+
+    override val interfaceClaimed: StateFlow<Boolean> = claimController.claimedState
+
+    // Dedicated, same reasoning as UsbControlWriterImpl.volumeExecutor: setManualClaim can block
+    // on real USB I/O (requestClaim always does; releaseClaim's awaitAndroidTakeover=true below
+    // does too) and is driven by a Settings UI toggle on the caller's own thread, which must not
+    // block on that round trip.
+    private val manualClaimExecutor =
+        Executors.newSingleThreadExecutor { r -> Thread(r, "UsbAudioManager-manualClaim").apply { isDaemon = true } }
+
+    override fun setManualClaim(claimed: Boolean) {
+        manualClaimExecutor.execute {
+            if (claimed) {
+                requestClaim()
+            } else {
+                // awaitAndroidTakeover=true: this call exists specifically so interfaceClaimed
+                // reflects reality once it flips, not just the intent to release -- see this
+                // function's own doc comment on UsbAudioManager. deactivateOnTimeout stays false:
+                // a manual release that doesn't get confirmed is still just a release, not a
+                // reason to tear down the whole session the way a track that genuinely needs HAL
+                // right now would.
+                releaseClaim(delayMs = 0, awaitAndroidTakeover = true, deactivateOnTimeout = false)
+            }
+        }
     }
 
     // In-memory only: which bit resolution to prefer when multiple formats are offered. Not
@@ -774,7 +879,7 @@ class UsbAudioManagerImpl(
             // can race to re-claim the interface, and evicting it again right before
             // selectFormat is safe/cheap insurance against that.
             UsbAudioController.reassertKernelEviction(session)
-            ok = UsbAudioController.selectFormat(session, format)
+            ok = UsbAudioController.selectFormat(session, format) == UsbAudioController.ControlWriteOutcome.Success
             if (ok) {
                 updateActiveSessionState { it.copy(format = format) }
                 diagnosticLogger.log("Switched to ${format.bitResolution}-bit (alt=${format.alternateSetting}) for upcoming track")
@@ -902,6 +1007,14 @@ class UsbAudioManagerImpl(
         sessionState = SessionState.Idle
         _controlState.value = null
         _capabilities.value = null
+        // The whole session is genuinely done (device unplugged, or USB DAC output turned off)
+        // -- UsbAudioOutput.pause()/release() already toggle this track off during ordinary
+        // pause/track-skip, but this is the one path that also needs to free its native
+        // AudioTrack resource outright, not just leave it paused indefinitely.
+        synchronized(directPlaybackTrackLock) {
+            directPlaybackTrack?.release()
+            directPlaybackTrack = null
+        }
     }
 
     /**
@@ -954,5 +1067,16 @@ class UsbAudioManagerImpl(
     /** [UsbDacPreferences.Listener] callback: see [blockPlayback]'s doc comment. */
     override fun onBitPerfectModeChanged() {
         updateBlockPlayback()
+    }
+
+    private companion object {
+        // Generous on purpose, same reasoning as UsbClaimControllerImpl's own identical constant
+        // -- never meant to trip in practice, just to fail loud instead of hanging a test suite.
+        const val DRAIN_TIMEOUT_SECONDS_FOR_TEST = 5L
+
+        // See buildSilentDirectPlaybackTrack's own doc comment -- content/quality genuinely don't
+        // matter, so these are the cheapest values that are still a valid AudioTrack config.
+        const val DIRECT_PLAYBACK_TRACK_SAMPLE_RATE_HZ = 8000
+        const val DIRECT_PLAYBACK_TRACK_FRAMES = 8000 // 1 second at the rate above.
     }
 }

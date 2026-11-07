@@ -36,6 +36,9 @@ import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import timber.log.Timber as L
 
 /**
@@ -85,7 +88,8 @@ internal class UsbClaimControllerImpl(
     // driver for Android's normal USB-audio HAL to use). Distinct from a session existing at all
     // -- a session can be fully discovered/activated and sitting completely unclaimed between
     // tracks, see UsbAudioManager.activateDac's tail and [releaseClaim].
-    @Volatile private var interfaceClaimed = false
+    private val _claimedState = MutableStateFlow(false)
+    override val claimedState: StateFlow<Boolean> = _claimedState.asStateFlow()
     @Volatile private var pendingRelease: ScheduledFuture<*>? = null
     // See UsbAudioManager.deactivateDac()'s and this class's own awaitAndroidOutputTakeover()
     // comments on this.
@@ -186,8 +190,8 @@ internal class UsbClaimControllerImpl(
         return was
     }
 
-    /** Whether we currently hold the raw interface claim -- see [interfaceClaimed]. */
-    override fun isClaimed(): Boolean = interfaceClaimed
+    /** Whether we currently hold the raw interface claim -- see [claimedState]. */
+    override fun isClaimed(): Boolean = _claimedState.value
 
     /**
      * For [UsbAudioManager.activateDac]'s tail: its own `UsbAudioController.activate()` call
@@ -196,7 +200,7 @@ internal class UsbClaimControllerImpl(
      * [releaseClaim]/[requestClaim] calls agree with reality.
      */
     override fun markAlreadyClaimed() {
-        interfaceClaimed = true
+        _claimedState.value = true
     }
 
     /**
@@ -205,7 +209,7 @@ internal class UsbClaimControllerImpl(
      * [releaseClaim] dance.
      */
     override fun markReleased() {
-        interfaceClaimed = false
+        _claimedState.value = false
     }
 
     /** For [UsbAudioManager.deactivateDac], canceling any release scheduled before a teardown. */
@@ -239,11 +243,11 @@ internal class UsbClaimControllerImpl(
     override fun requestClaim(session: UsbAudioSession?): UsbAudioManager.ClaimOutcome {
         pendingRelease?.cancel(false)
         pendingRelease = null
-        if (interfaceClaimed) return UsbAudioManager.ClaimOutcome.ALREADY_CLAIMED
+        if (_claimedState.value) return UsbAudioManager.ClaimOutcome.ALREADY_CLAIMED
         session ?: return UsbAudioManager.ClaimOutcome.FAILED
         val ok = UsbAudioController.reclaimFromKernel(session)
         if (ok) {
-            interfaceClaimed = true
+            _claimedState.value = true
             // reclaimFromKernel only re-claims the control interface and the streaming
             // interface's alt-0 -- the actual bit-depth alt-setting is whatever
             // ensureFormatActive's selectFormat call puts it at, further down the line. But that
@@ -332,7 +336,7 @@ internal class UsbClaimControllerImpl(
         // called -- since this can run after a real delay (see releaseClaim's own doc comment on
         // why that distinction matters).
         val session = getActiveSession()
-        if (session != null && interfaceClaimed) {
+        if (session != null && _claimedState.value) {
             // See UsbVolumeController.prepareForHalHandoff's doc comment for why this has to
             // happen, and why it has to happen before releaseToKernel below, not after. Also see
             // hardwareForcedForHandoff's own doc comment -- this is the one place that flag needs
@@ -341,7 +345,7 @@ internal class UsbClaimControllerImpl(
             hardwareForcedForHandoff = true
             volumeController.prepareForHalHandoff(session, session.topology.channelCount)
             UsbAudioController.releaseToKernel(session)
-            interfaceClaimed = false
+            _claimedState.value = false
             if (awaitAndroidTakeover) {
                 awaitAndroidOutputTakeover(deactivateOnTimeout)
             } else {

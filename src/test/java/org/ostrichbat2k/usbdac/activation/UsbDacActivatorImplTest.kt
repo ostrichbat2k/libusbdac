@@ -147,7 +147,8 @@ class UsbDacActivatorImplTest {
         every { UsbAudioController.getClockFrequencyRanges(any()) } returns emptyList()
         every { UsbAudioController.getClusterChannelCount(any(), any()) } returns null
         every { UsbAudioController.wakePowerDomain(any(), any(), any(), any()) } just Runs
-        every { UsbAudioController.setClockFrequency(any(), any()) } returns true
+        every { UsbAudioController.setClockFrequency(any(), any()) } returns
+            UsbAudioController.ClockWriteOutcome.Confirmed(48000)
         every { UsbAudioController.getMute(any()) } returns false
         every { UsbAudioController.setMute(any(), any()) } returns UsbAudioController.ControlWriteOutcome.Success
         every { UsbAudioController.getVolume(any(), any()) } returns 0
@@ -161,7 +162,8 @@ class UsbDacActivatorImplTest {
             UsbAudioController.ControlWriteOutcome.Success
         every { UsbAudioController.reassertKernelEviction(any()) } just Runs
         every { UsbAudioController.selectFormat(any(), any()) } returns UsbAudioController.ControlWriteOutcome.Success
-        every { UsbAudioController.setUac1EndpointSampleRate(any(), any(), any()) } returns true
+        every { UsbAudioController.setUac1EndpointSampleRate(any(), any(), any()) } returns
+            UsbAudioController.ClockWriteOutcome.Confirmed(44100)
         every { UsbAudioController.getClockValid(any()) } returns true
         every { UsbAudioController.release(any()) } just Runs
         return session
@@ -573,7 +575,8 @@ class UsbDacActivatorImplTest {
     fun `a failed clock set releases the session and returns null even if the alt-setting selection succeeded`() {
         val device = fakeDevice()
         stubHappyPath(device, topology(uacVersion = 2))
-        every { UsbAudioController.setClockFrequency(any(), any()) } returns false
+        every { UsbAudioController.setClockFrequency(any(), any()) } returns
+            UsbAudioController.ClockWriteOutcome.TransferFailed
 
         val result = activator.activate(device)
 

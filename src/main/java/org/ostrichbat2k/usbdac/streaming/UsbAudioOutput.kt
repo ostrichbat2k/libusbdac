@@ -337,21 +337,24 @@ class UsbAudioOutput(
         // setClockFrequency unconditionally here was the actual cause of a real, reproduced
         // infinite playback-error loop against a UAC 1.0 device: every reconfigure failed this
         // control transfer (wrong addressing entirely -- clockSourceId is always -1).
-        fun trySetClock() =
+        fun trySetClock(): UsbAudioController.ClockWriteOutcome =
             if (session.topology.uacVersion == 1) {
                 UsbAudioController.setUac1EndpointSampleRate(session, format.endpointAddress, sampleRateHz)
             } else {
                 UsbAudioController.setClockFrequency(session, sampleRateHz)
             }
-        var clockOk = trySetClock()
+        var clockResult = trySetClock()
         var clockSetAttempt = 0
-        while (!clockOk && clockSetAttempt < UsbAudioTuning.CLOCK_SET_MAX_RETRIES) {
+        while (clockResult !is UsbAudioController.ClockWriteOutcome.Confirmed &&
+            clockSetAttempt < UsbAudioTuning.CLOCK_SET_MAX_RETRIES) {
             Thread.sleep(UsbAudioTuning.DAC_SETTLE_DELAY_MS)
-            clockOk = trySetClock()
+            clockResult = trySetClock()
             clockSetAttempt++
         }
-        if (!clockOk) {
-            L.w("UsbAudioOutput: failed to set DAC clock to $sampleRateHz Hz after $clockSetAttempt retry(s)")
+        if (clockResult !is UsbAudioController.ClockWriteOutcome.Confirmed) {
+            L.w(
+                "UsbAudioOutput: failed to set DAC clock to $sampleRateHz Hz after $clockSetAttempt " +
+                    "retry(s): $clockResult")
             return false
         } else if (clockSetAttempt > 0) {
             L.i("UsbAudioOutput: set DAC clock to $sampleRateHz Hz after $clockSetAttempt retry(s)")

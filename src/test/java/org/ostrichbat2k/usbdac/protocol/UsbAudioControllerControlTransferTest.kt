@@ -24,9 +24,7 @@ import io.mockk.every
 import io.mockk.mockk
 import io.mockk.verify
 import org.junit.jupiter.api.Assertions.assertEquals
-import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNull
-import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 
 /**
@@ -134,31 +132,37 @@ class UsbAudioControllerControlTransferTest {
     }
 
     @Test
-    fun `setClockFrequency returns true only when the readback matches what was written`() {
+    fun `setClockFrequency reports Confirmed only when the readback matches what was written`() {
         val session = fakeSession(topology(clockSourceId = 2), controlInterfaceId = 0)
         every {
             session.connection.controlTransfer(0x21, 0x01, 0x0100, 0x0200, match<ByteArray> { it.contentEquals(le(48000, 4)) }, 4, 1000)
         } returns 4
         stub(session.connection, 0xA1, 0x01, 0x0100, 0x0200, le(48000, 4))
 
-        assertTrue(UsbAudioController.setClockFrequency(session, 48000))
+        assertEquals(
+            UsbAudioController.ClockWriteOutcome.Confirmed(48000),
+            UsbAudioController.setClockFrequency(session, 48000))
     }
 
     @Test
-    fun `setClockFrequency returns false when the write succeeds but the readback disagrees`() {
+    fun `setClockFrequency reports a mismatch when the write succeeds but the readback disagrees`() {
         val session = fakeSession(topology(clockSourceId = 2), controlInterfaceId = 0)
         every { session.connection.controlTransfer(0x21, any(), any(), any(), any(), any(), any()) } returns 4
         stub(session.connection, 0xA1, 0x01, 0x0100, 0x0200, le(44100, 4)) // device actually stayed at the old rate
 
-        assertFalse(UsbAudioController.setClockFrequency(session, 48000))
+        assertEquals(
+            UsbAudioController.ClockWriteOutcome.Mismatch(48000, 44100),
+            UsbAudioController.setClockFrequency(session, 48000))
     }
 
     @Test
-    fun `setClockFrequency returns false and never reads back when the write itself fails`() {
+    fun `setClockFrequency reports a transfer failure and never reads back when the write itself fails`() {
         val session = fakeSession()
         every { session.connection.controlTransfer(0x21, any(), any(), any(), any(), any(), any()) } returns -1
 
-        assertFalse(UsbAudioController.setClockFrequency(session, 48000))
+        assertEquals(
+            UsbAudioController.ClockWriteOutcome.TransferFailed,
+            UsbAudioController.setClockFrequency(session, 48000))
         verify(exactly = 0) { session.connection.controlTransfer(0xA1, any(), any(), any(), any(), any(), any()) }
     }
 
@@ -179,7 +183,9 @@ class UsbAudioControllerControlTransferTest {
         } returns 3
         stub(session.connection, 0xA2, 0x81, 0x0100, 0x82, le(44100, 3))
 
-        assertTrue(UsbAudioController.setUac1EndpointSampleRate(session, endpointAddress = 0x82, hz = 44100))
+        assertEquals(
+            UsbAudioController.ClockWriteOutcome.Confirmed(44100),
+            UsbAudioController.setUac1EndpointSampleRate(session, endpointAddress = 0x82, hz = 44100))
     }
 
     // ---- mute ----
@@ -296,7 +302,9 @@ class UsbAudioControllerControlTransferTest {
         every {
             session.connection.controlTransfer(0x21, 0x01, 0x0200, 0x0500, match<ByteArray> { it.contentEquals(byteArrayOf(0)) }, 1, 1000)
         } returns 1
-        assertTrue(UsbAudioController.setPowerDomainState(session, powerDomainId = 5, state = 0))
+        assertEquals(
+            UsbAudioController.ControlWriteOutcome.Success,
+            UsbAudioController.setPowerDomainState(session, powerDomainId = 5, state = 0))
     }
 
     @Test

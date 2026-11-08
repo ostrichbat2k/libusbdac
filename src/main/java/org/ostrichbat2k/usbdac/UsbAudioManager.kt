@@ -25,6 +25,7 @@ import org.ostrichbat2k.usbdac.protocol.UsbDeviceCapabilities
 import org.ostrichbat2k.usbdac.streaming.UsbPipelineStats
 import android.hardware.usb.UsbDevice
 import androidx.media3.exoplayer.audio.AudioSink
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 
 /**
@@ -192,6 +193,24 @@ interface UsbAudioManager : UsbDacPreferences.Listener {
      * the claim machinery through here, can consume it on every `activateAndStream()` call.
      */
     fun consumeHardwareReset(): Boolean
+
+    /**
+     * See [org.ostrichbat2k.usbdac.streaming.UsbAudioOutput]'s own doc comment on its
+     * last-instant safety read-back -- exposed on this facade so it can report a genuine
+     * [UsbDacPreferences.maxVolumePercent] violation to the host app without needing to know
+     * anything about how that's surfaced (a UI toast, a log, both). Emits once per violation;
+     * [volumeSafetyExceeded] is what a host app actually observes.
+     */
+    fun reportVolumeSafetyViolation()
+
+    /**
+     * Emits once every time [reportVolumeSafetyViolation] is called -- i.e. every time real
+     * hardware volume was caught exceeding [UsbDacPreferences.maxVolumePercent]'s cap right
+     * before audio would otherwise have reached the device, and that activation was aborted
+     * rather than ever let it through. Carries no payload: a host UI already knows its own
+     * current [UsbDacPreferences.maxVolumePercent] to build a message from.
+     */
+    val volumeSafetyExceeded: SharedFlow<Unit>
 
     /**
      * Schedules handing the interface back to the kernel's own driver after [delayMs], canceling

@@ -100,6 +100,10 @@ class UsbAudioOutputVolumeRestoreTest {
         return mockk(relaxed = true) {
             every { volumeDb } answers { backing }
             every { volumeDb = any() } answers { backing = it.invocation.args[0] as Int? }
+            // 100% = uncapped, so this suite's own target values (persisted or the device's
+            // reported midpoint) aren't altered by the safety-cap clamp restoreVolumeAfterRelock
+            // now also applies.
+            every { maxVolumePercent } returns 100
         }
     }
 

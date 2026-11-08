@@ -667,6 +667,20 @@ internal object UsbAudioController {
      */
     fun defaultVolumeTarget(range: Pair<Int, Int>?): Int = range?.let { (it.first + it.second) / 2 } ?: 0
 
+    /**
+     * Caps [value] so it can never request more gain than [maxPercent]% of [range] allows -- the
+     * single enforcement point behind [UsbDacPreferences.maxVolumePercent][
+     * org.ostrichbat2k.usbdac.UsbDacPreferences.maxVolumePercent]. Same min..max-relative percent
+     * scheme as [defaultVolumeTarget] (0% = [range]'s quietest, 100% = its loudest), and the same
+     * "can't clamp against a range we don't have" fallback: a null [range] returns [value]
+     * unchanged, since this only ever runs once the range has actually been read back.
+     */
+    fun capToMaxPercent(value: Int, range: Pair<Int, Int>?, maxPercent: Int): Int {
+        val r = range ?: return value
+        val cap = r.first + (r.second - r.first) * maxPercent.coerceIn(0, 100) / 100
+        return value.coerceAtMost(cap)
+    }
+
     /** Sets the Feature Unit's volume for [channel] (0=master, 1=left, 2=right), in 1/256 dB. */
     fun setVolume(session: UsbAudioSession, value: Int, channel: Int): ControlWriteOutcome {
         val unitId = session.topology.outputFeatureUnitId

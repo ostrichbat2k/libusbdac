@@ -19,6 +19,7 @@
 package org.ostrichbat2k.usbdac.activation
 
 import org.ostrichbat2k.usbdac.UsbAudioTuning
+import org.ostrichbat2k.usbdac.UsbDacPreferences
 import org.ostrichbat2k.usbdac.protocol.UacPlaybackTopology
 import org.ostrichbat2k.usbdac.protocol.UacStreamFormat
 import org.ostrichbat2k.usbdac.protocol.UsbAudioController
@@ -38,6 +39,7 @@ internal class UsbDacActivatorImpl(
     private val context: Context,
     private val usbManager: UsbManager,
     private val descriptorCache: UsbDacDescriptorCache,
+    private val usbSettings: UsbDacPreferences,
     private val getPreferredBitResolution: () -> Int,
     private val onCapabilities: (UsbDeviceCapabilities?) -> Unit,
     private val log: (String) -> Unit,
@@ -224,7 +226,9 @@ internal class UsbDacActivatorImpl(
             // gain) -- a freshly (re)activated DAC shouldn't jump straight to its loudest
             // setting. See UsbAudioController.defaultVolumeTarget.
             val range = UsbAudioController.getVolumeRange(session, channel)
-            val target = UsbAudioController.defaultVolumeTarget(range)
+            val target =
+                UsbAudioController.capToMaxPercent(
+                    UsbAudioController.defaultVolumeTarget(range), range, usbSettings.maxVolumePercent)
             if (volume == null || volume != target) {
                 UsbAudioController.setVolume(session, value = target, channel = channel)
             }

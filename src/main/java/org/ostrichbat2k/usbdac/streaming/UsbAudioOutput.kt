@@ -22,6 +22,7 @@ import org.ostrichbat2k.usbdac.UsbAudioManager
 import org.ostrichbat2k.usbdac.UsbAudioTuning
 import org.ostrichbat2k.usbdac.UsbDacPreferences
 import org.ostrichbat2k.usbdac.control.UsbVolumeController
+import org.ostrichbat2k.usbdac.control.UsbVolumeSafetyException
 import org.ostrichbat2k.usbdac.protocol.SyncType
 import org.ostrichbat2k.usbdac.protocol.UacStreamFormat
 import org.ostrichbat2k.usbdac.protocol.UsbAudioController
@@ -427,6 +428,29 @@ class UsbAudioOutput(
         // Confirmed, reproduced: "switch to DAC, press volume down once, volume jumps to max".
         restoreVolumeAfterRelock()
 
+        // Last-instant safety read-back, right before this instance would otherwise unmute and
+        // audio would actually reach the device: confirm the master channel's real, live
+        // hardware volume -- not just what restoreVolumeAfterRelock() above believes it wrote --
+        // is still within UsbDacPreferences.maxVolumePercent's cap. This is deliberately
+        // defense-in-depth on top of that write-time clamp (and UsbControlWriterImpl.setVolume's
+        // own), not a replacement for it -- it exists to catch a SET_CUR that silently failed on
+        // the wire (this function never re-reads after writing) or any future write path that
+        // forgets to clamp, since getting this wrong means genuinely loud, unexpected audio
+        // reaching whatever's plugged into the DAC. Checking channel 0 (master) alone mirrors
+        // this same function's and UsbDacActivatorImpl.activate()'s own precedent for why master
+        // specifically matters here (an independent gain stage separate from the per-channel
+        // ones). Stays muted and aborts activation entirely rather than ever let this through.
+        val masterVolume = UsbAudioController.getVolume(session, channel = 0)
+        val masterRange = UsbAudioController.getVolumeRange(session, channel = 0)
+        val masterCap = UsbAudioController.capToMaxPercent(masterRange?.second ?: 0, masterRange, usbSettings.maxVolumePercent)
+        if (masterVolume != null && masterRange != null && masterVolume > masterCap) {
+            L.e(
+                "UsbAudioOutput: refusing to stream -- master volume=$masterVolume exceeds the " +
+                    "${usbSettings.maxVolumePercent}% safety cap (=$masterCap) of range=$masterRange")
+            throw UsbVolumeSafetyException(
+                "USB DAC volume ($masterVolume) exceeds the ${usbSettings.maxVolumePercent}% safety limit ($masterCap)")
+        }
+
         // Only unmute now that the clock is confirmed (or assumed, if unreadable) locked, and the
         // volume reapply above has had a settled device to work with -- see the setMute(true)
         // call above for why this has to bracket the whole relock sequence rather than just being
@@ -464,6 +488,7 @@ class UsbAudioOutput(
     internal fun restoreVolumeAfterRelock() {
         for (channel in 0..channels) {
             val volume = UsbAudioController.getVolume(session, channel)
+            val range = UsbAudioController.getVolumeRange(session, channel)
             // Prefer the user's last explicitly-set volume (persisted in UsbDacPreferences, see
             // UsbAudioManager.setVolume) over a fixed default -- otherwise every activation
             // (app restart, DAC reconnect, new track that triggers a clock change) reset
@@ -471,9 +496,15 @@ class UsbAudioOutput(
             // reported as "volume resets after reinstall". Only a genuinely first-ever-seen
             // device (volumeDb null) falls back to the midpoint of its own reported range (not
             // its max/unity gain) -- see UsbAudioController.defaultVolumeTarget.
+            //
+            // Capped against UsbDacPreferences.maxVolumePercent either way -- not just the
+            // midpoint-default branch -- so a persisted volumeDb from before the cap existed (or
+            // from before it was lowered) can't bypass it on the very next relock/reactivation.
             val target =
-                usbSettings.volumeDb
-                    ?: UsbAudioController.defaultVolumeTarget(UsbAudioController.getVolumeRange(session, channel))
+                UsbAudioController.capToMaxPercent(
+                    usbSettings.volumeDb ?: UsbAudioController.defaultVolumeTarget(range),
+                    range,
+                    usbSettings.maxVolumePercent)
             L.i("UsbAudioOutput: post-clock-change channel $channel volume=$volume target=$target")
             if (volume == null || volume != target) {
                 UsbAudioController.setVolume(session, value = target, channel = channel)
@@ -518,7 +549,20 @@ class UsbAudioOutput(
                 // early enough a guard against a concurrent releaseClaim() mid-relock.
                 usbAudioManager.beginClaimAttempt()
                 try {
-                    onActivationAttemptFinished(activateAndStream())
+                    val succeeded =
+                        try {
+                            activateAndStream()
+                        } catch (e: UsbVolumeSafetyException) {
+                            // See activateAndStream()'s own doc comment on this check -- surfaced
+                            // to the host app as a real, user-visible error (not just a log line)
+                            // rather than silently falling back to isStalled()'s generic stuck-
+                            // player detection, since this is specifically about not streaming
+                            // audio the user never had a chance to react to.
+                            L.e("UsbAudioOutput: aborting activation -- ${e.message}")
+                            usbAudioManager.reportVolumeSafetyViolation()
+                            false
+                        }
+                    onActivationAttemptFinished(succeeded)
                 } finally {
                     usbAudioManager.endClaimAttempt()
                     activating = false

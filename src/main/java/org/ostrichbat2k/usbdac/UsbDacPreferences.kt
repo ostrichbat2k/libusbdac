@@ -72,6 +72,27 @@ interface UsbDacPreferences {
     val volumeStepPercent: Int
 
     /**
+     * A hard safety ceiling on the DAC's hardware output volume, expressed as a percentage of
+     * the device's own native min..max Feature Unit range (same per-device-relative scheme as
+     * [volumeStepPercent], for the same reason -- a fixed dB number means wildly different
+     * perceived loudness across devices' ranges). No volume this library ever writes to the
+     * Feature Unit for bit-perfect playback -- a user's own key/slider adjustment, the midpoint
+     * default a fresh activation starts from, a restore after a clock relock -- is allowed to
+     * exceed this, at any point in time; see [UsbAudioController.capToMaxPercent][
+     * org.ostrichbat2k.usbdac.protocol.UsbAudioController.capToMaxPercent]. Defaults
+     * conservatively low (see [DEFAULT_MAX_VOLUME_PERCENT]) since a bit-perfect DAC's own gain
+     * stage sits entirely outside Android's usual safe-listening volume limiter, and
+     * headphones/IEMs driven directly by one can be genuinely startling at even a modest-looking
+     * slider position. Deliberately does not apply to the HAL-fallback path's unity-gain handoff
+     * ([UsbVolumeController.prepareForHalHandoff][
+     * org.ostrichbat2k.usbdac.control.UsbVolumeController.prepareForHalHandoff]) -- the real
+     * loudness there is governed by Android's own software volume curve on top of that fixed
+     * hardware gain, not by this setting. Not a hard contract: implementations should coerce into
+     * `1..100` rather than assume a caller-supplied value is already in range.
+     */
+    val maxVolumePercent: Int
+
+    /**
      * Whether [UsbAudioOutput.pause] should skip its automatic release-to-kernel entirely,
      * leaving the interface claimed (hardware state untouched) until the user explicitly hands
      * it back via [UsbAudioManager.setManualClaim]. `false` (Automatic, the default) is today's
@@ -112,6 +133,9 @@ interface UsbDacPreferences {
         /** Called when [volumeStepPercent] has changed. */
         fun onVolumeStepPercentChanged() {}
 
+        /** Called when [maxVolumePercent] has changed. */
+        fun onMaxVolumePercentChanged() {}
+
         /** Called when [manualReleaseControl] has changed. */
         fun onManualReleaseControlChanged() {}
     }
@@ -119,5 +143,8 @@ interface UsbDacPreferences {
     companion object {
         /** The upper bound [volumeStepPercent] may be set to. */
         const val MAX_VOLUME_STEP_PERCENT = 10
+
+        /** [maxVolumePercent]'s conservative out-of-the-box value -- see its own doc comment. */
+        const val DEFAULT_MAX_VOLUME_PERCENT = 40
     }
 }

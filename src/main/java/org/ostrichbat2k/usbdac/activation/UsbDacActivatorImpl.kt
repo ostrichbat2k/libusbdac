@@ -202,9 +202,10 @@ internal class UsbDacActivatorImpl(
         // further below, after selectFormat has made that endpoint active (see there for why).
         val clockOk =
             if (found.uacVersion != 1) {
-                UsbAudioController.setClockFrequency(session, UsbAudioTuning.SUPPORTED_SAMPLE_RATE_HZ).also {
-                    log("Clock set to ${UsbAudioTuning.SUPPORTED_SAMPLE_RATE_HZ} Hz: ok=$it")
-                }
+                val outcome =
+                    UsbAudioController.setClockFrequency(session, UsbAudioTuning.SUPPORTED_SAMPLE_RATE_HZ)
+                log("Clock set to ${UsbAudioTuning.SUPPORTED_SAMPLE_RATE_HZ} Hz: $outcome")
+                outcome is UsbAudioController.ClockWriteOutcome.Confirmed
             } else {
                 true
             }
@@ -296,9 +297,10 @@ internal class UsbDacActivatorImpl(
                     log("Format alt=${format.alternateSetting} declares no sample rate")
                     false
                 } else {
-                    UsbAudioController.setUac1EndpointSampleRate(session, format.endpointAddress, rateHz).also {
-                        log("UAC1 endpoint sample rate set to $rateHz Hz: ok=$it")
-                    }
+                    val outcome =
+                        UsbAudioController.setUac1EndpointSampleRate(session, format.endpointAddress, rateHz)
+                    log("UAC1 endpoint sample rate set to $rateHz Hz: $outcome")
+                    outcome is UsbAudioController.ClockWriteOutcome.Confirmed
                 }
             } else {
                 clockOk

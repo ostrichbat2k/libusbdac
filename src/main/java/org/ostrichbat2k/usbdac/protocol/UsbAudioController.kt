@@ -121,6 +121,27 @@ internal object UsbAudioController {
         data object TransferFailed : ControlWriteOutcome
     }
 
+    /**
+     * A clock/endpoint sample-rate write's outcome, replacing a bare `Boolean` for
+     * [setClockFrequency]/[setUac1EndpointSampleRate]. Unlike [ControlWriteOutcome], a clean
+     * transfer here still isn't proof the rate actually took effect -- see
+     * [UsbAudioSession.clockSupportedRates]'s own doc comment for the real, reproduced case where
+     * SET_CUR plus its own readback both reported success while the hardware clock silently
+     * stayed at its previous rate. [Mismatch] exists so a caller can tell that apart from
+     * [TransferFailed] instead of both collapsing into the same `false`.
+     */
+    sealed interface ClockWriteOutcome {
+        /** The write transfer succeeded and the readback confirms [hz] actually took effect. */
+        data class Confirmed(val hz: Int) : ClockWriteOutcome
+
+        /** The underlying USB transfer itself failed -- the readback was never attempted. */
+        data object TransferFailed : ClockWriteOutcome
+
+        /** The write transfer succeeded, but the readback came back as [actualHz] instead of the
+         * requested [requestedHz] -- the device silently didn't apply it. */
+        data class Mismatch(val requestedHz: Int, val actualHz: Int?) : ClockWriteOutcome
+    }
+
     /** The CUR request's bRequest byte for [topology]'s UAC version and GET/SET direction. */
     internal fun curRequest(topology: UacPlaybackTopology, get: Boolean): Int =
         if (topology.uacVersion == 1 && get) UAC1_REQUEST_GET_CUR else UAC_REQUEST_CUR
@@ -495,7 +516,7 @@ internal object UsbAudioController {
     }
 
     /** Attempts to set the clock source sample rate in Hz, then reads it back to confirm. */
-    fun setClockFrequency(session: UsbAudioSession, hz: Int): Boolean {
+    fun setClockFrequency(session: UsbAudioSession, hz: Int): ClockWriteOutcome {
         val wValue = CS_SAM_FREQ_CONTROL shl 8
         val wIndex = (session.topology.clockSourceId shl 8) or session.controlInterface.id
         val buffer = leBytes(hz, 4)
@@ -504,12 +525,12 @@ internal object UsbAudioController {
                 REQ_TYPE_CLASS_INTERFACE_SET, UAC_REQUEST_CUR, wValue, wIndex, buffer, buffer.size, 1000)
         if (result < 0) {
             L.w("SET_CUR clock frequency to $hz Hz failed: result=$result")
-            return false
+            return ClockWriteOutcome.TransferFailed
         }
         val readBack = getClockFrequency(session)
         val ok = readBack == hz
         L.i("SET_CUR clock frequency to $hz Hz: write result=$result, readback=$readBack, match=$ok")
-        return ok
+        return if (ok) ClockWriteOutcome.Confirmed(hz) else ClockWriteOutcome.Mismatch(hz, readBack)
     }
 
     /**
@@ -546,7 +567,7 @@ internal object UsbAudioController {
      * Source, this endpoint doesn't functionally exist (and this request isn't meaningful) until
      * that alternate setting is actually active.
      */
-    fun setUac1EndpointSampleRate(session: UsbAudioSession, endpointAddress: Int, hz: Int): Boolean {
+    fun setUac1EndpointSampleRate(session: UsbAudioSession, endpointAddress: Int, hz: Int): ClockWriteOutcome {
         val wValue = CS_SAM_FREQ_CONTROL shl 8
         val buffer = leBytes(hz, 3)
         val result =
@@ -560,14 +581,14 @@ internal object UsbAudioController {
                 1000)
         if (result < 0) {
             L.w("SET_CUR UAC1 endpoint sample rate to $hz Hz failed: result=$result")
-            return false
+            return ClockWriteOutcome.TransferFailed
         }
         val readBack = getUac1EndpointSampleRate(session, endpointAddress)
         val ok = readBack == hz
         L.i(
             "SET_CUR UAC1 endpoint 0x${"%02x".format(endpointAddress)} sample rate to $hz Hz: " +
                 "write result=$result, readback=$readBack, match=$ok")
-        return ok
+        return if (ok) ClockWriteOutcome.Confirmed(hz) else ClockWriteOutcome.Mismatch(hz, readBack)
     }
 
     /** Reads the Feature Unit's mute state for [channel] (0=master, 1=left, 2=right), or null. */
@@ -788,7 +809,7 @@ internal object UsbAudioController {
     }
 
     /** Sets a UAC 3.0 Power Domain's state. Does not wait out any recovery time itself. */
-    fun setPowerDomainState(session: UsbAudioSession, powerDomainId: Int, state: Int): Boolean {
+    fun setPowerDomainState(session: UsbAudioSession, powerDomainId: Int, state: Int): ControlWriteOutcome {
         val wValue = AC_POWER_DOMAIN_CONTROL shl 8
         val wIndex = (powerDomainId shl 8) or session.controlInterface.id
         val buffer = byteArrayOf(state.toByte())
@@ -796,7 +817,7 @@ internal object UsbAudioController {
             session.connection.controlTransfer(
                 REQ_TYPE_CLASS_INTERFACE_SET, UAC_REQUEST_CUR, wValue, wIndex, buffer, buffer.size, 1000)
         L.i("SET_CUR power domain state (id=$powerDomainId) to $state: result=$result")
-        return result >= 0
+        return if (result >= 0) ControlWriteOutcome.Success else ControlWriteOutcome.TransferFailed
     }
 
     /**
@@ -820,7 +841,7 @@ internal object UsbAudioController {
             L.i("Power domain $powerDomainId already in D0")
             return
         }
-        if (!setPowerDomainState(session, powerDomainId, UsbAudioManager.PD_STATE_D0)) {
+        if (setPowerDomainState(session, powerDomainId, UsbAudioManager.PD_STATE_D0) != ControlWriteOutcome.Success) {
             L.w("Failed to set power domain $powerDomainId to D0")
             return
         }

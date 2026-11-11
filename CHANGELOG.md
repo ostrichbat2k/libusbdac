@@ -8,6 +8,26 @@ Pin to an exact tag or commit rather than a version range.
 
 ## [Unreleased]
 
+### Added
+- Added a user-configurable max-volume safety cap (#109).
+
+### Fixed
+- Gave clock/endpoint-rate writes and power domain writes typed outcomes
+  instead of a bare `Boolean`/ignored result (#111).
+- `doReleaseClaim()`'s delayed-release recheck now also accounts for
+  `claimAttemptsInFlight`, closing the same race #36 already fixed for
+  the synchronous release path (#106).
+- Signal a fatal streaming error (e.g. the DAC being unplugged) to the
+  caller immediately instead of leaving `isStalled()` to discover it by
+  polling, which turned one teardown into a repeating pulse
+  (Auxio#51).
+
+### Infrastructure
+- Added test coverage for `UsbIsoStreamEngine`'s feedback-thread
+  lifecycle (async-clocked DACs) (#107).
+- Fixed detekt violations that accumulated while `CI`/`Release` were
+  temporarily disabled, and regenerated the detekt baseline (#115).
+
 ## [v0.2.0] - 2026-11-07
 
 ### Added

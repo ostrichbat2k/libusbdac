@@ -400,6 +400,28 @@ class UsbClaimControllerImplTest {
     }
 
     @Test
+    fun `a scheduled delayed release is suppressed when a claim attempt begins before it fires`() {
+        // Regression test for #106: doReleaseClaim's own delayed-path recheck only rechecked
+        // activeStreamCount, never claimAttemptsInFlight, so a releaseClaim(delayMs > 0) that
+        // scheduled successfully (no attempt in flight yet) would still fire and hand the
+        // interface back out from under an activation attempt that started claiming/relocking
+        // during the delay -- the same race #106's sibling fix (the in-flight test above) closes
+        // for the synchronous delayMs=0 path, reopened here for the delayed path specifically.
+        val device = fakeDevice()
+        val session = fakeSession(device)
+        stubAlreadyRecognized(device)
+        activeSession = session
+        controller.markAlreadyClaimed()
+
+        controller.releaseClaim(delayMs = 100, awaitAndroidTakeover = false)
+        controller.beginClaimAttempt()
+
+        Thread.sleep(300)
+        verify(exactly = 0) { UsbAudioController.releaseToKernel(any()) }
+        assertTrue(controller.isClaimed())
+    }
+
+    @Test
     fun `cancelPendingRelease cancels a scheduled release before it fires`() {
         val device = fakeDevice()
         val session = fakeSession(device)

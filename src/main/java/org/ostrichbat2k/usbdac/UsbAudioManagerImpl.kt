@@ -299,6 +299,12 @@ class UsbAudioManagerImpl(
     /** The inverse of [notifyStreamingStarted] -- call before, not after, releasing anything. */
     override fun notifyStreamingStopped() = claimController.notifyStreamingStopped()
 
+    /** See [UsbAudioManager.notifyStreamFatalError]'s own doc comment. */
+    override fun notifyStreamFatalError() {
+        diagnosticLogger.log("Streaming thread reported a fatal error -- deactivating session")
+        deactivateDac()
+    }
+
     @Suppress("TooGenericExceptionCaught") // Deliberately broad -- see this function's own doc comment.
     override fun setDirectPlaybackActive(active: Boolean) {
         synchronized(directPlaybackTrackLock) {

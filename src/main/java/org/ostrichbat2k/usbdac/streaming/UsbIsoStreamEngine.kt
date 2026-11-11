@@ -51,6 +51,13 @@ internal class UsbIsoStreamEngine(
     private val paused: () -> Boolean,
     private val reportPipelineStats: (UsbPipelineStats?) -> Unit,
     private val nativeBridge: UsbNativeBridge = UsbNativeBridgeImpl,
+    // Called exactly once, from the main streaming thread, the instant the main loop itself
+    // discovers the device is gone (REAP_ERROR_FATAL) -- strictly earlier than any caller's own
+    // isStalled() polling could notice. Deliberately not wired to the feedback loop's own fatal
+    // branch (see startFeedbackThreadIfApplicable's doc comment: a feedback failure only means
+    // lost rate-correction, not device loss) -- see UsbAudioManager.notifyStreamFatalError's own
+    // doc comment for what a caller does with this.
+    private val onFatalStreamError: () -> Unit = {},
 ) {
     private companion object {
         // factor(i) = 1.0 - (i+1)/UsbAudioTuning.UNDERRUN_FADE_FRAMES for the common case where a short read's
@@ -334,10 +341,14 @@ internal class UsbIsoStreamEngine(
                                 // The stream cannot produce anything more (device gone, most
                                 // likely) -- see #60: looping back to reapIso() here is exactly
                                 // the busy-spin this check exists to stop. isStalled() (already
-                                // polled by callers, e.g. play()'s retry path) picks this up on
-                                // its own once lastUrbSubmittedAtMs stops advancing, so nothing
-                                // further needs to be signalled from here.
+                                // polled by callers, e.g. play()'s retry path) still picks this up
+                                // on its own once lastUrbSubmittedAtMs stops advancing, but #51
+                                // found that alone lets a dead session get rebuilt against
+                                // repeatedly (each rebuild wedging again) before that poll ever
+                                // fires -- onFatalStreamError lets the caller react right now
+                                // instead of waiting for it.
                                 L.e("UsbIsoStreamEngine: reapIso() reported a fatal error -- stopping the streaming thread")
+                                onFatalStreamError()
                                 break
                             }
                             continue

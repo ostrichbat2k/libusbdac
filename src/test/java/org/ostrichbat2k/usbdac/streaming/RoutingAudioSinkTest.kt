@@ -310,6 +310,27 @@ class RoutingAudioSinkTest {
             usbAudioManager.reportPlaybackRoute(
                 UsbAudioManager.PlaybackRoute.Fallback(bitDepth = 16, sampleRateHz = 48000, channels = 2))
         }
+        // #51: the abandoned USB delegate must actually be torn down, not just dropped -- same
+        // reasoning as commitDelegateSwitch's own abandon-case (see that function's doc comment).
+        verify(exactly = 1) { usbSink.flush() }
+    }
+
+    @Test
+    fun `current nudges fallback to play during self-heal when already mid-playback`() {
+        // #51: without this, fallback sits in its own default-paused state forever, since
+        // ExoPlayer only calls play() on this outer sink once per play intent and never learns
+        // self-heal just switched which delegate we forward to -- same isPlaying nudge
+        // commitDelegateSwitch already gives a newly-adopted delegate.
+        every { usbAudioManager.resolveActiveSink(any()) } returns usbSink
+        supporting(usbSink)
+        val fmt = format()
+        sink.configure(fmt, 0, null)
+        sink.play()
+
+        every { usbAudioManager.resolveActiveSink(any()) } returns null
+        sink.handleDiscontinuity()
+
+        verify { fallback.play() }
     }
 
     @Test

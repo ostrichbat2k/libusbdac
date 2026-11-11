@@ -30,7 +30,9 @@ import java.util.concurrent.atomic.AtomicInteger
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import org.ostrichbat2k.usbdac.UsbAudioTuning
 import org.ostrichbat2k.usbdac.protocol.SyncType
+import org.ostrichbat2k.usbdac.protocol.UacFeedbackEndpoint
 import org.ostrichbat2k.usbdac.protocol.UacPlaybackTopology
 import org.ostrichbat2k.usbdac.protocol.UacStreamFormat
 import org.ostrichbat2k.usbdac.protocol.UsbAudioSession
@@ -79,6 +81,12 @@ class UsbIsoStreamEngineTest {
             maxPacketSize = 192,
         )
 
+    // For the feedback-thread lifecycle tests (#107): an ASYNC format with a feedback endpoint,
+    // distinct address/maxPacketSize from the main format so a bug routing main-stream calls at
+    // the feedback endpoint (or vice versa) would be obvious from FakeNativeBridge's own counts.
+    private val feedbackEndpoint = UacFeedbackEndpoint(address = 0x82, maxPacketSize = 4, bInterval = 1)
+    private val asyncTestFormat = testFormat.copy(syncType = SyncType.ASYNC, feedbackEndpoint = feedbackEndpoint)
+
     private val testSession =
         UsbAudioSession(
             device = mockk<UsbDevice>(relaxed = true),
@@ -93,16 +101,29 @@ class UsbIsoStreamEngineTest {
      * per call index (falling back to "succeed"/[UsbNativeBridge.REAP_ERROR_FATAL] once a script
      * runs out), plus an optional [beforeReap] hook for tests that need to synchronize with, or
      * block, the background thread at a specific reapIso() call.
+     *
+     * The feedback-stream equivalents ([feedbackReapResults]/[feedbackSubmitReadResults]/
+     * [beforeFeedbackReap]) are scripted and counted entirely independently of the main stream's
+     * -- routed by comparing the call's `handle` (for reapIso) or the `endpointAddress` passed to
+     * [openIsoStream] against [feedbackOpenHandle]/[feedbackEndpointAddress], since the real
+     * native layer hands back two distinct handles for two distinct endpoints the same way.
      */
     private class FakeNativeBridge(
         private val openHandle: Long = 1L,
+        private val feedbackOpenHandle: Long = 2L,
+        private val feedbackEndpointAddress: Int = -1,
         private val submitResults: List<Boolean> = emptyList(),
         private val reapResults: List<Int> = emptyList(),
+        private val feedbackSubmitReadResults: List<Boolean> = emptyList(),
+        private val feedbackReapResults: List<Int> = emptyList(),
         private val beforeReap: (callIndex: Int) -> Unit = {},
+        private val beforeFeedbackReap: (callIndex: Int) -> Unit = {},
     ) : UsbNativeBridge {
         val openIsoStreamCallCount = AtomicInteger(0)
         val submitIsoCallCount = AtomicInteger(0)
         val reapIsoCallCount = AtomicInteger(0)
+        val feedbackSubmitIsoReadCallCount = AtomicInteger(0)
+        val feedbackReapIsoCallCount = AtomicInteger(0)
         val cancelIsoHandles = CopyOnWriteArrayList<Long>()
         val closeIsoStreamHandles = CopyOnWriteArrayList<Long>()
 
@@ -118,7 +139,7 @@ class UsbIsoStreamEngineTest {
             numUrbs: Int,
         ): Long {
             openIsoStreamCallCount.incrementAndGet()
-            return openHandle
+            return if (endpointAddress == feedbackEndpointAddress) feedbackOpenHandle else openHandle
         }
 
         override fun submitIso(handle: Long, slot: Int, data: ByteArray, packetLengths: IntArray): Boolean {
@@ -126,11 +147,16 @@ class UsbIsoStreamEngineTest {
             return submitResults.getOrElse(idx) { true }
         }
 
-        override fun reapIso(handle: Long): Int {
-            val idx = reapIsoCallCount.getAndIncrement()
-            beforeReap(idx)
-            return reapResults.getOrElse(idx) { UsbNativeBridge.REAP_ERROR_FATAL }
-        }
+        override fun reapIso(handle: Long): Int =
+            if (handle == feedbackOpenHandle) {
+                val idx = feedbackReapIsoCallCount.getAndIncrement()
+                beforeFeedbackReap(idx)
+                feedbackReapResults.getOrElse(idx) { UsbNativeBridge.REAP_ERROR_FATAL }
+            } else {
+                val idx = reapIsoCallCount.getAndIncrement()
+                beforeReap(idx)
+                reapResults.getOrElse(idx) { UsbNativeBridge.REAP_ERROR_FATAL }
+            }
 
         override fun cancelIso(handle: Long) {
             cancelIsoHandles.add(handle)
@@ -140,17 +166,20 @@ class UsbIsoStreamEngineTest {
             closeIsoStreamHandles.add(handle)
         }
 
-        override fun submitIsoRead(handle: Long, slot: Int, packetLengths: IntArray) = true
+        override fun submitIsoRead(handle: Long, slot: Int, packetLengths: IntArray): Boolean {
+            val idx = feedbackSubmitIsoReadCallCount.getAndIncrement()
+            return feedbackSubmitReadResults.getOrElse(idx) { true }
+        }
 
         override fun readIsoSlotData(handle: Long, slot: Int, dst: ByteArray) = -1
 
         override fun getPacketErrorStats(handle: Long) = longArrayOf(0L, 0L)
     }
 
-    private fun engineWith(bridge: UsbNativeBridge, paused: Boolean = true) =
+    private fun engineWith(bridge: UsbNativeBridge, paused: Boolean = true, format: UacStreamFormat = testFormat) =
         UsbIsoStreamEngine(
             session = testSession,
-            format = testFormat,
+            format = format,
             channels = testTopology.channelCount,
             sampleRateHz = 44100,
             ringBuffer = PcmRingBuffer(4096),
@@ -291,5 +320,136 @@ class UsbIsoStreamEngineTest {
 
         assertEquals(0L, engine.framesOutput)
         engine.stop()
+    }
+
+    /** Regression shape for #107: a feedback submitIsoRead failure must not abandon later slots' prefill. */
+    @Test
+    fun `a feedback submitIsoRead failing twice for a slot is logged and prefill still continues to the next slot`() {
+        val bridge =
+            FakeNativeBridge(
+                openHandle = 1L,
+                feedbackOpenHandle = 2L,
+                feedbackEndpointAddress = feedbackEndpoint.address,
+                reapResults = listOf(UsbNativeBridge.REAP_ERROR_FATAL),
+                feedbackReapResults = listOf(UsbNativeBridge.REAP_ERROR_FATAL),
+                // Slot 0's prefill resubmit fails both attempts (2 calls); slot 1's succeeds on
+                // the first (falls back to "succeed" once the script runs out) -- 3 calls total.
+                feedbackSubmitReadResults = listOf(false, false))
+        val engine = engineWith(bridge, format = asyncTestFormat)
+
+        engine.start()
+        val deadline = System.currentTimeMillis() + 2000
+        while (bridge.feedbackSubmitIsoReadCallCount.get() < 3 && System.currentTimeMillis() < deadline) {
+            Thread.sleep(5)
+        }
+
+        assertEquals(
+            3,
+            bridge.feedbackSubmitIsoReadCallCount.get(),
+            "slot 0 should get both retry attempts, then prefill should still move on to slot 1")
+
+        engine.stop()
+    }
+
+    /** Regression shape for #107: the feedback stream's own fatal error must not affect the main stream. */
+    @Test
+    fun `a fatal reapIso error on the feedback stream stops only the feedback thread, not the main loop`() {
+        val mainReachedSecondReap = CountDownLatch(1)
+        val blockMainForever = CountDownLatch(1)
+        val bridge =
+            FakeNativeBridge(
+                openHandle = 1L,
+                feedbackOpenHandle = 2L,
+                feedbackEndpointAddress = feedbackEndpoint.address,
+                reapResults = listOf(0),
+                feedbackReapResults = listOf(UsbNativeBridge.REAP_ERROR_FATAL),
+                beforeReap = { idx ->
+                    if (idx == 1) {
+                        mainReachedSecondReap.countDown()
+                        blockMainForever.await()
+                    }
+                })
+        val engine = engineWith(bridge, format = asyncTestFormat)
+
+        engine.start()
+        val feedbackDeadline = System.currentTimeMillis() + 2000
+        while (bridge.feedbackReapIsoCallCount.get() == 0 && System.currentTimeMillis() < feedbackDeadline) {
+            Thread.sleep(5)
+        }
+        assertTrue(bridge.feedbackReapIsoCallCount.get() > 0, "feedback thread never reached reapIso()")
+
+        assertTrue(
+            mainReachedSecondReap.await(2, TimeUnit.SECONDS),
+            "main loop should keep cycling through reapIso after the feedback thread's own fatal error")
+
+        blockMainForever.countDown()
+        engine.stop()
+    }
+
+    /** Regression shape for #107: stop() must shut down a stuck main stream and a clean feedback stream independently. */
+    @Test
+    fun `stop shuts down the main stream and the feedback stream independently`() {
+        val mainReachedReap = CountDownLatch(1)
+        val blockMainForever = CountDownLatch(1)
+        val bridge =
+            FakeNativeBridge(
+                openHandle = 1L,
+                feedbackOpenHandle = 2L,
+                feedbackEndpointAddress = feedbackEndpoint.address,
+                // The main stream's reapIso never returns (stuck, same shape as the existing
+                // stuck-thread test above); the feedback stream exits cleanly on its own.
+                feedbackReapResults = listOf(UsbNativeBridge.REAP_ERROR_FATAL),
+                beforeReap = { mainReachedReap.countDown(); blockMainForever.await() })
+        val engine = engineWith(bridge, format = asyncTestFormat)
+
+        engine.start()
+        assertTrue(mainReachedReap.await(2, TimeUnit.SECONDS), "main thread never reached reapIso()")
+        val feedbackDeadline = System.currentTimeMillis() + 2000
+        while (bridge.feedbackReapIsoCallCount.get() == 0 && System.currentTimeMillis() < feedbackDeadline) {
+            Thread.sleep(5)
+        }
+
+        engine.stop()
+
+        assertEquals(
+            setOf(1L, 2L), bridge.cancelIsoHandles.toSet(), "stop() must try to cancel both streams")
+        assertTrue(
+            bridge.closeIsoStreamHandles.contains(2L),
+            "the feedback stream, which exited cleanly, should be closed")
+        assertTrue(
+            !bridge.closeIsoStreamHandles.contains(1L),
+            "the stuck main stream must not be closed while its thread might still be using the handle")
+
+        blockMainForever.countDown()
+    }
+
+    /** Regression shape for #107: a stuck feedback thread must leak its handle, not risk a use-after-free. */
+    @Test
+    fun `stop leaves the native feedback stream open rather than close it while its thread is still stuck`() {
+        val feedbackReachedReap = CountDownLatch(1)
+        val blockFeedbackForever = CountDownLatch(1)
+        val bridge =
+            FakeNativeBridge(
+                openHandle = 1L,
+                feedbackOpenHandle = 2L,
+                feedbackEndpointAddress = feedbackEndpoint.address,
+                // The main stream exits cleanly (immediate fatal reap); the feedback stream's
+                // reapIso never returns, simulating cancelIso() failing to unblock it in time.
+                reapResults = listOf(UsbNativeBridge.REAP_ERROR_FATAL),
+                beforeFeedbackReap = { feedbackReachedReap.countDown(); blockFeedbackForever.await() })
+        val engine = engineWith(bridge, format = asyncTestFormat)
+
+        engine.start()
+        assertTrue(feedbackReachedReap.await(2, TimeUnit.SECONDS), "feedback thread never reached reapIso()")
+
+        engine.stop()
+
+        assertTrue(
+            bridge.cancelIsoHandles.containsAll(listOf(1L, 2L)), "stop() must still try to cancel both streams")
+        assertTrue(
+            !bridge.closeIsoStreamHandles.contains(2L),
+            "closeIsoStream must not run for the feedback stream while its thread might still be using the handle")
+
+        blockFeedbackForever.countDown()
     }
 }

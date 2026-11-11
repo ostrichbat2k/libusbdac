@@ -324,9 +324,11 @@ internal class UsbClaimControllerImpl(
     }
 
     private fun doReleaseClaim(awaitAndroidTakeover: Boolean, deactivateOnTimeout: Boolean) {
-        if (activeStreamCount.get() > 0) {
+        if (activeStreamCount.get() > 0 || claimAttemptsInFlight.get() > 0) {
             // The race can still be lost a second time between releaseClaim scheduling this and
-            // it actually firing (a new stream started in the meantime) -- re-latch for the same
+            // it actually firing -- a new stream started, or a new activation attempt began
+            // claiming/relocking (see beginClaimAttempt's own doc comment for why that alone,
+            // before notifyStreamingStarted, already needs guarding) -- re-latch for the same
             // reason releaseClaim's own early-return branch does, rather than silently dropping
             // an already-escalated request here.
             pendingDeactivateOnTimeout = pendingDeactivateOnTimeout || deactivateOnTimeout

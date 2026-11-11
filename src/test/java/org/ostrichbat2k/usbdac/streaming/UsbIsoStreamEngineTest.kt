@@ -30,7 +30,6 @@ import java.util.concurrent.atomic.AtomicInteger
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
-import org.ostrichbat2k.usbdac.UsbAudioTuning
 import org.ostrichbat2k.usbdac.protocol.SyncType
 import org.ostrichbat2k.usbdac.protocol.UacFeedbackEndpoint
 import org.ostrichbat2k.usbdac.protocol.UacPlaybackTopology
@@ -81,9 +80,9 @@ class UsbIsoStreamEngineTest {
             maxPacketSize = 192,
         )
 
-    // For the feedback-thread lifecycle tests (#107): an ASYNC format with a feedback endpoint,
-    // distinct address/maxPacketSize from the main format so a bug routing main-stream calls at
-    // the feedback endpoint (or vice versa) would be obvious from FakeNativeBridge's own counts.
+    // For the feedback-thread lifecycle tests (#107) and the onFatalStreamError tests (#51): an
+    // ASYNC format with a feedback endpoint, distinct address/maxPacketSize from the main format
+    // so FakeNativeBridge can route calls to the right script.
     private val feedbackEndpoint = UacFeedbackEndpoint(address = 0x82, maxPacketSize = 4, bInterval = 1)
     private val asyncTestFormat = testFormat.copy(syncType = SyncType.ASYNC, feedbackEndpoint = feedbackEndpoint)
 
@@ -176,17 +175,22 @@ class UsbIsoStreamEngineTest {
         override fun getPacketErrorStats(handle: Long) = longArrayOf(0L, 0L)
     }
 
-    private fun engineWith(bridge: UsbNativeBridge, paused: Boolean = true, format: UacStreamFormat = testFormat) =
-        UsbIsoStreamEngine(
-            session = testSession,
-            format = format,
-            channels = testTopology.channelCount,
-            sampleRateHz = 44100,
-            ringBuffer = PcmRingBuffer(4096),
-            paused = { paused },
-            reportPipelineStats = {},
-            nativeBridge = bridge,
-        )
+    private fun engineWith(
+        bridge: UsbNativeBridge,
+        paused: Boolean = true,
+        format: UacStreamFormat = testFormat,
+        onFatalStreamError: () -> Unit = {},
+    ) = UsbIsoStreamEngine(
+        session = testSession,
+        format = format,
+        channels = testTopology.channelCount,
+        sampleRateHz = 44100,
+        ringBuffer = PcmRingBuffer(4096),
+        paused = { paused },
+        reportPipelineStats = {},
+        nativeBridge = bridge,
+        onFatalStreamError = onFatalStreamError,
+    )
 
     @Test
     fun `start does nothing and opens no thread when openIsoStream fails`() {
@@ -351,9 +355,32 @@ class UsbIsoStreamEngineTest {
         engine.stop()
     }
 
-    /** Regression shape for #107: the feedback stream's own fatal error must not affect the main stream. */
+    /** Regression shape for #51: a fatal main-loop error has to let the caller react right now, not just leave isStalled() to poll it. */
     @Test
-    fun `a fatal reapIso error on the feedback stream stops only the feedback thread, not the main loop`() {
+    fun `onFatalStreamError fires exactly once when the main loop hits a fatal reapIso error`() {
+        val bridge = FakeNativeBridge(reapResults = listOf(UsbNativeBridge.REAP_ERROR_FATAL))
+        var fatalCalls = 0
+        val engine = engineWith(bridge, onFatalStreamError = { fatalCalls++ })
+
+        engine.start()
+        val deadline = System.currentTimeMillis() + 2000
+        while (fatalCalls == 0 && System.currentTimeMillis() < deadline) {
+            Thread.sleep(5)
+        }
+
+        assertEquals(1, fatalCalls)
+        engine.stop()
+        // Still exactly 1 -- stop()'s own cancelIso/join must not trigger a second call.
+        assertEquals(1, fatalCalls)
+    }
+
+    /**
+     * Regression shape for #107 and #51 together: the feedback stream's own fatal error must
+     * stop only the feedback thread (main loop keeps cycling through reapIso), and must not be
+     * mistaken for device loss ([onFatalStreamError] stays silent).
+     */
+    @Test
+    fun `a fatal reapIso error on the feedback stream stops only the feedback thread and does not fire onFatalStreamError`() {
         val mainReachedSecondReap = CountDownLatch(1)
         val blockMainForever = CountDownLatch(1)
         val bridge =
@@ -369,7 +396,8 @@ class UsbIsoStreamEngineTest {
                         blockMainForever.await()
                     }
                 })
-        val engine = engineWith(bridge, format = asyncTestFormat)
+        var fatalCalls = 0
+        val engine = engineWith(bridge, format = asyncTestFormat, onFatalStreamError = { fatalCalls++ })
 
         engine.start()
         val feedbackDeadline = System.currentTimeMillis() + 2000
@@ -381,6 +409,7 @@ class UsbIsoStreamEngineTest {
         assertTrue(
             mainReachedSecondReap.await(2, TimeUnit.SECONDS),
             "main loop should keep cycling through reapIso after the feedback thread's own fatal error")
+        assertEquals(0, fatalCalls, "the feedback stream's own fatal error must not look like device loss")
 
         blockMainForever.countDown()
         engine.stop()

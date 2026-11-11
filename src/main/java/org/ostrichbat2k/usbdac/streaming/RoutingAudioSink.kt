@@ -168,10 +168,20 @@ class RoutingAudioSink(private val usbAudioManager: UsbAudioManager, private val
         val existing = delegate
         if (existing != null && existing !== fallback && existing !== usbAudioManager.resolveActiveSink(trigger = isPlaying)) {
             delegate = null
+            // #51: same reasoning as commitDelegateSwitch's own abandon-case -- without this,
+            // the abandoned existing's native thread/USB claim is leaked, since nothing else
+            // here ever calls pause()/release()/flush() on a delegate this class has simply
+            // stopped forwarding calls to.
+            existing.flush()
             pendingListener?.let(fallback::setListener)
             lastConfiguredFormat?.let {
                 fallback.configure(it, lastConfiguredBufferSize, lastConfiguredOutputChannels)
                 usbAudioManager.reportPlaybackRoute(fallbackRoute(it))
+                // #51: same isPlaying nudge commitDelegateSwitch already gives a newly-adopted
+                // delegate -- without it, fallback sits in its own default-paused state forever,
+                // since ExoPlayer only calls play() on this outer sink once per play intent and
+                // never learns this self-heal just switched which delegate we forward to.
+                if (isPlaying) fallback.play()
             }
             return fallback
         }

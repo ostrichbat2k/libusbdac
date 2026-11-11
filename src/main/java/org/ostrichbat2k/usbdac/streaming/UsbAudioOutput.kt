@@ -137,6 +137,7 @@ class UsbAudioOutput(
             ringBuffer = ringBuffer,
             paused = { paused },
             reportPipelineStats = usbAudioManager::reportPipelineStats,
+            onFatalStreamError = usbAudioManager::notifyStreamFatalError,
         )
 
     // The isochronous schedule can't actually stop (the USB clock must keep ticking), so "pause"

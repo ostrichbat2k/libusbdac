@@ -389,7 +389,20 @@ class UsbAudioOutputProvider(
                     UsbAudioOutput.InputConversion.DROP_PADDING_BYTE -> " (dropping 32-bit container padding)"
                     UsbAudioOutput.InputConversion.NONE -> ""
                 })
-        usbAudioManager.ensureFormatActive(target, config.sampleRate)
+        // #51: ensureFormatActive() returning false means the session this provider was built
+        // for is no longer the one UsbAudioManager considers live (device likely unplugged mid-
+        // relock, or a prior fatal stream error already deactivated it) -- refuse to build a
+        // UsbAudioOutput against a dead session rather than opening a native stream doomed to
+        // wedge again. DefaultAudioSink.buildAudioOutput() already catches exactly this exception
+        // type and reports/rethrows it as its own InitializationException -- a supported failure
+        // path for AudioOutputProvider, not a new propagation mechanism.
+        if (!usbAudioManager.ensureFormatActive(target, config.sampleRate)) {
+            throw AudioOutputProvider.InitializationException(
+                IllegalStateException(
+                    "UsbAudioOutputProvider: ensureFormatActive failed -- session is no longer " +
+                        "the one UsbAudioManager considers live, refusing to build a " +
+                        "UsbAudioOutput against it"))
+        }
         // Authoritative Now Playing route report -- RoutingAudioSink.configure() also reports
         // an immediate, optimistic one right after resolveForConfigure() for UI responsiveness,
         // but that one derives bit depth from the decoder's own inputFormat.pcmEncoding, which

@@ -419,6 +419,24 @@ class UsbAudioManagerImplTest {
     }
 
     @Test
+    fun `notifyStreamFatalError deactivates an active session`() {
+        // Regression test for #51: the streaming thread's own fatal-error signal has to reach
+        // the same deactivation path as a device-detach broadcast or a claim takeover timeout --
+        // same shape as the onUsbEnabledChanged(false) test above.
+        val device = fakeDevice()
+        every { dacActivator.activate(device) } returns UsbDacActivator.Result(fakeSession(device), testFormat, 44100)
+        devicesFlow.value = listOf(UsbAudioDevice(device, hasPermission = true))
+        manager.triggerActivation()
+        runBlocking { manager.awaitActivation() }
+        assertNotNull(manager.controlState.value)
+
+        manager.notifyStreamFatalError()
+
+        assertNull(manager.controlState.value)
+        assertFalse(manager.blockPlayback.value)
+    }
+
+    @Test
     fun `onUsbEnabledChanged(true) attempts activation of the attached device`() {
         val device = fakeDevice()
         every { dacActivator.activate(device) } returns UsbDacActivator.Result(fakeSession(device), testFormat, 44100)

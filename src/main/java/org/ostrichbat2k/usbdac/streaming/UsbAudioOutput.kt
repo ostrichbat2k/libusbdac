@@ -446,7 +446,8 @@ class UsbAudioOutput(
         // ones). Stays muted and aborts activation entirely rather than ever let this through.
         val masterVolume = UsbAudioController.getVolume(session, channel = 0)
         val masterRange = UsbAudioController.getVolumeRange(session, channel = 0)
-        val masterCap = UsbAudioController.capToMaxPercent(masterRange?.second ?: 0, masterRange, usbSettings.maxVolumePercent)
+        val masterCap =
+            UsbAudioController.capToMaxPercent(masterRange?.second ?: 0, masterRange, usbSettings.maxVolumePercent)
         if (masterVolume != null && masterRange != null && masterVolume > masterCap) {
             L.e(
                 "UsbAudioOutput: refusing to stream -- master volume=$masterVolume exceeds the " +

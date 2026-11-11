@@ -355,7 +355,10 @@ class UsbIsoStreamEngineTest {
         engine.stop()
     }
 
-    /** Regression shape for #51: a fatal main-loop error has to let the caller react right now, not just leave isStalled() to poll it. */
+    /**
+     * Regression shape for #51: a fatal main-loop error has to let the caller react right now,
+     * not just leave isStalled() to poll it.
+     */
     @Test
     fun `onFatalStreamError fires exactly once when the main loop hits a fatal reapIso error`() {
         val bridge = FakeNativeBridge(reapResults = listOf(UsbNativeBridge.REAP_ERROR_FATAL))
@@ -380,7 +383,7 @@ class UsbIsoStreamEngineTest {
      * mistaken for device loss ([onFatalStreamError] stays silent).
      */
     @Test
-    fun `a fatal reapIso error on the feedback stream stops only the feedback thread and does not fire onFatalStreamError`() {
+    fun `a fatal reapIso error on the feedback stream alone does not stop the main loop or fire onFatalStreamError`() {
         val mainReachedSecondReap = CountDownLatch(1)
         val blockMainForever = CountDownLatch(1)
         val bridge =
@@ -415,7 +418,10 @@ class UsbIsoStreamEngineTest {
         engine.stop()
     }
 
-    /** Regression shape for #107: stop() must shut down a stuck main stream and a clean feedback stream independently. */
+    /**
+     * Regression shape for #107: stop() must shut down a stuck main stream and a clean feedback
+     * stream independently.
+     */
     @Test
     fun `stop shuts down the main stream and the feedback stream independently`() {
         val mainReachedReap = CountDownLatch(1)

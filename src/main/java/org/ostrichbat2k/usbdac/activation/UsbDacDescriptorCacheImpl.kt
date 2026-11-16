@@ -162,6 +162,7 @@ private fun CachedUacFormat.toDomain() =
         syncType = SyncType.entries[syncType],
         sampleRates = sampleRatesEncoded.decodeInts(),
         bInterval = bInterval,
+        hasSamplingFrequencyControl = hasSamplingFrequencyControl,
         feedbackEndpoint =
             if (feedbackEndpointAddress >= 0) {
                 UacFeedbackEndpoint(
@@ -186,7 +187,8 @@ private fun UacStreamFormat.toEntity(deviceKey: String) =
         bInterval = bInterval,
         feedbackEndpointAddress = feedbackEndpoint?.address ?: -1,
         feedbackMaxPacketSize = feedbackEndpoint?.maxPacketSize ?: -1,
-        feedbackBInterval = feedbackEndpoint?.bInterval ?: -1)
+        feedbackBInterval = feedbackEndpoint?.bInterval ?: -1,
+        hasSamplingFrequencyControl = hasSamplingFrequencyControl)
 
 @Entity(tableName = "usb_dac_topology")
 internal data class CachedUacTopology(
@@ -228,6 +230,8 @@ internal data class CachedUacFormat(
     val feedbackEndpointAddress: Int = -1,
     val feedbackMaxPacketSize: Int = -1,
     val feedbackBInterval: Int = -1,
+    /** See [UacStreamFormat.hasSamplingFrequencyControl]. */
+    val hasSamplingFrequencyControl: Boolean = true,
 )
 
 @Dao
@@ -254,11 +258,12 @@ internal interface DescriptorCacheDao {
 }
 
 // Bumped to 2 for #61's new CachedUacFormat.bInterval column, then to 3 for #25's isAsync ->
-// syncType rename plus the three new feedbackEndpoint* columns -- fallbackToDestructiveMigration
+// syncType rename plus the three new feedbackEndpoint* columns, then to 4 for #128's
+// hasSamplingFrequencyControl column -- fallbackToDestructiveMigration
 // above means this just wipes and recreates the cache on next open rather than needing an
 // explicit Migration, acceptable for a pure performance cache (see this class's own doc comment
 // on why a stale/missing entry is a one-tap-equivalent cost, not a correctness risk).
-@Database(entities = [CachedUacTopology::class, CachedUacFormat::class], version = 3, exportSchema = false)
+@Database(entities = [CachedUacTopology::class, CachedUacFormat::class], version = 4, exportSchema = false)
 internal abstract class DescriptorCacheDatabase : RoomDatabase() {
     abstract fun dao(): DescriptorCacheDao
 }

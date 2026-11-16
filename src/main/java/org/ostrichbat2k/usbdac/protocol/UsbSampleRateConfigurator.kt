@@ -31,10 +31,20 @@ import org.ostrichbat2k.usbdac.UsbAudioTuning
  * callers pass different retry counts -- exactly as they behaved before this was extracted.
  */
 internal object UsbSampleRateConfigurator {
-    /** [outcome] of the last attempt, and how many [retries] beyond the first it took. */
-    data class RateWrite(val outcome: UsbAudioController.ClockWriteOutcome, val retries: Int) {
-        val confirmed: Boolean
-            get() = outcome is UsbAudioController.ClockWriteOutcome.Confirmed
+    /**
+     * [outcome] of the last attempt and how many [retries] beyond the first it took.
+     *
+     * [acceptedBecause] is set when the rate is being treated as in effect although the device
+     * did not confirm it by read-back -- the cases UAC 1.0 allows, see [writeSampleRate]. Callers
+     * decide on [accepted], and log [acceptedBecause] so such a session can be recognised later.
+     */
+    data class RateWrite(
+        val outcome: UsbAudioController.ClockWriteOutcome,
+        val retries: Int,
+        val acceptedBecause: String? = null,
+    ) {
+        val accepted: Boolean
+            get() = outcome is UsbAudioController.ClockWriteOutcome.Confirmed || acceptedBecause != null
     }
 
     /**
@@ -45,35 +55,75 @@ internal object UsbSampleRateConfigurator {
     data class ClockSettle(val valid: Boolean?, val extraWaits: Int)
 
     /**
-     * Writes [hz] to wherever this device keeps its sample rate: the streaming endpoint at
-     * [endpointAddress] for UAC 1.0, which has no Clock Source entity, or the Clock Source for
-     * UAC 2.0/3.0, where [endpointAddress] is not used. Using the Clock Source request on a
-     * UAC 1.0 device was once the cause of a real, reproduced endless playback-error loop.
+     * Writes [hz] to wherever this device keeps its sample rate: [format]'s streaming endpoint
+     * for UAC 1.0, which has no Clock Source entity, or the Clock Source for UAC 2.0/3.0. Using
+     * the Clock Source request on a UAC 1.0 device was once the cause of a real, reproduced
+     * endless playback-error loop.
      *
-     * Anything but [UsbAudioController.ClockWriteOutcome.Confirmed] is retried up to [maxRetries]
-     * times, with [UsbAudioTuning.DAC_SETTLE_DELAY_MS] before each retry.
+     * UAC 2.0/3.0: only a read-back equal to [hz] is accepted. A real device has stored and
+     * echoed a rate it then did not run at, so nothing weaker is trusted there.
+     *
+     * UAC 1.0 (#128): the Sampling Frequency control is optional, and the usual device without it
+     * has one fixed rate and STALLs the request. Treating that as failure made every such device
+     * unusable. So, the way Linux's `set_sample_rate_v1` (sound/usb/clock.c) does:
+     * - the endpoint does not declare the control: nothing is sent;
+     * - the write went through but the rate cannot be read back (failed, or zero): accepted,
+     *   since reading is optional too;
+     * - anything else failed, but [hz] is the only rate the format declares: accepted, because
+     *   there is no other rate the device could be running at.
+     * A read-back of a *different* rate, or any failure on a device with several rates, is still
+     * a failure.
+     *
+     * A result that is not accepted is retried up to [maxRetries] times, with
+     * [UsbAudioTuning.DAC_SETTLE_DELAY_MS] before each retry.
      */
     fun writeSampleRate(
         session: UsbAudioSession,
-        endpointAddress: Int,
+        format: UacStreamFormat,
         hz: Int,
         maxRetries: Int = 0,
         sleep: (Long) -> Unit = Thread::sleep,
     ): RateWrite {
-        fun attempt(): UsbAudioController.ClockWriteOutcome =
-            if (session.topology.uacVersion == 1) {
-                UsbAudioController.setUac1EndpointSampleRate(session, endpointAddress, hz)
-            } else {
-                UsbAudioController.setClockFrequency(session, hz)
-            }
-        var outcome = attempt()
-        var retries = 0
-        while (outcome !is UsbAudioController.ClockWriteOutcome.Confirmed && retries < maxRetries) {
-            sleep(UsbAudioTuning.DAC_SETTLE_DELAY_MS)
-            outcome = attempt()
-            retries++
+        val isUac1 = session.topology.uacVersion == 1
+        if (isUac1 && !format.hasSamplingFrequencyControl) {
+            return RateWrite(
+                UsbAudioController.ClockWriteOutcome.Confirmed(hz),
+                retries = 0,
+                acceptedBecause = "endpoint declares no sampling frequency control; nothing sent")
         }
-        return RateWrite(outcome, retries)
+        fun attempt(retries: Int): RateWrite {
+            val outcome =
+                if (isUac1) {
+                    UsbAudioController.setUac1EndpointSampleRate(session, format.endpointAddress, hz)
+                } else {
+                    UsbAudioController.setClockFrequency(session, hz)
+                }
+            return RateWrite(outcome, retries, if (isUac1) uac1Tolerance(outcome, format, hz) else null)
+        }
+        var write = attempt(0)
+        while (!write.accepted && write.retries < maxRetries) {
+            sleep(UsbAudioTuning.DAC_SETTLE_DELAY_MS)
+            write = attempt(write.retries + 1)
+        }
+        return write
+    }
+
+    /** Why an unconfirmed UAC 1.0 [outcome] is acceptable, or null if it is not. See [writeSampleRate]. */
+    private fun uac1Tolerance(
+        outcome: UsbAudioController.ClockWriteOutcome,
+        format: UacStreamFormat,
+        hz: Int,
+    ): String? {
+        val mismatch = outcome as? UsbAudioController.ClockWriteOutcome.Mismatch
+        val unreadable = mismatch != null && (mismatch.actualHz == null || mismatch.actualHz == 0)
+        val onlyRate = format.sampleRates.size == 1 && format.sampleRates[0] == hz
+        val wrongRateReadBack = mismatch != null && !unreadable
+        return when {
+            outcome is UsbAudioController.ClockWriteOutcome.Confirmed -> null
+            unreadable -> "rate written; device does not report it back"
+            onlyRate && !wrongRateReadBack -> "request failed, but $hz Hz is the only rate this format declares"
+            else -> null
+        }
     }
 
     /**

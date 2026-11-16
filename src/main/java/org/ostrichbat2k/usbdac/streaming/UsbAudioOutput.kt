@@ -338,14 +338,16 @@ class UsbAudioOutput(
         // Source request -- see writeSampleRate's doc comment for why that choice matters.
         val rateWrite =
             UsbSampleRateConfigurator.writeSampleRate(
-                session, format.endpointAddress, sampleRateHz, maxRetries = UsbAudioTuning.CLOCK_SET_MAX_RETRIES)
-        if (!rateWrite.confirmed) {
+                session, format, sampleRateHz, maxRetries = UsbAudioTuning.CLOCK_SET_MAX_RETRIES)
+        if (!rateWrite.accepted) {
             L.w(
                 "UsbAudioOutput: failed to set DAC clock to $sampleRateHz Hz after ${rateWrite.retries} " +
                     "retry(s): ${rateWrite.outcome}")
             return false
-        } else if (rateWrite.retries > 0) {
-            L.i("UsbAudioOutput: set DAC clock to $sampleRateHz Hz after ${rateWrite.retries} retry(s)")
+        } else if (rateWrite.retries > 0 || rateWrite.acceptedBecause != null) {
+            L.i(
+                "UsbAudioOutput: set DAC clock to $sampleRateHz Hz after ${rateWrite.retries} retry(s)" +
+                    (rateWrite.acceptedBecause?.let { " -- unconfirmed, accepted: $it" } ?: ""))
         }
 
         // See UsbAudioManager.activateDac's comment on wakePowerDomain for why: a clean,

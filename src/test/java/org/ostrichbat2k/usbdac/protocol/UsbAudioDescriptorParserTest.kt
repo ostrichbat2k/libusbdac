@@ -410,7 +410,13 @@ class UsbAudioDescriptorParserUac2Test {
 }
 
 class UsbAudioDescriptorParserUac1Test {
-    private fun ab13xLikeConfig(sampleRates: List<Int> = listOf(8000, 48000)): ByteArray {
+    /** Class-specific endpoint descriptor (EP_GENERAL, type 0x25) with the given bmAttributes. */
+    private fun csEndpoint(attributes: Int) = byteArrayOf(7, 0x25, 0x01, attributes.toByte(), 0, 0, 0)
+
+    private fun ab13xLikeConfig(
+        sampleRates: List<Int> = listOf(8000, 48000),
+        afterEndpoint: ByteArray = ByteArray(0),
+    ): ByteArray {
         val config = D.configuration(1)
         val acIface = D.iface(0, 0, 1, 1, 0x00)
         val input = D.uac1InputTerminal(id = 1, terminalType = 0x0101, channelCount = 2)
@@ -421,7 +427,30 @@ class UsbAudioDescriptorParserUac1Test {
         // bInterval=4: see UsbAudioDescriptorParserUac3Test's earPodsLikeConfig for why a
         // non-default value is used here.
         val endpoint = D.endpoint(address = 0x01, attributes = 0x05, maxPacketSize = 192, bInterval = 4)
-        return config + acIface + input + output + asIface + asGeneral + formatType + endpoint
+        return config + acIface + input + output + asIface + asGeneral + formatType + endpoint + afterEndpoint
+    }
+
+    @Test
+    fun `sampling frequency control bit of the class-specific endpoint descriptor is read`() {
+        fun parsed(after: ByteArray) =
+            UsbAudioDescriptorParserUac1.parseUac1Playback(ab13xLikeConfig(afterEndpoint = after))!!.formats.single()
+        assertEquals(true, parsed(csEndpoint(0x01)).hasSamplingFrequencyControl)
+        assertEquals(true, parsed(csEndpoint(0x81)).hasSamplingFrequencyControl, "other attribute bits ignored")
+        assertEquals(false, parsed(csEndpoint(0x00)).hasSamplingFrequencyControl)
+        assertEquals(false, parsed(csEndpoint(0x80)).hasSamplingFrequencyControl)
+        // No class-specific endpoint descriptor at all: unknown, so the request is still tried.
+        assertEquals(true, parsed(ByteArray(0)).hasSamplingFrequencyControl)
+    }
+
+    @Test
+    fun `a feedback endpoint's class-specific descriptor does not decide the data endpoint's control`() {
+        val feedback = D.endpoint(address = 0x81, attributes = 0x11, maxPacketSize = 3, bInterval = 1)
+        val format =
+            UsbAudioDescriptorParserUac1.parseUac1Playback(
+                    ab13xLikeConfig(afterEndpoint = csEndpoint(0x01) + feedback + csEndpoint(0x00)))!!
+                .formats
+                .single()
+        assertEquals(true, format.hasSamplingFrequencyControl)
     }
 
     @Test

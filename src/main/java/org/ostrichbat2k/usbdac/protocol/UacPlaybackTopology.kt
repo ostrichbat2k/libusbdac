@@ -82,6 +82,15 @@ data class UacStreamFormat(
     val bInterval: Int = 1,
     /** See [UacFeedbackEndpoint]. Null unless the descriptor walk found one (#25). */
     val feedbackEndpoint: UacFeedbackEndpoint? = null,
+    /**
+     * UAC 1.0 only: whether the streaming endpoint implements the Sampling Frequency control --
+     * bit 0 of bmAttributes in its class-specific endpoint descriptor (UAC 1.0 4.6.1.2). The
+     * control is optional, and a device with one fixed rate commonly leaves it out and STALLs the
+     * request (#128). False only when the descriptor was present and said so; true when it said
+     * yes, when there was no such descriptor to read, and for UAC 2.0/3.0, where the rate belongs
+     * to the Clock Source and this is not consulted.
+     */
+    val hasSamplingFrequencyControl: Boolean = true,
 )
 
 /**

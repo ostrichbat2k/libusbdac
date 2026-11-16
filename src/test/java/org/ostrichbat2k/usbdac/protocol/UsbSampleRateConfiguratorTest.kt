@@ -75,6 +75,21 @@ class UsbSampleRateConfiguratorTest {
             streamingAltSettings = emptyMap(),
         )
 
+    private fun format(rates: List<Int> = listOf(44100, 48000, RATE), hasRateControl: Boolean = true) =
+        UacStreamFormat(
+            alternateSetting = 1,
+            bitResolution = 16,
+            subslotSize = 2,
+            clusterDescriptorId = -1,
+            endpointAddress = ENDPOINT,
+            maxPacketSize = 192,
+            sampleRates = rates,
+            hasSamplingFrequencyControl = hasRateControl,
+        )
+
+    private fun write(session: UsbAudioSession, format: UacStreamFormat, maxRetries: Int = 0) =
+        UsbSampleRateConfigurator.writeSampleRate(session, format, RATE, maxRetries, sleep)
+
     @BeforeEach
     fun setUp() {
         mockkObject(UsbAudioController)
@@ -90,8 +105,8 @@ class UsbSampleRateConfiguratorTest {
         for (version in listOf(2, 3)) {
             val session = session(version)
             every { UsbAudioController.setClockFrequency(session, RATE) } returns ClockWriteOutcome.Confirmed(RATE)
-            val write = UsbSampleRateConfigurator.writeSampleRate(session, ENDPOINT, RATE, sleep = sleep)
-            assertTrue(write.confirmed)
+            val write = write(session, format())
+            assertTrue(write.accepted)
             assertEquals(0, write.retries)
             verify(exactly = 1) { UsbAudioController.setClockFrequency(session, RATE) }
         }
@@ -104,8 +119,8 @@ class UsbSampleRateConfiguratorTest {
         val session = session(1)
         every { UsbAudioController.setUac1EndpointSampleRate(session, ENDPOINT, RATE) } returns
             ClockWriteOutcome.Confirmed(RATE)
-        val write = UsbSampleRateConfigurator.writeSampleRate(session, ENDPOINT, RATE, sleep = sleep)
-        assertTrue(write.confirmed)
+        val write = write(session, format())
+        assertTrue(write.accepted)
         verify(exactly = 1) { UsbAudioController.setUac1EndpointSampleRate(session, ENDPOINT, RATE) }
         verify(exactly = 0) { UsbAudioController.setClockFrequency(any(), any()) }
     }
@@ -114,8 +129,8 @@ class UsbSampleRateConfiguratorTest {
     fun `without retries a failed write is reported after a single attempt and no delay`() {
         val session = session(2)
         every { UsbAudioController.setClockFrequency(session, RATE) } returns ClockWriteOutcome.TransferFailed
-        val write = UsbSampleRateConfigurator.writeSampleRate(session, ENDPOINT, RATE, sleep = sleep)
-        assertFalse(write.confirmed)
+        val write = write(session, format())
+        assertFalse(write.accepted)
         assertEquals(ClockWriteOutcome.TransferFailed, write.outcome)
         assertEquals(0, write.retries)
         verify(exactly = 1) { UsbAudioController.setClockFrequency(session, RATE) }
@@ -130,8 +145,8 @@ class UsbSampleRateConfiguratorTest {
                 ClockWriteOutcome.TransferFailed,
                 ClockWriteOutcome.Mismatch(RATE, 48000),
                 ClockWriteOutcome.Confirmed(RATE))
-        val write = UsbSampleRateConfigurator.writeSampleRate(session, ENDPOINT, RATE, maxRetries = 3, sleep = sleep)
-        assertTrue(write.confirmed)
+        val write = write(session, format(), maxRetries = 3)
+        assertTrue(write.accepted)
         assertEquals(2, write.retries)
         assertEquals(List(2) { UsbAudioTuning.DAC_SETTLE_DELAY_MS }, sleeps)
     }
@@ -140,11 +155,88 @@ class UsbSampleRateConfiguratorTest {
     fun `retries stop at the limit and the last outcome is reported`() {
         val session = session(2)
         every { UsbAudioController.setClockFrequency(session, RATE) } returns ClockWriteOutcome.Mismatch(RATE, 48000)
-        val write = UsbSampleRateConfigurator.writeSampleRate(session, ENDPOINT, RATE, maxRetries = 3, sleep = sleep)
-        assertFalse(write.confirmed)
+        val write = write(session, format(), maxRetries = 3)
+        assertFalse(write.accepted)
         assertEquals(3, write.retries)
         verify(exactly = 4) { UsbAudioController.setClockFrequency(session, RATE) }
         assertEquals(3, sleeps.size)
+    }
+
+    // ---- #128: what UAC 1.0 is allowed to leave out ----
+
+    @Test
+    fun `UAC1 endpoint without the sampling frequency control is sent nothing and accepted`() {
+        val session = session(1)
+        val write = write(session, format(hasRateControl = false))
+        assertTrue(write.accepted)
+        assertTrue(write.acceptedBecause!!.contains("no sampling frequency control"))
+        verify(exactly = 0) { UsbAudioController.setUac1EndpointSampleRate(any(), any(), any()) }
+        assertTrue(sleeps.isEmpty())
+    }
+
+    @Test
+    fun `the control flag is not consulted for UAC2`() {
+        val session = session(2)
+        every { UsbAudioController.setClockFrequency(session, RATE) } returns ClockWriteOutcome.Confirmed(RATE)
+        val write = write(session, format(hasRateControl = false))
+        assertTrue(write.accepted)
+        assertNull(write.acceptedBecause)
+        verify(exactly = 1) { UsbAudioController.setClockFrequency(session, RATE) }
+    }
+
+    @Test
+    fun `UAC1 write that cannot be read back is accepted without retrying`() {
+        for (readBack in listOf<Int?>(null, 0)) {
+            sleeps.clear()
+            val session = session(1)
+            every { UsbAudioController.setUac1EndpointSampleRate(session, ENDPOINT, RATE) } returns
+                ClockWriteOutcome.Mismatch(RATE, readBack)
+            val write = write(session, format(), maxRetries = 3)
+            assertTrue(write.accepted, "readBack=$readBack")
+            assertEquals(0, write.retries)
+            assertTrue(sleeps.isEmpty())
+        }
+    }
+
+    @Test
+    fun `UAC1 read-back of a different rate is a failure even on a single-rate format`() {
+        val session = session(1)
+        every { UsbAudioController.setUac1EndpointSampleRate(session, ENDPOINT, RATE) } returns
+            ClockWriteOutcome.Mismatch(RATE, 48000)
+        val write = write(session, format(rates = listOf(RATE)))
+        assertFalse(write.accepted)
+        assertNull(write.acceptedBecause)
+    }
+
+    @Test
+    fun `UAC1 stalled request is accepted when it asks for the format's only rate`() {
+        val session = session(1)
+        every { UsbAudioController.setUac1EndpointSampleRate(session, ENDPOINT, RATE) } returns
+            ClockWriteOutcome.TransferFailed
+        val write = write(session, format(rates = listOf(RATE)))
+        assertTrue(write.accepted)
+        assertEquals(ClockWriteOutcome.TransferFailed, write.outcome)
+        assertTrue(write.acceptedBecause!!.contains("only rate"))
+    }
+
+    @Test
+    fun `UAC1 stalled request is a failure when the format has other rates`() {
+        val session = session(1)
+        every { UsbAudioController.setUac1EndpointSampleRate(session, ENDPOINT, RATE) } returns
+            ClockWriteOutcome.TransferFailed
+        val write = write(session, format(), maxRetries = 2)
+        assertFalse(write.accepted)
+        assertEquals(2, write.retries)
+    }
+
+    @Test
+    fun `UAC2 gets none of the UAC1 leniency`() {
+        val session = session(2)
+        every { UsbAudioController.setClockFrequency(session, RATE) } returnsMany
+            listOf(ClockWriteOutcome.Mismatch(RATE, null), ClockWriteOutcome.TransferFailed)
+        val single = format(rates = listOf(RATE))
+        assertFalse(write(session, single).accepted)
+        assertFalse(write(session, single).accepted)
     }
 
     @Test

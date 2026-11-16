@@ -46,7 +46,7 @@ enum class SyncType {
  * An Asynchronous device's dedicated feedback endpoint (UAC 5.12.4.2) -- a second, IN-direction
  * isochronous endpoint in the same alt setting as the main OUT data endpoint, over which the
  * device periodically reports its own real sample-consumption rate as a fixed-point value (see
- * [org.ostrichbat2k.usbdac.streaming.FeedbackRateDecoder]). Only ever populated when the
+ * [org.ostrichbat2k.usbdac.streaming.FeedbackDecoder]). Only ever populated when the
  * descriptor walk actually found a second, IN-direction endpoint in this alt setting --
  * independent of [UacStreamFormat.syncType] saying [SyncType.ASYNC], since a confused or
  * malformed device could decode either without the other; [UsbAudioOutput] is the one place

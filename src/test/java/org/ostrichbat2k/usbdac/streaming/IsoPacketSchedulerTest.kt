@@ -55,8 +55,8 @@ class IsoPacketSchedulerTest {
 
     @Test
     fun `44100Hz at 1000 packets per second follows the exact known Bresenham pattern`() {
-        // base = 44, remainder = 100 -- the accumulator crosses 1000 (the +1 packet) on
-        // exactly every 10th call, never early or late.
+        // 44.1 per packet -- the phase crosses a whole sample (the +1 packet) on exactly every
+        // 10th call, never early or late.
         val scheduler = IsoPacketScheduler(sampleRateHz = 44100, packetsPerSecond = 1000)
         val expected = List(20) { i -> if ((i + 1) % 10 == 0) 45 else 44 }
         val actual = List(20) { scheduler.nextPacketSampleCount() }
@@ -77,16 +77,64 @@ class IsoPacketSchedulerTest {
     }
 
     @Test
-    fun `updateRate re-derives the distribution for a new rate, as if freshly constructed`() {
+    fun `updateRate changes the step and keeps the phase`() {
+        // 44100 Hz at 1000 packets/s is 44.1 per packet. Seven packets leave 0.7 in the phase;
+        // switching to 44300 (44.3 per packet) then crosses 1.0 on the very next packet. A
+        // scheduler that cleared the phase would need four more packets to get there.
         val scheduler = IsoPacketScheduler(sampleRateHz = 44100, packetsPerSecond = 1000)
-        repeat(7) { scheduler.nextPacketSampleCount() } // advance into the cycle, accumulator != 0
+        repeat(7) { assertEquals(44, scheduler.nextPacketSampleCount()) }
+        scheduler.updateRate(44300)
+        assertEquals(45, scheduler.nextPacketSampleCount())
+    }
+
+    @Test
+    fun `a rate update before every packet does not change what is delivered`() {
+        // #120. Feedback arrives about once per millisecond. Clearing the phase on each update
+        // threw the fraction away every time: 44100 Hz came out as exactly 44000.
+        for ((rateHz, pps) in listOf(44100 to 1000, 44100 to 8000, 48010 to 1000, 88200 to 8000, 176400 to 8000)) {
+            val scheduler = IsoPacketScheduler(rateHz, pps)
+            var total = 0
+            repeat(pps) {
+                scheduler.updateRate(rateHz)
+                total += scheduler.nextPacketSampleCount()
+            }
+            assertEquals(rateHz, total, "rateHz=$rateHz pps=$pps")
+        }
+    }
+
+    @Test
+    fun `feedback in Q16_16 samples per packet is delivered at the rate it asks for`() {
+        // A device clock 1000 ppm fast at high speed, feedback applied every 8 packets (1 ms).
+        val pps = 8000
+        val deviceHz = 44144.1
+        val q16 = Math.round(deviceHz * 65536 / pps)
+        val scheduler = IsoPacketScheduler(44100, pps)
+        var total = 0L
+        val seconds = 10
+        repeat(pps * seconds) { i ->
+            if (i % 8 == 0) scheduler.updateSamplesPerPacketQ16(q16)
+            total += scheduler.nextPacketSampleCount()
+        }
+        // Q16.16 per packet resolves 8000/65536 = 0.12 Hz, so allow that much per second.
+        assertEquals(deviceHz * seconds, total.toDouble(), 0.13 * seconds + 1)
+    }
+
+    @Test
+    fun `packet sizes only ever differ by one sample while following feedback`() {
+        val scheduler = IsoPacketScheduler(44100, 8000)
+        scheduler.updateSamplesPerPacketQ16(Math.round(44144.1 * 65536 / 8000))
+        val sizes = List(8000) { scheduler.nextPacketSampleCount() }.toSet()
+        assertEquals(setOf(5, 6), sizes)
+    }
+
+    @Test
+    fun `a packet never exceeds maxSamplesPerPacket and the excess is dropped, not deferred`() {
+        val scheduler = IsoPacketScheduler(sampleRateHz = 48000, packetsPerSecond = 1000, maxSamplesPerPacket = 50)
+        scheduler.updateRate(96000) // 96 per packet, far over the ceiling
+        repeat(100) { assertEquals(50, scheduler.nextPacketSampleCount()) }
+        // Back at a rate that fits, nothing was banked from the clamped packets.
         scheduler.updateRate(48000)
-
-        val afterUpdate = List(20) { scheduler.nextPacketSampleCount() }
-        val fresh = IsoPacketScheduler(sampleRateHz = 48000, packetsPerSecond = 1000)
-        val fromScratch = List(20) { fresh.nextPacketSampleCount() }
-
-        assertEquals(fromScratch, afterUpdate)
+        repeat(100) { assertEquals(48, scheduler.nextPacketSampleCount()) }
     }
 
     @Test

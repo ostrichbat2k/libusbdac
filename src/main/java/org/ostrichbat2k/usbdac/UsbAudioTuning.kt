@@ -169,12 +169,11 @@ internal object UsbAudioTuning {
     const val FEEDBACK_PACKETS_PER_URB = 1
 
     /**
-     * [org.ostrichbat2k.usbdac.streaming.FeedbackRateDecoder]'s sanity-check band: a decoded
-     * candidate rate is only trusted if it's within this fraction of the nominal negotiated rate.
-     * The on-wire feedback format is genuinely ambiguous (see that class's own doc comment) --
-     * this is deliberately generous (+-10%) since a real device's own clock drift should only
-     * ever be a tiny fraction of this, so the band exists to reject outright garbage/misdecodes,
-     * not to track genuine drift tightly.
+     * [org.ostrichbat2k.usbdac.streaming.FeedbackDecoder]'s acceptance band: a feedback value is
+     * only applied if it is within this fraction of the nominal negotiated rate. A real device's
+     * clock differs from nominal by a tiny fraction of this, so the band exists to reject
+     * garbage, not to track drift tightly. It also bounds how much larger than nominal a packet
+     * can get, which [org.ostrichbat2k.usbdac.streaming.UsbIsoStreamEngine] sizes its buffers by.
      */
     const val FEEDBACK_RATE_TOLERANCE_FRACTION = 0.1
 }

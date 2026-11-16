@@ -159,7 +159,17 @@ internal class UsbIsoStreamEngine(
                 "bInterval=${format.bInterval} (pacing $packetsPerSecond packets/sec, " +
                 "${packetDurationNs / 1000}us/packet, $packetsPerUrb packets/urb)")
         isoHandle = handle
-        val scheduler = IsoPacketScheduler(sampleRateHz, packetsPerSecond)
+        // The most one packet may ever carry. An Asynchronous device can ask for more than the
+        // nominal rate through feedback (accepted up to FEEDBACK_RATE_TOLERANCE_FRACTION above
+        // it), so the ceiling is that, limited to what the endpoint's wMaxPacketSize holds --
+        // but never below what the nominal rate itself needs, which is what was always sent.
+        val nominalMaxSamplesPerPacket = sampleRateHz / packetsPerSecond + 1
+        val feedbackMaxSamplesPerPacket =
+            (sampleRateHz * (1.0 + UsbAudioTuning.FEEDBACK_RATE_TOLERANCE_FRACTION) / packetsPerSecond).toInt() + 1
+        val maxSamplesPerPacket =
+            minOf(feedbackMaxSamplesPerPacket, format.maxPacketSize / frameBytes)
+                .coerceAtLeast(nominalMaxSamplesPerPacket)
+        val scheduler = IsoPacketScheduler(sampleRateHz, packetsPerSecond, maxSamplesPerPacket)
 
         // Reused across every call instead of allocating a fresh ByteArray/IntArray each time --
         // this runs every URB, indefinitely, for the entire stream. Confirmed, reproduced:
@@ -167,9 +177,9 @@ internal class UsbIsoStreamEngine(
         // playback, and got worse at higher data rates (96kHz) -- consistent with the garbage
         // from thousands of allocations a minute eventually triggering a GC pause long enough to
         // stall this time-critical thread past the lookahead the in-flight URBs provide, starving
-        // the device's isochronous schedule. Sized for the largest a packet can ever be for this
-        // sampleRateHz (IsoPacketScheduler's Bresenham remainder adds at most one extra sample).
-        val maxBytesPerPacket = (sampleRateHz / packetsPerSecond + 1) * frameBytes
+        // the device's isochronous schedule. Sized for the largest packet the scheduler is
+        // allowed to produce (it clamps to maxSamplesPerPacket).
+        val maxBytesPerPacket = maxSamplesPerPacket * frameBytes
         val urbBuffer = ByteArray(packetsPerUrb * maxBytesPerPacket)
         val packetLengths = IntArray(packetsPerUrb)
         // What's currently loaded into each URB slot, for framesOutput to credit once reapIso()
@@ -435,7 +445,8 @@ internal class UsbIsoStreamEngine(
                     start()
                 }
 
-        startFeedbackThreadIfApplicable(fd, scheduler)
+        val feedbackDecoder = FeedbackDecoder(sampleRateHz, packetsPerSecond, maxSamplesPerPacket)
+        startFeedbackThreadIfApplicable(fd, scheduler, feedbackDecoder)
     }
 
     /**
@@ -453,7 +464,7 @@ internal class UsbIsoStreamEngine(
      * means the scheduler stops getting corrected and stays at whatever rate was last set, not
      * that playback itself is at risk.
      */
-    private fun startFeedbackThreadIfApplicable(fd: Int, scheduler: IsoPacketScheduler) {
+    private fun startFeedbackThreadIfApplicable(fd: Int, scheduler: IsoPacketScheduler, decoder: FeedbackDecoder) {
         val feedback = format.feedbackEndpoint
         if (format.syncType != SyncType.ASYNC || feedback == null) return
 
@@ -473,7 +484,7 @@ internal class UsbIsoStreamEngine(
         feedbackStreaming = true
 
         feedbackThread =
-            Thread { runFeedbackLoop(handle, feedback.maxPacketSize, scheduler) }
+            Thread { runFeedbackLoop(handle, feedback.maxPacketSize, scheduler, decoder) }
                 .apply {
                     isDaemon = true
                     name = "UsbAudioOutput-feedback"
@@ -484,10 +495,15 @@ internal class UsbIsoStreamEngine(
     /**
      * The feedback thread's body, split out of [startFeedbackThreadIfApplicable] purely to keep
      * that function's own cyclomatic complexity within detekt's threshold -- behaves identically
-     * either way, since [handle]/[maxPacketSize]/[scheduler] are exactly what the closure captured
-     * before this split.
+     * either way, since [handle]/[maxPacketSize]/[scheduler]/[decoder] are exactly what the
+     * closure captured before this split.
      */
-    private fun runFeedbackLoop(handle: Long, maxPacketSize: Int, scheduler: IsoPacketScheduler) {
+    private fun runFeedbackLoop(
+        handle: Long,
+        maxPacketSize: Int,
+        scheduler: IsoPacketScheduler,
+        decoder: FeedbackDecoder,
+    ) {
         val packetLengths = IntArray(UsbAudioTuning.FEEDBACK_PACKETS_PER_URB) { maxPacketSize }
         val buffer = ByteArray(maxPacketSize)
 
@@ -517,13 +533,32 @@ internal class UsbIsoStreamEngine(
                 continue
             }
             val bytesRead = nativeBridge.readIsoSlotData(handle, slot, buffer)
-            if (bytesRead > 0) {
-                val decoded = FeedbackRateDecoder.decode(buffer.copyOf(bytesRead), sampleRateHz)
-                if (decoded != null) scheduler.updateRate(decoded)
-            }
+            if (bytesRead > 0) applyFeedback(buffer, bytesRead, scheduler, decoder)
             resubmit(slot)
         }
         L.i("UsbIsoStreamEngine: feedback thread exiting")
+    }
+
+    /**
+     * Decodes one feedback payload and, if it is usable, hands the rate to [scheduler]. Logs only
+     * when the detected wire format changes -- once per stream on a healthy device -- so the
+     * steady state allocates nothing on the feedback thread (#121).
+     */
+    private fun applyFeedback(
+        buffer: ByteArray,
+        bytesRead: Int,
+        scheduler: IsoPacketScheduler,
+        decoder: FeedbackDecoder,
+    ) {
+        val shiftBefore = decoder.detectedShift
+        val samplesPerPacketQ16 = decoder.decode(buffer, bytesRead)
+        if (samplesPerPacketQ16 != FeedbackDecoder.REJECTED) scheduler.updateSamplesPerPacketQ16(samplesPerPacketQ16)
+        if (decoder.detectedShift != shiftBefore) {
+            L.i(
+                "UsbIsoStreamEngine: feedback format shift $shiftBefore -> ${decoder.detectedShift} " +
+                    "($bytesRead-byte payload, value $samplesPerPacketQ16 Q16.16 samples/packet; " +
+                    "${FeedbackDecoder.SHIFT_UNKNOWN} = undetected, ${FeedbackDecoder.REJECTED} = rejected)")
+        }
     }
 
     fun stop() {

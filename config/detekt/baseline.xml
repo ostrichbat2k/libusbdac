@@ -10,7 +10,6 @@
     <ID>CyclomaticComplexMethod:UsbAudioDescriptorParserUac2.kt$UsbAudioDescriptorParserUac2$fun parseUac2Playback(entries: List&lt;Pair&lt;Int, ByteArray&gt;&gt;): UacPlaybackTopology?</ID>
     <ID>CyclomaticComplexMethod:UsbAudioDescriptorParserUac3.kt$UsbAudioDescriptorParserUac3$fun dumpAcTopology(entries: List&lt;Pair&lt;Int, ByteArray&gt;&gt;)</ID>
     <ID>CyclomaticComplexMethod:UsbAudioDescriptorParserUac3.kt$UsbAudioDescriptorParserUac3$fun parseUac3Playback(entries: List&lt;Pair&lt;Int, ByteArray&gt;&gt;): UacPlaybackTopology?</ID>
-    <ID>CyclomaticComplexMethod:UsbAudioInspector.kt$UsbAudioInspector$fun inspect(context: Context, device: UsbDevice, isSessionActive: () -&gt; Boolean = { false })</ID>
     <ID>CyclomaticComplexMethod:UsbAudioOutput.kt$UsbAudioOutput$private fun activateAndStream(): Boolean</ID>
     <ID>CyclomaticComplexMethod:UsbClaimControllerImpl.kt$UsbClaimControllerImpl$private fun awaitAndroidOutputTakeover(deactivateOnTimeout: Boolean)</ID>
     <ID>CyclomaticComplexMethod:UsbDacActivatorImpl.kt$UsbDacActivatorImpl$override fun activate(device: UsbDevice): UsbDacActivator.Result?</ID>
@@ -90,7 +89,6 @@
     <ID>MagicNumber:UsbAudioDescriptorParserUac3.kt$UsbAudioDescriptorParserUac3$7</ID>
     <ID>MagicNumber:UsbAudioDescriptorParserUac3.kt$UsbAudioDescriptorParserUac3$8</ID>
     <ID>MagicNumber:UsbAudioDescriptorParserUac3.kt$UsbAudioDescriptorParserUac3$9</ID>
-    <ID>MagicNumber:UsbAudioInspector.kt$UsbAudioInspector$48000</ID>
     <ID>MagicNumber:UsbAudioManagerImpl.kt$UsbAudioManagerImpl$16</ID>
     <ID>MagicNumber:UsbAudioManagerImpl.kt$UsbAudioManagerImpl$8000L</ID>
     <ID>MagicNumber:UsbAudioOutput.kt$UsbAudioOutput$0xFF</ID>
@@ -178,7 +176,6 @@
     <ID>ReturnCount:UsbAudioDescriptorParserUac1.kt$UsbAudioDescriptorParserUac1$fun parseUac1Playback(entries: List&lt;Pair&lt;Int, ByteArray&gt;&gt;): UacPlaybackTopology?</ID>
     <ID>ReturnCount:UsbAudioDescriptorParserUac2.kt$UsbAudioDescriptorParserUac2$fun parseUac2Playback(entries: List&lt;Pair&lt;Int, ByteArray&gt;&gt;): UacPlaybackTopology?</ID>
     <ID>ReturnCount:UsbAudioDescriptorParserUac3.kt$UsbAudioDescriptorParserUac3$fun parseUac3Playback(entries: List&lt;Pair&lt;Int, ByteArray&gt;&gt;): UacPlaybackTopology?</ID>
-    <ID>ReturnCount:UsbAudioInspector.kt$UsbAudioInspector$fun inspect(context: Context, device: UsbDevice, isSessionActive: () -&gt; Boolean = { false })</ID>
     <ID>ReturnCount:UsbAudioManagerImpl.kt$UsbAudioManagerImpl$override fun ensureFormatActive(format: UacStreamFormat, sampleRateHz: Int): Boolean</ID>
     <ID>ReturnCount:UsbAudioManagerImpl.kt$UsbAudioManagerImpl$override fun getClockInfo(): Pair&lt;Int?, Boolean?&gt;?</ID>
     <ID>ReturnCount:UsbAudioManagerImpl.kt$UsbAudioManagerImpl$override fun getPowerDomainState(): Int?</ID>

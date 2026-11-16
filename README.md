@@ -169,7 +169,6 @@ they're used across every feature rather than belonging to one.
 | `streaming` | `IsoPacketScheduler`, `PcmRingBuffer`, `UsbPipelineStats` | Isochronous packet-size pacing math, the streaming thread's PCM ring buffer, and the live pipeline stats exposed for a host's diagnostics UI. |
 | `abx` | `UsbAbxTester` / `Impl` | The blind ABX self-test: secretly routes a track bit-perfect or HAL-fallback, then asks the host app to guess which, scoring the result. |
 | `diagnostics` | `UsbDiagnosticLog` / `Impl` | The timestamped, most-recent-first activation event log backing the manager's diagnostic log. |
-| `debug` | `UsbAudioInspector` | A standalone manual descriptor-inspection tool, independent of the real activation path. |
 
 The library has **no DI-framework dependency** -- `UsbAudioManagerImpl`
 takes a plain constructor behind the `UsbAudioManager` interface, and a

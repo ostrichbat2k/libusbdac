@@ -27,6 +27,7 @@ import org.ostrichbat2k.usbdac.protocol.SyncType
 import org.ostrichbat2k.usbdac.protocol.UacStreamFormat
 import org.ostrichbat2k.usbdac.protocol.UsbAudioController
 import org.ostrichbat2k.usbdac.protocol.UsbAudioSession
+import org.ostrichbat2k.usbdac.protocol.UsbSampleRateConfigurator
 import android.media.AudioDeviceInfo
 import androidx.media3.common.C
 import androidx.media3.common.PlaybackParameters
@@ -333,32 +334,18 @@ class UsbAudioOutput(
         // muted until right before startStreamingThread(), once the clock is confirmed locked.
         UsbAudioController.setMute(session, muted = true)
 
-        // UAC 1.0 has no Clock Source entity -- its rate lives on the streaming endpoint itself
-        // (see UsbAudioManager.activateDac's comment on the same split). Using
-        // setClockFrequency unconditionally here was the actual cause of a real, reproduced
-        // infinite playback-error loop against a UAC 1.0 device: every reconfigure failed this
-        // control transfer (wrong addressing entirely -- clockSourceId is always -1).
-        fun trySetClock(): UsbAudioController.ClockWriteOutcome =
-            if (session.topology.uacVersion == 1) {
-                UsbAudioController.setUac1EndpointSampleRate(session, format.endpointAddress, sampleRateHz)
-            } else {
-                UsbAudioController.setClockFrequency(session, sampleRateHz)
-            }
-        var clockResult = trySetClock()
-        var clockSetAttempt = 0
-        while (clockResult !is UsbAudioController.ClockWriteOutcome.Confirmed &&
-            clockSetAttempt < UsbAudioTuning.CLOCK_SET_MAX_RETRIES) {
-            Thread.sleep(UsbAudioTuning.DAC_SETTLE_DELAY_MS)
-            clockResult = trySetClock()
-            clockSetAttempt++
-        }
-        if (clockResult !is UsbAudioController.ClockWriteOutcome.Confirmed) {
+        // UsbSampleRateConfigurator picks the UAC 1.0 endpoint request or the UAC 2.0/3.0 Clock
+        // Source request -- see writeSampleRate's doc comment for why that choice matters.
+        val rateWrite =
+            UsbSampleRateConfigurator.writeSampleRate(
+                session, format.endpointAddress, sampleRateHz, maxRetries = UsbAudioTuning.CLOCK_SET_MAX_RETRIES)
+        if (!rateWrite.confirmed) {
             L.w(
-                "UsbAudioOutput: failed to set DAC clock to $sampleRateHz Hz after $clockSetAttempt " +
-                    "retry(s): $clockResult")
+                "UsbAudioOutput: failed to set DAC clock to $sampleRateHz Hz after ${rateWrite.retries} " +
+                    "retry(s): ${rateWrite.outcome}")
             return false
-        } else if (clockSetAttempt > 0) {
-            L.i("UsbAudioOutput: set DAC clock to $sampleRateHz Hz after $clockSetAttempt retry(s)")
+        } else if (rateWrite.retries > 0) {
+            L.i("UsbAudioOutput: set DAC clock to $sampleRateHz Hz after ${rateWrite.retries} retry(s)")
         }
 
         // See UsbAudioManager.activateDac's comment on wakePowerDomain for why: a clean,
@@ -380,8 +367,7 @@ class UsbAudioOutput(
         // here -- see UsbAudioManager.activateDac's comment on that call: evicting a driver
         // after the alt-setting is already selected resets the interface back to alt 0 as a
         // side effect, which would undo the activation this sink depends on.
-        Thread.sleep(UsbAudioTuning.DAC_SETTLE_DELAY_MS)
-
+        //
         // Every per-track rate change used to never check this at all -- SET_CUR + a GET_CUR
         // readback both succeeding only proves the device's control-register accepted and
         // stored the new rate; it's a separate, real question whether the device's actual
@@ -392,15 +378,13 @@ class UsbAudioOutput(
         // rate: pitched-up, sped-up playback. Polling a few times (rather than one fixed wait)
         // covers devices whose relock is slower than UsbAudioTuning.DAC_SETTLE_DELAY_MS without always paying
         // that cost on devices that lock fast.
+        val settle =
+            UsbSampleRateConfigurator.awaitClockSettled(
+                session, maxValidRetries = UsbAudioTuning.CLOCK_VALID_MAX_RETRIES)
         if (session.topology.uacVersion != 1) {
-            var valid = UsbAudioController.getClockValid(session)
-            var attempt = 0
-            while (valid == false && attempt < UsbAudioTuning.CLOCK_VALID_MAX_RETRIES) {
-                Thread.sleep(UsbAudioTuning.DAC_SETTLE_DELAY_MS)
-                valid = UsbAudioController.getClockValid(session)
-                attempt++
-            }
-            L.i("UsbAudioOutput: clock valid at ${sampleRateHz}Hz after $attempt extra wait(s): $valid")
+            L.i(
+                "UsbAudioOutput: clock valid at ${sampleRateHz}Hz after ${settle.extraWaits} extra wait(s): " +
+                    "${settle.valid}")
         }
 
         // Re-apply volume after every clock change: unknown whether reconfiguring the clock

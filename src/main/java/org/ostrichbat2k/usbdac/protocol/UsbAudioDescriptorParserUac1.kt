@@ -26,6 +26,7 @@ import org.ostrichbat2k.usbdac.protocol.UsbAudioDescriptorHelper.AS2_FORMAT_TYPE
 import org.ostrichbat2k.usbdac.protocol.UsbAudioDescriptorHelper.AS_GENERAL
 import org.ostrichbat2k.usbdac.protocol.UsbAudioDescriptorHelper.AS_SUBCLASS
 import org.ostrichbat2k.usbdac.protocol.UsbAudioDescriptorHelper.DESC_TYPE_CONFIGURATION
+import org.ostrichbat2k.usbdac.protocol.UsbAudioDescriptorHelper.DESC_TYPE_CS_ENDPOINT
 import org.ostrichbat2k.usbdac.protocol.UsbAudioDescriptorHelper.DESC_TYPE_CS_INTERFACE
 import org.ostrichbat2k.usbdac.protocol.UsbAudioDescriptorHelper.DESC_TYPE_ENDPOINT
 import org.ostrichbat2k.usbdac.protocol.UsbAudioDescriptorHelper.DESC_TYPE_INTERFACE
@@ -60,6 +61,11 @@ internal object UsbAudioDescriptorParserUac1 {
     // UAC 1.0's extended (9-byte) endpoint descriptor's own bSynchAddress field -- bRefresh
     // (offset 7) comes first. See pendingDeclaredSynchAddress's doc comment below.
     private const val ENDPOINT_BSYNCHADDRESS_OFFSET = 8
+
+    // Class-specific AS isochronous audio data endpoint descriptor (UAC 1.0 4.6.1.2).
+    private const val CS_ENDPOINT_SUBTYPE_GENERAL = 0x01
+    private const val CS_ENDPOINT_ATTRIBUTES_OFFSET = 3
+    private const val CS_ENDPOINT_ATTR_SAMPLING_FREQUENCY = 0x01
 
     fun parseUac1Playback(configBytes: ByteArray): UacPlaybackTopology? = parseUac1Playback(walk(configBytes))
 
@@ -106,6 +112,11 @@ internal object UsbAudioDescriptorParserUac1 {
         var pendingSubslotSize = -1
         var pendingSampleRates = emptyList<Int>()
         var isPendingTerminalLinked = false
+        // See UacStreamFormat.hasSamplingFrequencyControl. The class-specific endpoint descriptor
+        // follows the standard descriptor of the endpoint it describes, so lastEndpointWasData
+        // says whether the one being read belongs to the OUT data endpoint or to the feedback one.
+        var pendingHasSamplingFrequencyControl = true
+        var lastEndpointWasData = false
 
         fun flushPendingFormat(interfaceNumber: Int) {
             if (pendingAltSetting >= 0 && pendingEndpointAddress >= 0 && pendingBitResolution > 0) {
@@ -127,6 +138,7 @@ internal object UsbAudioDescriptorParserUac1 {
                             maxPacketSize = pendingMaxPacketSize,
                             syncType = SyncType.fromBits(pendingEndpointSync),
                             sampleRates = pendingSampleRates,
+                            hasSamplingFrequencyControl = pendingHasSamplingFrequencyControl,
                             bInterval = pendingBInterval.takeIf { it > 0 } ?: 1,
                             feedbackEndpoint =
                                 feedbackEndpointOrNull(
@@ -145,6 +157,8 @@ internal object UsbAudioDescriptorParserUac1 {
             pendingSubslotSize = -1
             pendingSampleRates = emptyList()
             isPendingTerminalLinked = false
+            pendingHasSamplingFrequencyControl = true
+            lastEndpointWasData = false
         }
 
         for ((type, bytes) in entries) {
@@ -231,12 +245,24 @@ internal object UsbAudioDescriptorParserUac1 {
                         }
                     }
                 }
+                DESC_TYPE_CS_ENDPOINT -> {
+                    // EP_GENERAL: bLength, bDescriptorType, bDescriptorSubtype, bmAttributes, ...
+                    val describesDataEndpoint =
+                        currentInterfaceNumber == streamingInterfaceNumber && lastEndpointWasData
+                    val isGeneral =
+                        bytes.size > CS_ENDPOINT_ATTRIBUTES_OFFSET && bytes.u8(2) == CS_ENDPOINT_SUBTYPE_GENERAL
+                    if (describesDataEndpoint && isGeneral) {
+                        pendingHasSamplingFrequencyControl =
+                            bytes.u8(CS_ENDPOINT_ATTRIBUTES_OFFSET) and CS_ENDPOINT_ATTR_SAMPLING_FREQUENCY != 0
+                    }
+                }
                 DESC_TYPE_ENDPOINT -> {
                     if (currentInterfaceNumber == streamingInterfaceNumber) {
                         val address = bytes.u8(2)
                         val attributes = bytes.u8(3)
                         val maxPacketSize = bytes.u16(4)
                         val bInterval = bytes.u8(6)
+                        lastEndpointWasData = address and UsbConstants.USB_DIR_IN == 0
                         if (address and UsbConstants.USB_DIR_IN == 0) {
                             // OUT -- this library only ever streams playback, so the main data
                             // endpoint is always OUT; see pendingFeedbackAddress's doc comment.

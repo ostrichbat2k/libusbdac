@@ -205,9 +205,9 @@ internal class UsbDacActivatorImpl(
             if (found.uacVersion != 1) {
                 val write =
                     UsbSampleRateConfigurator.writeSampleRate(
-                        session, format.endpointAddress, UsbAudioTuning.SUPPORTED_SAMPLE_RATE_HZ)
+                        session, format, UsbAudioTuning.SUPPORTED_SAMPLE_RATE_HZ)
                 log("Clock set to ${UsbAudioTuning.SUPPORTED_SAMPLE_RATE_HZ} Hz: ${write.outcome}")
-                write.confirmed
+                write.accepted
             } else {
                 true
             }
@@ -299,9 +299,11 @@ internal class UsbDacActivatorImpl(
                     log("Format alt=${format.alternateSetting} declares no sample rate")
                     false
                 } else {
-                    val write = UsbSampleRateConfigurator.writeSampleRate(session, format.endpointAddress, rateHz)
-                    log("UAC1 endpoint sample rate set to $rateHz Hz: ${write.outcome}")
-                    write.confirmed
+                    val write = UsbSampleRateConfigurator.writeSampleRate(session, format, rateHz)
+                    log(
+                        "UAC1 endpoint sample rate set to $rateHz Hz: ${write.outcome}" +
+                            (write.acceptedBecause?.let { " (unconfirmed, accepted: $it)" } ?: ""))
+                    write.accepted
                 }
             } else {
                 clockOk

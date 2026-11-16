@@ -36,6 +36,7 @@ internal object UsbAudioDescriptorHelper {
     const val DESC_TYPE_INTERFACE = 0x04
     const val DESC_TYPE_ENDPOINT = 0x05
     const val DESC_TYPE_CS_INTERFACE = 0x24
+    const val DESC_TYPE_CS_ENDPOINT = 0x25
 
     const val AC_SUBCLASS = 1
     const val AS_SUBCLASS = 2

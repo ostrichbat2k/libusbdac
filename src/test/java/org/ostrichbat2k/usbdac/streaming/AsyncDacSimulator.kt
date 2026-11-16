@@ -19,7 +19,6 @@
 package org.ostrichbat2k.usbdac.streaming
 
 import java.util.concurrent.LinkedBlockingQueue
-import java.util.concurrent.atomic.AtomicLong
 
 /** How [AsyncDacSimulator] encodes its clock on the feedback endpoint. All four exist in the wild. */
 internal enum class FeedbackWire {
@@ -86,8 +85,11 @@ internal class AsyncDacSimulator(
 
     private val mainCompletions = LinkedBlockingQueue<Int>()
     private val feedbackCompletions = LinkedBlockingQueue<Int>()
-    private val frames = AtomicLong(0)
-    private val packets = AtomicLong(0)
+    // Updated and read together under countLock: a snapshot taken between the two additions
+    // would be off by a whole URB of frames, which is far more than the tests' tolerance.
+    private val countLock = Any()
+    private var frames = 0L
+    private var packets = 0L
 
     @Volatile var largestPacketFrames = 0
         private set
@@ -95,7 +97,7 @@ internal class AsyncDacSimulator(
     @Volatile var smallestPacketFrames = Int.MAX_VALUE
         private set
 
-    fun snapshot() = Snapshot(frames.get(), packets.get())
+    fun snapshot() = synchronized(countLock) { Snapshot(frames, packets) }
 
     /** Frames per second of bus time the host actually sent between two snapshots. */
     fun deliveredRateHz(from: Snapshot, to: Snapshot): Double =
@@ -140,8 +142,10 @@ internal class AsyncDacSimulator(
             if (packetFrames > largestPacketFrames) largestPacketFrames = packetFrames
             if (packetFrames < smallestPacketFrames) smallestPacketFrames = packetFrames
         }
-        frames.addAndGet(urbFrames)
-        packets.addAndGet(packetLengths.size.toLong())
+        synchronized(countLock) {
+            frames += urbFrames
+            packets += packetLengths.size
+        }
         mainCompletions.put(slot)
         return true
     }

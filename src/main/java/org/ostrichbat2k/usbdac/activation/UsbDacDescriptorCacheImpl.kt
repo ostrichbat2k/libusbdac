@@ -110,6 +110,8 @@ internal class UsbDacDescriptorCacheImpl(context: Context) : UsbDacDescriptorCac
                     powerDomainD2RecoveryUs = topology.powerDomainD2RecoveryUs,
                     channelCount = topology.channelCount,
                     clockSupportedRatesEncoded = clockSupportedRates.encodeRanges(),
+                    clockFrequencyWritable = topology.clockFrequencyWritable,
+                    clockValidityReadable = topology.clockValidityReadable,
                 ),
                 topology.formats.map { it.toEntity(key) },
             )
@@ -149,6 +151,8 @@ private fun CachedUacTopology.toDomain(formats: List<UacStreamFormat>) =
         powerDomainD2RecoveryUs = powerDomainD2RecoveryUs,
         channelCount = channelCount,
         formats = formats,
+        clockFrequencyWritable = clockFrequencyWritable,
+        clockValidityReadable = clockValidityReadable,
     )
 
 private fun CachedUacFormat.toDomain() =
@@ -208,6 +212,10 @@ internal data class CachedUacTopology(
     val powerDomainD2RecoveryUs: Int,
     val channelCount: Int,
     val clockSupportedRatesEncoded: String,
+    /** See [UacPlaybackTopology.clockFrequencyWritable]. */
+    val clockFrequencyWritable: Boolean = true,
+    /** See [UacPlaybackTopology.clockValidityReadable]. */
+    val clockValidityReadable: Boolean = true,
 )
 
 @Entity(tableName = "usb_dac_format", primaryKeys = ["deviceKey", "alternateSetting"])
@@ -259,11 +267,12 @@ internal interface DescriptorCacheDao {
 
 // Bumped to 2 for #61's new CachedUacFormat.bInterval column, then to 3 for #25's isAsync ->
 // syncType rename plus the three new feedbackEndpoint* columns, then to 4 for #128's
-// hasSamplingFrequencyControl column -- fallbackToDestructiveMigration
+// hasSamplingFrequencyControl column, then to 5 for #131's two
+// clock-control columns -- fallbackToDestructiveMigration
 // above means this just wipes and recreates the cache on next open rather than needing an
 // explicit Migration, acceptable for a pure performance cache (see this class's own doc comment
 // on why a stale/missing entry is a one-tap-equivalent cost, not a correctness risk).
-@Database(entities = [CachedUacTopology::class, CachedUacFormat::class], version = 4, exportSchema = false)
+@Database(entities = [CachedUacTopology::class, CachedUacFormat::class], version = 5, exportSchema = false)
 internal abstract class DescriptorCacheDatabase : RoomDatabase() {
     abstract fun dao(): DescriptorCacheDao
 }

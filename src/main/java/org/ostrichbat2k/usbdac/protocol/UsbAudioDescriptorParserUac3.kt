@@ -183,6 +183,8 @@ internal object UsbAudioDescriptorParserUac3 {
         var controlInterfaceNumber = -1
         var streamingInterfaceNumber = -1
         var clockSourceId = -1
+        var clockFrequencyWritable = true
+        var clockValidityReadable = true
         var usbStreamingTerminalId = -1
         var outputFeatureUnitId = -1
         var mixerUnitId = -1
@@ -285,7 +287,11 @@ internal object UsbAudioDescriptorParserUac3 {
                                 }
                             }
                             AC_CLOCK_SOURCE -> {
-                                if (clockSourceId < 0) clockSourceId = bytes.u8(3)
+                                if (clockSourceId < 0) {
+                                    clockSourceId = bytes.u8(3)
+                                    clockFrequencyWritable = UsbAudioDescriptorHelper.clockFrequencyWritable(bytes)
+                                    clockValidityReadable = UsbAudioDescriptorHelper.clockValidityReadable(bytes)
+                                }
                             }
                             AC_OUTPUT_TERMINAL -> {
                                 val terminalType = bytes.u16(4)
@@ -405,6 +411,8 @@ internal object UsbAudioDescriptorParserUac3 {
             powerDomainD2RecoveryUs = powerDomain?.d2RecoveryUs ?: 0,
             channelCount = -1, // not parsed for UAC3 -- see UacPlaybackTopology.channelCount
             formats = formats,
-            nonPcmFormats = nonPcmFormatsByInterface[streamingInterfaceNumber].orEmpty())
+            nonPcmFormats = nonPcmFormatsByInterface[streamingInterfaceNumber].orEmpty(),
+            clockFrequencyWritable = clockFrequencyWritable,
+            clockValidityReadable = clockValidityReadable)
     }
 }

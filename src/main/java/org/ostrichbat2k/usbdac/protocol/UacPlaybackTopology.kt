@@ -165,6 +165,18 @@ data class UacPlaybackTopology(
     val formats: List<UacStreamFormat>,
     /** See [UacNonPcmFormat]. Always empty on UAC 1.0, which has no bmFormats bitmap to exclude by. */
     val nonPcmFormats: List<UacNonPcmFormat> = emptyList(),
+    /**
+     * UAC 2.0/3.0: whether the Clock Source's Sampling Frequency control can be written -- bits
+     * 1:0 of its descriptor's bmControls equal to 0b11 (UAC 2.0 4.7.2.1). False for a fixed-clock
+     * device, which must not be sent a SET_CUR it has said it does not support (#131). True when
+     * the descriptor says so or is too short to say, and for UAC 1.0, where it is not consulted.
+     */
+    val clockFrequencyWritable: Boolean = true,
+    /**
+     * UAC 2.0/3.0: whether the Clock Source's Clock Validity control can be read -- bits 3:2 of
+     * bmControls non-zero. When it cannot, the clock is assumed valid without asking.
+     */
+    val clockValidityReadable: Boolean = true,
 )
 
 /**

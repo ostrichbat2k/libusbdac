@@ -136,6 +136,13 @@ private object D {
 
     fun uac2ClockSource(id: Int) = cs(4, 0x0A) { setU8(3, id) }
 
+    /** A full-length UAC2 Clock Source descriptor (8 bytes) carrying [bmControls] at offset 5. */
+    fun uac2ClockSourceWithControls(id: Int, bmControls: Int) =
+        cs(8, 0x0A) {
+            setU8(3, id)
+            setU8(5, bmControls)
+        }
+
     fun uac2MixerUnit(id: Int, sources: List<Int>) =
         cs(5 + sources.size, 0x04) {
             setU8(3, id)
@@ -332,11 +339,20 @@ class UsbAudioDescriptorParserUac3Test {
 }
 
 class UsbAudioDescriptorParserUac2Test {
-    private fun fiioLikeConfig(channelCount: Int = 2, withClock: Boolean = true): ByteArray {
+    private fun fiioLikeConfig(
+        channelCount: Int = 2,
+        withClock: Boolean = true,
+        clockControls: Int? = null,
+    ): ByteArray {
         val config = D.configuration(1)
         val acIface = D.iface(0, 0, 1, 1, 0x20)
         val input = D.uac2InputTerminal(id = 1, terminalType = 0x0101, channelCount = channelCount)
-        val clock = if (withClock) D.uac2ClockSource(id = 10) else byteArrayOf()
+        val clock =
+            when {
+                !withClock -> byteArrayOf()
+                clockControls != null -> D.uac2ClockSourceWithControls(id = 10, bmControls = clockControls)
+                else -> D.uac2ClockSource(id = 10)
+            }
         val output = D.outputTerminal(terminalType = 0x0301, sourceId = 15)
         val asIface = D.iface(1, 1, 1, 2, 0x20)
         val asGeneral = D.uac2AsGeneral(terminalLink = 1)
@@ -345,6 +361,32 @@ class UsbAudioDescriptorParserUac2Test {
         // non-default value is used here.
         val endpoint = D.endpoint(address = 0x07, attributes = 0x05, maxPacketSize = 196, bInterval = 4)
         return config + acIface + input + clock + output + asIface + asGeneral + formatType + endpoint
+    }
+
+    @Test
+    fun `clock source bmControls decides whether the frequency is writable and validity readable`() {
+        fun parsed(controls: Int?) =
+            UsbAudioDescriptorParserUac2.parseUac2Playback(fiioLikeConfig(clockControls = controls))!!
+        // frequency read/write (0b11), validity read-only (0b01 << 2): the usual DAC.
+        parsed(0b0111).let {
+            assertTrue(it.clockFrequencyWritable)
+            assertTrue(it.clockValidityReadable)
+        }
+        // frequency read-only, no validity control: a fixed-clock device.
+        parsed(0b0001).let {
+            assertEquals(false, it.clockFrequencyWritable)
+            assertEquals(false, it.clockValidityReadable)
+        }
+        // no controls at all.
+        parsed(0b0000).let {
+            assertEquals(false, it.clockFrequencyWritable)
+            assertEquals(false, it.clockValidityReadable)
+        }
+        // a descriptor too short to carry bmControls: assume both, as before this was parsed.
+        parsed(null).let {
+            assertTrue(it.clockFrequencyWritable)
+            assertTrue(it.clockValidityReadable)
+        }
     }
 
     @Test

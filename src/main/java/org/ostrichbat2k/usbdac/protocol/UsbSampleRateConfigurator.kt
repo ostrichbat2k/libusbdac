@@ -61,7 +61,11 @@ internal object UsbSampleRateConfigurator {
      * endless playback-error loop.
      *
      * UAC 2.0/3.0: only a read-back equal to [hz] is accepted. A real device has stored and
-     * echoed a rate it then did not run at, so nothing weaker is trusted there.
+     * echoed a rate it then did not run at, so nothing weaker is trusted there. If the Clock
+     * Source declares its frequency read-only (#131) no write is sent -- a request a device has
+     * said it does not support is answered with a STALL, which some firmware does not recover
+     * from -- and the rate is only read: accepted if the clock is already at [hz], a failure if
+     * not, since nothing we can send would change it.
      *
      * UAC 1.0 (#128): the Sampling Frequency control is optional, and the usual device without it
      * has one fixed rate and STALLs the request. Treating that as failure made every such device
@@ -93,10 +97,10 @@ internal object UsbSampleRateConfigurator {
         }
         fun attempt(retries: Int): RateWrite {
             val outcome =
-                if (isUac1) {
-                    UsbAudioController.setUac1EndpointSampleRate(session, format.endpointAddress, hz)
-                } else {
-                    UsbAudioController.setClockFrequency(session, hz)
+                when {
+                    isUac1 -> UsbAudioController.setUac1EndpointSampleRate(session, format.endpointAddress, hz)
+                    session.topology.clockFrequencyWritable -> UsbAudioController.setClockFrequency(session, hz)
+                    else -> readOnlyClockOutcome(session, hz)
                 }
             return RateWrite(outcome, retries, if (isUac1) uac1Tolerance(outcome, format, hz) else null)
         }
@@ -106,6 +110,16 @@ internal object UsbSampleRateConfigurator {
             write = attempt(write.retries + 1)
         }
         return write
+    }
+
+    /** A read-only Clock Source is at [hz] already or it is not; see [writeSampleRate]. */
+    private fun readOnlyClockOutcome(session: UsbAudioSession, hz: Int): UsbAudioController.ClockWriteOutcome {
+        val current = UsbAudioController.getClockFrequency(session)
+        return if (current == hz) {
+            UsbAudioController.ClockWriteOutcome.Confirmed(hz)
+        } else {
+            UsbAudioController.ClockWriteOutcome.Mismatch(hz, current)
+        }
     }
 
     /** Why an unconfirmed UAC 1.0 [outcome] is acceptable, or null if it is not. See [writeSampleRate]. */
@@ -133,7 +147,8 @@ internal object UsbSampleRateConfigurator {
      * separate question, and this is the one answer the device itself can give.
      *
      * While the answer is an explicit "not valid", waits and asks again up to [maxValidRetries]
-     * times. An unreadable control is not retried.
+     * times. An unreadable control is not retried, and one the Clock Source's descriptor declares
+     * unreadable is not asked at all (#131).
      */
     fun awaitClockSettled(
         session: UsbAudioSession,
@@ -141,7 +156,8 @@ internal object UsbSampleRateConfigurator {
         sleep: (Long) -> Unit = Thread::sleep,
     ): ClockSettle {
         sleep(UsbAudioTuning.DAC_SETTLE_DELAY_MS)
-        if (session.topology.uacVersion == 1) return ClockSettle(valid = null, extraWaits = 0)
+        val canAsk = session.topology.uacVersion != 1 && session.topology.clockValidityReadable
+        if (!canAsk) return ClockSettle(valid = null, extraWaits = 0)
         var valid = UsbAudioController.getClockValid(session)
         var extraWaits = 0
         while (valid == false && extraWaits < maxValidRetries) {

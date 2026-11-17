@@ -51,7 +51,7 @@ class UsbSampleRateConfiguratorTest {
     private val sleeps = mutableListOf<Long>()
     private val sleep: (Long) -> Unit = { sleeps += it }
 
-    private fun session(uacVersion: Int) =
+    private fun session(uacVersion: Int, clockWritable: Boolean = true, validityReadable: Boolean = true) =
         UsbAudioSession(
             device = mockk<UsbDevice>(relaxed = true),
             connection = mockk<UsbDeviceConnection>(relaxed = true),
@@ -70,6 +70,8 @@ class UsbSampleRateConfiguratorTest {
                     powerDomainD2RecoveryUs = 0,
                     channelCount = 2,
                     formats = emptyList(),
+                    clockFrequencyWritable = clockWritable,
+                    clockValidityReadable = validityReadable,
                 ),
             controlInterface = mockk<UsbInterface>(relaxed = true),
             streamingAltSettings = emptyMap(),
@@ -237,6 +239,39 @@ class UsbSampleRateConfiguratorTest {
         val single = format(rates = listOf(RATE))
         assertFalse(write(session, single).accepted)
         assertFalse(write(session, single).accepted)
+    }
+
+    // ---- #131: what the Clock Source's bmControls says it supports ----
+
+    @Test
+    fun `a read-only clock already at the rate is accepted without any write`() {
+        val session = session(2, clockWritable = false)
+        every { UsbAudioController.getClockFrequency(session) } returns RATE
+        val write = write(session, format(), maxRetries = 3)
+        assertTrue(write.accepted)
+        assertEquals(ClockWriteOutcome.Confirmed(RATE), write.outcome)
+        assertNull(write.acceptedBecause)
+        verify(exactly = 0) { UsbAudioController.setClockFrequency(any(), any()) }
+        assertTrue(sleeps.isEmpty())
+    }
+
+    @Test
+    fun `a read-only clock at another rate is a failure and is still never written`() {
+        val session = session(3, clockWritable = false)
+        every { UsbAudioController.getClockFrequency(session) } returns 48000
+        val write = write(session, format())
+        assertFalse(write.accepted)
+        assertEquals(ClockWriteOutcome.Mismatch(RATE, 48000), write.outcome)
+        verify(exactly = 0) { UsbAudioController.setClockFrequency(any(), any()) }
+    }
+
+    @Test
+    fun `a clock whose validity control is not readable is not asked`() {
+        val settle = UsbSampleRateConfigurator.awaitClockSettled(
+            session(2, validityReadable = false), maxValidRetries = 3, sleep = sleep)
+        assertNull(settle.valid)
+        assertEquals(listOf(UsbAudioTuning.DAC_SETTLE_DELAY_MS), sleeps)
+        verify(exactly = 0) { UsbAudioController.getClockValid(any()) }
     }
 
     @Test

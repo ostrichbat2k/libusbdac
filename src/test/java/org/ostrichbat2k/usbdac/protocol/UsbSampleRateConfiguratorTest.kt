@@ -26,6 +26,7 @@ import io.mockk.mockk
 import io.mockk.mockkObject
 import io.mockk.unmockkObject
 import io.mockk.verify
+import io.mockk.verifyOrder
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
@@ -35,6 +36,7 @@ import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.ostrichbat2k.usbdac.UsbAudioTuning
 import org.ostrichbat2k.usbdac.protocol.UsbAudioController.ClockWriteOutcome
+import org.ostrichbat2k.usbdac.protocol.UsbAudioController.ControlWriteOutcome
 
 /**
  * [UsbSampleRateConfigurator] is what plug-in activation and playback start now share (#136).
@@ -332,5 +334,100 @@ class UsbSampleRateConfiguratorTest {
         assertEquals(false, settle.valid)
         assertEquals(0, settle.extraWaits)
         assertEquals(1, sleeps.size)
+    }
+
+    // ---- #122: the clock is changed with the streaming interface on alt 0 ----
+
+    private fun idleWrite(session: UsbAudioSession, format: UacStreamFormat) =
+        UsbSampleRateConfigurator.writeSampleRateWithStreamIdle(session, format, RATE, sleep = sleep)
+
+    @Test
+    fun `UAC2 and UAC3 go to alt 0, write the clock, then reselect the format's alt-setting`() {
+        for (version in listOf(2, 3)) {
+            val session = session(version)
+            val format = format()
+            every { UsbAudioController.selectZeroBandwidth(session) } returns ControlWriteOutcome.Success
+            every { UsbAudioController.setClockFrequency(session, RATE) } returns ClockWriteOutcome.Confirmed(RATE)
+            every { UsbAudioController.selectFormat(session, format) } returns ControlWriteOutcome.Success
+
+            val result = idleWrite(session, format)
+
+            assertTrue(result.write.accepted)
+            assertTrue(result.altRestored)
+            verifyOrder {
+                UsbAudioController.selectZeroBandwidth(session)
+                UsbAudioController.setClockFrequency(session, RATE)
+                UsbAudioController.selectFormat(session, format)
+            }
+        }
+    }
+
+    @Test
+    fun `UAC1 keeps its alt-setting, since its rate lives on the streaming endpoint`() {
+        val session = session(1)
+        every { UsbAudioController.setUac1EndpointSampleRate(session, ENDPOINT, RATE) } returns
+            ClockWriteOutcome.Confirmed(RATE)
+
+        val result = idleWrite(session, format())
+
+        assertTrue(result.write.accepted)
+        assertTrue(result.altRestored)
+        verify(exactly = 0) { UsbAudioController.selectZeroBandwidth(any()) }
+        verify(exactly = 0) { UsbAudioController.selectFormat(any(), any()) }
+    }
+
+    @Test
+    fun `a read-only clock is not written, so the alt-setting is left alone`() {
+        val session = session(2, clockWritable = false)
+        every { UsbAudioController.getClockFrequency(session) } returns RATE
+
+        val result = idleWrite(session, format())
+
+        assertTrue(result.write.accepted)
+        verify(exactly = 0) { UsbAudioController.selectZeroBandwidth(any()) }
+        verify(exactly = 0) { UsbAudioController.selectFormat(any(), any()) }
+    }
+
+    @Test
+    fun `if alt 0 can't be selected the clock is written anyway and nothing is reselected`() {
+        val session = session(2)
+        every { UsbAudioController.selectZeroBandwidth(session) } returns ControlWriteOutcome.TransferFailed
+        every { UsbAudioController.setClockFrequency(session, RATE) } returns ClockWriteOutcome.Confirmed(RATE)
+
+        val result = idleWrite(session, format())
+
+        assertTrue(result.write.accepted)
+        assertTrue(result.altRestored)
+        verify(exactly = 1) { UsbAudioController.setClockFrequency(session, RATE) }
+        verify(exactly = 0) { UsbAudioController.selectFormat(any(), any()) }
+    }
+
+    @Test
+    fun `the format's alt-setting is reselected even when the clock write fails`() {
+        val session = session(2)
+        val format = format()
+        every { UsbAudioController.selectZeroBandwidth(session) } returns ControlWriteOutcome.Success
+        every { UsbAudioController.setClockFrequency(session, RATE) } returns ClockWriteOutcome.Mismatch(RATE, 44100)
+        every { UsbAudioController.selectFormat(session, format) } returns ControlWriteOutcome.Success
+
+        val result = idleWrite(session, format)
+
+        assertFalse(result.write.accepted)
+        assertTrue(result.altRestored)
+        verify(exactly = 1) { UsbAudioController.selectFormat(session, format) }
+    }
+
+    @Test
+    fun `a failed reselect is reported even though the clock write succeeded`() {
+        val session = session(2)
+        val format = format()
+        every { UsbAudioController.selectZeroBandwidth(session) } returns ControlWriteOutcome.Success
+        every { UsbAudioController.setClockFrequency(session, RATE) } returns ClockWriteOutcome.Confirmed(RATE)
+        every { UsbAudioController.selectFormat(session, format) } returns ControlWriteOutcome.TransferFailed
+
+        val result = idleWrite(session, format)
+
+        assertTrue(result.write.accepted)
+        assertFalse(result.altRestored)
     }
 }

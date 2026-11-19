@@ -336,9 +336,19 @@ class UsbAudioOutput(
 
         // UsbSampleRateConfigurator picks the UAC 1.0 endpoint request or the UAC 2.0/3.0 Clock
         // Source request -- see writeSampleRate's doc comment for why that choice matters.
-        val rateWrite =
-            UsbSampleRateConfigurator.writeSampleRate(
+        //
+        // ensureFormatActive() above has already selected the streaming alt-setting. For UAC
+        // 2.0/3.0 the clock is changed with the interface back on alt 0 and the streaming
+        // alt-setting selected again afterwards (#122), so the endpoint only goes live once the
+        // clock is at the new rate. UAC 1.0 sets the rate on that endpoint, so it stays as is.
+        val idleWrite =
+            UsbSampleRateConfigurator.writeSampleRateWithStreamIdle(
                 session, format, sampleRateHz, maxRetries = UsbAudioTuning.CLOCK_SET_MAX_RETRIES)
+        if (!idleWrite.altRestored) {
+            L.w("UsbAudioOutput: could not reselect alt-setting ${format.alternateSetting} after the clock change")
+            return false
+        }
+        val rateWrite = idleWrite.write
         if (!rateWrite.accepted) {
             L.w(
                 "UsbAudioOutput: failed to set DAC clock to $sampleRateHz Hz after ${rateWrite.retries} " +

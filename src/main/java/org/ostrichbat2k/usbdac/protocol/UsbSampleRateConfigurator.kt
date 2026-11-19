@@ -19,6 +19,7 @@
 package org.ostrichbat2k.usbdac.protocol
 
 import org.ostrichbat2k.usbdac.UsbAudioTuning
+import timber.log.Timber as L
 
 /**
  * The steps that put a device on a sample rate and wait for it to get there, in one place (#136).
@@ -28,7 +29,8 @@ import org.ostrichbat2k.usbdac.UsbAudioTuning
  *
  * Only the building blocks live here. *When* each is called relative to selecting the streaming
  * alt-setting, muting, and restoring volume is still each caller's own sequence, and the two
- * callers pass different retry counts -- exactly as they behaved before this was extracted.
+ * callers pass different retry counts. Playback start uses [writeSampleRateWithStreamIdle], which
+ * also takes the streaming interface to alternate setting 0 around the write (#122).
  */
 internal object UsbSampleRateConfigurator {
     /**
@@ -110,6 +112,47 @@ internal object UsbSampleRateConfigurator {
             write = attempt(write.retries + 1)
         }
         return write
+    }
+
+    /**
+     * [write] is the rate write itself. [altRestored] is false only when the streaming interface
+     * was moved to alternate setting 0 and could not be put back on the format's own one, which
+     * leaves nothing to stream on whatever [write] says.
+     */
+    data class IdleRateWrite(val write: RateWrite, val altRestored: Boolean)
+
+    /**
+     * [writeSampleRate] with the streaming interface idle (#122): for a UAC 2.0/3.0 device with a
+     * writable clock, selects alternate setting 0, writes the rate, then selects [format]'s
+     * alternate setting again. This is the order Linux `snd-usb-audio` uses for a UAC 2.0 rate
+     * change, because some devices do not follow a rate change while their streaming interface is
+     * active.
+     *
+     * UAC 1.0 is unchanged: its rate is a control on the streaming endpoint, which only exists
+     * while a non-zero alternate setting is selected. A read-only clock is unchanged too, since
+     * nothing is written. If alternate setting 0 can't be selected, the rate is written with the
+     * interface as it was, as before.
+     */
+    fun writeSampleRateWithStreamIdle(
+        session: UsbAudioSession,
+        format: UacStreamFormat,
+        hz: Int,
+        maxRetries: Int = 0,
+        sleep: (Long) -> Unit = Thread::sleep,
+    ): IdleRateWrite {
+        val writesClock = session.topology.uacVersion != 1 && session.topology.clockFrequencyWritable
+        val idled =
+            writesClock &&
+                UsbAudioController.selectZeroBandwidth(session) == UsbAudioController.ControlWriteOutcome.Success
+        if (writesClock && !idled) {
+            L.w(
+                "UsbSampleRateConfigurator: could not select alt 0; " +
+                    "changing the clock with the stream interface active")
+        }
+        val write = writeSampleRate(session, format, hz, maxRetries, sleep)
+        val altRestored =
+            !idled || UsbAudioController.selectFormat(session, format) == UsbAudioController.ControlWriteOutcome.Success
+        return IdleRateWrite(write, altRestored)
     }
 
     /** A read-only Clock Source is at [hz] already or it is not; see [writeSampleRate]. */

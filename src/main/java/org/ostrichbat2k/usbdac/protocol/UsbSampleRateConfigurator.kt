@@ -19,6 +19,7 @@
 package org.ostrichbat2k.usbdac.protocol
 
 import org.ostrichbat2k.usbdac.UsbAudioTuning
+import org.ostrichbat2k.usbdac.quirks.UsbDeviceQuirk
 import timber.log.Timber as L
 
 /**
@@ -99,15 +100,21 @@ internal object UsbSampleRateConfigurator {
         }
         // The playback path's Clock Selector, if any, has to be on the input leading to the clock
         // about to be written, or the write changes a clock nothing plays from (#129).
-        if (!isUac1 && session.topology.clockSelectorId >= 0) UsbAudioController.selectClockInput(session)
+        val skipSelector = UsbDeviceQuirk.SKIP_CLOCK_SELECTOR in session.quirks
+        if (!isUac1 && session.topology.clockSelectorId >= 0 && !skipSelector) {
+            UsbAudioController.selectClockInput(session)
+        }
+        val skipReadBack = UsbDeviceQuirk.SKIP_SAMPLE_RATE_READBACK in session.quirks
         fun attempt(retries: Int): RateWrite {
             val outcome =
                 when {
-                    isUac1 -> UsbAudioController.setUac1EndpointSampleRate(session, format.endpointAddress, hz)
+                    isUac1 ->
+                        UsbAudioController.setUac1EndpointSampleRate(
+                            session, format.endpointAddress, hz, readBack = !skipReadBack)
                     session.topology.clockFrequencyWritable -> UsbAudioController.setClockFrequency(session, hz)
                     else -> readOnlyClockOutcome(session, hz)
                 }
-            return RateWrite(outcome, retries, if (isUac1) uac1Tolerance(outcome, format, hz) else null)
+            return RateWrite(outcome, retries, if (isUac1) uac1Tolerance(outcome, format, hz, skipReadBack) else null)
         }
         var write = attempt(0)
         while (!write.accepted && write.retries < maxRetries) {
@@ -143,7 +150,12 @@ internal object UsbSampleRateConfigurator {
         maxRetries: Int = 0,
         sleep: (Long) -> Unit = Thread::sleep,
     ): IdleRateWrite {
-        val writesClock = session.topology.uacVersion != 1 && session.topology.clockFrequencyWritable
+        // SET_INTERFACE_FIRST (#132): this device wants the order #122 replaced -- rate written
+        // with the streaming alt-setting already selected.
+        val writesClock =
+            session.topology.uacVersion != 1 &&
+                session.topology.clockFrequencyWritable &&
+                UsbDeviceQuirk.SET_INTERFACE_FIRST !in session.quirks
         val idled =
             writesClock &&
                 UsbAudioController.selectZeroBandwidth(session) == UsbAudioController.ControlWriteOutcome.Success
@@ -173,6 +185,7 @@ internal object UsbSampleRateConfigurator {
         outcome: UsbAudioController.ClockWriteOutcome,
         format: UacStreamFormat,
         hz: Int,
+        readBackSkipped: Boolean,
     ): String? {
         val mismatch = outcome as? UsbAudioController.ClockWriteOutcome.Mismatch
         val unreadable = mismatch != null && (mismatch.actualHz == null || mismatch.actualHz == 0)
@@ -180,6 +193,7 @@ internal object UsbSampleRateConfigurator {
         val wrongRateReadBack = mismatch != null && !unreadable
         return when {
             outcome is UsbAudioController.ClockWriteOutcome.Confirmed -> null
+            unreadable && readBackSkipped -> "rate written; read-back skipped for this device (quirk)"
             unreadable -> "rate written; device does not report it back"
             onlyRate && !wrongRateReadBack -> "request failed, but $hz Hz is the only rate this format declares"
             else -> null

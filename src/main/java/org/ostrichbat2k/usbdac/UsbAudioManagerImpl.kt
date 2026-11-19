@@ -44,6 +44,7 @@ import org.ostrichbat2k.usbdac.protocol.UacStreamFormat
 import org.ostrichbat2k.usbdac.protocol.UsbAudioController
 import org.ostrichbat2k.usbdac.protocol.UsbAudioSession
 import org.ostrichbat2k.usbdac.protocol.UsbDeviceCapabilities
+import org.ostrichbat2k.usbdac.quirks.UsbDeviceQuirks
 import org.ostrichbat2k.usbdac.streaming.IsoPacketScheduler
 import org.ostrichbat2k.usbdac.streaming.RoutingAudioSink
 import org.ostrichbat2k.usbdac.streaming.UsbAudioOutput
@@ -987,6 +988,10 @@ class UsbAudioManagerImpl(
         controlWriter.refreshControlState(result.session, result.format, device.productName ?: device.deviceName)
         diagnosticLogger.log("DAC session ready: ${result.format} at ${result.rateHz} Hz")
         logIfImplicitFeedback(result.format)
+        val (quirks, quirkSource) = UsbDeviceQuirks.resolve(device.vendorId, device.productId)
+        if (quirks.isNotEmpty()) {
+            diagnosticLogger.log("Device quirks in effect: ${quirks.joinToString()} ($quirkSource)")
+        }
 
         // UsbAudioController.activate() (and selectFormat, inside dacActivator) claimed the
         // interface to do this one-time discovery/setup, but nothing's actually playing yet --

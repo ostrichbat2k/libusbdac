@@ -44,4 +44,10 @@ data class UsbPipelineStats(
     // how many fewer bytes actually reached the device than were requested, cumulatively.
     val badPacketCount: Long = 0L,
     val shortBytesCount: Long = 0L,
+    // URB queue margin (#123), see UrbQueueMarginTracker: the smallest time to spare between
+    // reaping a URB and resubmitting it (negative: the queue ran dry), how many URBs ran it dry,
+    // and the longest wall-clock pacing wait. Null margin until the first URB is resubmitted.
+    val minQueueMarginUs: Long? = null,
+    val queueRanDryCount: Int = 0,
+    val maxPacingWaitUs: Long = 0L,
 )

@@ -139,6 +139,7 @@ class UsbAudioOutput(
             paused = { paused },
             reportPipelineStats = usbAudioManager::reportPipelineStats,
             onFatalStreamError = usbAudioManager::notifyStreamFatalError,
+            urbQueue = usbSettings.urbQueueOverride?.coerced() ?: UrbQueueShape.DEFAULT,
         )
 
     // The isochronous schedule can't actually stop (the USB clock must keep ticking), so "pause"
@@ -497,14 +498,14 @@ class UsbAudioOutput(
     }
 
     /**
-     * Waits until the first [UsbAudioTuning.NUM_URBS] URBs of pre-roll have completed, so the
+     * Waits until the first [UsbIsoStreamEngine.numUrbs] URBs of pre-roll have completed, so the
      * device is unmuted onto a stream that's really running (#127). Gives up quietly after
      * [UsbAudioTuning.STREAM_ESTABLISH_TIMEOUT_MS], or straight away if the stream has already
      * stopped (a pause landed); [isStalled] covers a stream that never got going.
      */
     private fun awaitStreamEstablished() {
         val deadline = System.currentTimeMillis() + UsbAudioTuning.STREAM_ESTABLISH_TIMEOUT_MS
-        while (streamEngine.streaming && streamEngine.urbsReaped < UsbAudioTuning.NUM_URBS) {
+        while (streamEngine.streaming && streamEngine.urbsReaped < streamEngine.numUrbs) {
             if (System.currentTimeMillis() >= deadline) {
                 L.w(
                     "UsbAudioOutput: pre-roll stream not established after " +

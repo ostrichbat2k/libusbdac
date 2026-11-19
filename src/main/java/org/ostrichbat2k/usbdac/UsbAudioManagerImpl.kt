@@ -74,6 +74,7 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
 import timber.log.Timber as L
@@ -846,6 +847,14 @@ class UsbAudioManagerImpl(
             .setEnableFloatOutput(true)
             .build()
             .also { sink -> updateActiveSessionState { it.copy(sink = sink) } }
+    }
+
+    /** See [UsbAudioManager.reportFeedbackRateMismatch] (#124). */
+    override fun reportFeedbackRateMismatch(requestedHz: Int, observedHz: Int) {
+        diagnosticLogger.log(
+            "Warning: feedback says the device runs at $observedHz Hz, not the requested $requestedHz Hz " +
+                "-- the clock change may not have taken effect")
+        _controlState.update { it?.copy(feedbackRateMismatchHz = observedHz) }
     }
 
     /** See [UacStreamFormat.needsImplicitFeedback] (#133). */

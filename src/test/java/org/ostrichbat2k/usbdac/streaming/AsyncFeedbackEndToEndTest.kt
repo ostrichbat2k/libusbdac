@@ -23,7 +23,11 @@ import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbInterface
 import io.mockk.every
 import io.mockk.mockk
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import kotlin.math.abs
+import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.ostrichbat2k.usbdac.protocol.SyncType
@@ -188,4 +192,66 @@ class AsyncFeedbackEndToEndTest {
     @Test
     fun `device clock exactly nominal stays exact`() =
         assertHostFollowsDeviceClock(Case(USB_SPEED_HIGH, 1, 44100, clockOffset = 1.0))
+
+    // ---- #124: feedback as a cross-check on the clock change ----
+
+    /** Streams to a device whose clock really runs at [deviceRateHz] after [requestedRateHz] was asked for. */
+    private fun mismatchReportedWithin(requestedRateHz: Int, deviceRateHz: Double, waitMs: Long): Pair<Int, Int>? {
+        val dac =
+            AsyncDacSimulator(
+                usbSpeed = USB_SPEED_HIGH,
+                dataBInterval = 1,
+                deviceRateHz = deviceRateHz,
+                frameBytes = CHANNELS * SUBSLOT_BYTES,
+                feedbackWire = FeedbackWire.SPEC,
+                feedbackEndpointAddress = FEEDBACK_ENDPOINT,
+            )
+        val format =
+            UacStreamFormat(
+                alternateSetting = 1,
+                bitResolution = 16,
+                subslotSize = SUBSLOT_BYTES,
+                clusterDescriptorId = -1,
+                endpointAddress = 0x01,
+                maxPacketSize = 1024,
+                syncType = SyncType.ASYNC,
+                feedbackEndpoint = UacFeedbackEndpoint(FEEDBACK_ENDPOINT, 4, bInterval = 4),
+            )
+        val reported = CountDownLatch(1)
+        var report: Pair<Int, Int>? = null
+        val engine =
+            UsbIsoStreamEngine(
+                session = session,
+                format = format,
+                channels = CHANNELS,
+                sampleRateHz = requestedRateHz,
+                ringBuffer = PcmRingBuffer(1 shl 16),
+                paused = { true },
+                reportPipelineStats = {},
+                nativeBridge = dac,
+                onFeedbackRateMismatch = { requested, observed ->
+                    report = requested to observed
+                    reported.countDown()
+                },
+            )
+        engine.start()
+        try {
+            reported.await(waitMs, TimeUnit.MILLISECONDS)
+        } finally {
+            engine.stop()
+        }
+        return report
+    }
+
+    @Test
+    fun `a device whose clock stayed in the other rate family is reported`() {
+        // 44.1 kHz asked for, 48 kHz running: within the decoder's 10% tolerance, so the host
+        // would follow it, playing everything 8.8% fast, without this check.
+        assertEquals(44100 to 48000, mismatchReportedWithin(44100, 48000.0, waitMs = 2000))
+    }
+
+    @Test
+    fun `a device at the requested rate plus ordinary clock error is not reported`() {
+        assertFalse(mismatchReportedWithin(44100, 44100 * DEVICE_CLOCK_OFFSET, waitMs = 600) != null)
+    }
 }

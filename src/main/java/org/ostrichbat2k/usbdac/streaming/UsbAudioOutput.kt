@@ -140,6 +140,7 @@ class UsbAudioOutput(
             reportPipelineStats = usbAudioManager::reportPipelineStats,
             onFatalStreamError = usbAudioManager::notifyStreamFatalError,
             urbQueue = usbSettings.urbQueueOverride?.coerced() ?: UrbQueueShape.DEFAULT,
+            onFeedbackRateMismatch = usbAudioManager::reportFeedbackRateMismatch,
         )
 
     // The isochronous schedule can't actually stop (the USB clock must keep ticking), so "pause"

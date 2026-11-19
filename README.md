@@ -272,6 +272,12 @@ unsupported-device case -- it's expected to activate and stream normally,
 just without real-hardware verification of the feedback-clocked rate
 correction yet.
 
+Clicks or dropouts with every counter clean (no reap errors, no bad
+packets, no underruns, and no "ran dry" in the queue-margin log line) need
+a look below the application layer: see
+[docs/kernel-usb-diagnostics.md](docs/kernel-usb-diagnostics.md) for an
+xHCI trace recipe (root required).
+
 ## Known limitations
 
 - The Asynchronous/feedback-clocked isochronous path (#25) has no

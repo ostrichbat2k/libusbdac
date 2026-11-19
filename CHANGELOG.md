@@ -36,6 +36,10 @@ Pin to an exact tag or commit rather than a version range.
   and feedback threads taking each other's URBs (duplicate submissions,
   lost queue slots, stalled feedback) (#139). `UsbNativeBridge.reapIso` is
   replaced by `reapIsoAny`.
+- A claim release requested during an activation attempt -- a pause or
+  track skip during a clock relock -- is replayed when the attempt ends
+  instead of being dropped, so the DAC no longer stays claimed with
+  nothing streaming (#141).
 - UAC1 devices that don't implement the Sampling Frequency control no
   longer fail activation (#128).
 - Honour the UAC2/3 Clock Source's `bmControls`: a read-only frequency is

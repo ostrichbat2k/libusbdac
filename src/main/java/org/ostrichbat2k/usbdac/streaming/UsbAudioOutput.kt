@@ -649,7 +649,15 @@ class UsbAudioOutput(
         }
         return synchronized(activationLock) {
             val stillWanted = !paused && !released
-            if (stillWanted) startStreamLocked(holdSilence) else usbAudioManager.releaseClaim()
+            when {
+                stillWanted -> startStreamLocked(holdSilence)
+                // Same release release() itself would have made, had a stream been running.
+                released -> usbAudioManager.releaseClaim(delayMs = 0)
+                // Same as pause(): in manual mode (#31) the claim stays with us.
+                !usbSettings.manualReleaseControl -> usbAudioManager.releaseClaim()
+            }
+            // Either release runs inside this attempt's own beginClaimAttempt bracket, so the
+            // claim controller holds it until the attempt ends and replays it then (#141).
             stillWanted
         }
     }

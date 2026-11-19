@@ -102,13 +102,46 @@ internal class UsbIsoStreamEngine(
     // cross-thread visibility, just convenient to declare alongside the other stream-lifetime state.
     private var underrunCount = 0
 
+    // Pre-roll (#127): while true the stream carries silence and leaves the ring buffer alone,
+    // exactly like pause silence, so the DAC settles with data already flowing. Set by
+    // start(holdSilence = true), cleared by openSilenceGate() once the caller has the device
+    // settled, unmuted and at the right volume.
+    @Volatile private var silenceGate = false
+
+    // Set by openSilenceGate(), consumed by the streaming thread: the first real audio after
+    // pre-roll fades in instead of starting at full level.
+    @Volatile private var fadeInPending = false
+
+    /**
+     * URBs whose completion [UsbNativeBridge.reapIso] has confirmed since [start]. A caller
+     * waiting for the stream to be established (#127) watches this go past
+     * [UsbAudioTuning.NUM_URBS].
+     */
+    @Volatile var urbsReaped: Long = 0L
+        private set
+
+    /** Ends the pre-roll begun by `start(holdSilence = true)`: real audio follows, faded in (#127). */
+    fun openSilenceGate() {
+        if (!silenceGate) return
+        fadeInPending = true
+        silenceGate = false
+    }
+
     /** Resets position accounting -- called from [UsbAudioOutput.flush]. */
     fun resetPosition() {
         framesOutput = 0L
     }
 
-    fun start() {
+    /**
+     * Opens the native stream and starts the streaming thread. With [holdSilence] it starts in
+     * pre-roll (#127): silence, not credited to position and not taken from the ring buffer,
+     * until [openSilenceGate].
+     */
+    fun start(holdSilence: Boolean = false) {
         if (streaming) return
+        silenceGate = holdSilence
+        fadeInPending = false
+        urbsReaped = 0L
         val fd = session.connection.fileDescriptor
 
         // THE pacing fix: a high-speed device schedules one iso packet per 125us *microframe*,
@@ -189,23 +222,7 @@ internal class UsbIsoStreamEngine(
         val slotFrames = LongArray(UsbAudioTuning.NUM_URBS)
         val slotCreditable = BooleanArray(UsbAudioTuning.NUM_URBS)
 
-        /**
-         * Ramps the last [UsbAudioTuning.UNDERRUN_FADE_FRAMES] frames of real audio already in [buf] (ending at
-         * [readBytes]) down to silence, in place, instead of leaving the hard edge
-         * [PcmRingBuffer.readOrZeroPad]'s zero-padding creates right at that boundary.
-         *
-         * A real underrun's audible symptom isn't the padding itself -- confirmed, reproduced: a
-         * *fully* empty read (zero real bytes, the whole URB zero-padded) is inaudible, just a
-         * fraction more silence before sound starts/resumes. It's specifically a *partial* read
-         * (some real signal, then a dead stop at [readBytes]) that's heard as a click/crackle,
-         * because real waveforms essentially never cross zero exactly at that boundary -- cutting
-         * straight to silence there is a genuine discontinuity, not just an early mute. Fading the
-         * tail down smoothly removes that discontinuity without changing anything else about how
-         * underruns are handled (still logged, still rate-limited, still just silence beyond
-         * [readBytes]) -- it only asks "how do the last few real samples transition into that
-         * silence" instead of "do they transition at all".
-         */
-        fun fadeTailToSilence(buf: ByteArray, readBytes: Int) {
+        fun rampFrames(buf: ByteArray, readBytes: Int, fadingIn: Boolean) {
             val subslot = format.subslotSize
             val totalFrames = readBytes / frameBytes
             val fadeFrames = minOf(UsbAudioTuning.UNDERRUN_FADE_FRAMES, totalFrames)
@@ -214,19 +231,22 @@ internal class UsbIsoStreamEngine(
             val maxValue = signBit - 1
             val minValue = -signBit
             for (i in 0 until fadeFrames) {
-                val frameIndex = totalFrames - fadeFrames + i
+                // Fading out: the last fadeFrames frames, down to 0. Fading in: the first
+                // fadeFrames frames, (i+1)/fadeFrames up to full level.
+                val frameIndex = if (fadingIn) i else totalFrames - fadeFrames + i
                 // Reaches exactly 0 at the last faded frame, right where the zero-padded region
                 // -- already silent -- begins, so the two halves meet smoothly instead of at a
                 // sudden edge. Uses the precomputed table whenever fadeFrames is the usual full
                 // UsbAudioTuning.UNDERRUN_FADE_FRAMES window; only the rare shorter-read case (fadeFrames <
                 // UsbAudioTuning.UNDERRUN_FADE_FRAMES) still divides on the fly, since that shape isn't in the
                 // table.
-                val factor =
+                val fadeOutFactor =
                     if (fadeFrames == UsbAudioTuning.UNDERRUN_FADE_FRAMES) {
                         UNDERRUN_FADE_FACTORS[i]
                     } else {
                         1.0 - (i + 1).toDouble() / fadeFrames
                     }
+                val factor = if (fadingIn) 1.0 - fadeOutFactor else fadeOutFactor
                 val frameOffset = frameIndex * frameBytes
                 for (ch in 0 until channels) {
                     val sampleOffset = frameOffset + ch * subslot
@@ -243,6 +263,35 @@ internal class UsbIsoStreamEngine(
             }
         }
 
+        /**
+         * Ramps the last [UsbAudioTuning.UNDERRUN_FADE_FRAMES] frames of real audio already in [buf] (ending at
+         * [readBytes]) down to silence, in place, instead of leaving the hard edge
+         * [PcmRingBuffer.readOrZeroPad]'s zero-padding creates right at that boundary.
+         *
+         * A real underrun's audible symptom isn't the padding itself -- confirmed, reproduced: a
+         * *fully* empty read (zero real bytes, the whole URB zero-padded) is inaudible, just a
+         * fraction more silence before sound starts/resumes. It's specifically a *partial* read
+         * (some real signal, then a dead stop at [readBytes]) that's heard as a click/crackle,
+         * because real waveforms essentially never cross zero exactly at that boundary -- cutting
+         * straight to silence there is a genuine discontinuity, not just an early mute. Fading the
+         * tail down smoothly removes that discontinuity without changing anything else about how
+         * underruns are handled (still logged, still rate-limited, still just silence beyond
+         * [readBytes]) -- it only asks "how do the last few real samples transition into that
+         * silence" instead of "do they transition at all".
+         */
+        fun fadeTailToSilence(buf: ByteArray, readBytes: Int) = rampFrames(buf, readBytes, fadingIn = false)
+
+        /**
+         * The mirror of [fadeTailToSilence] for the first real audio after pre-roll (#127): ramps
+         * the first [UsbAudioTuning.UNDERRUN_FADE_FRAMES] frames of [buf] up from silence, so the
+         * hand-over from pre-roll silence to the track has no hard edge either.
+         */
+        fun fadeHeadFromSilence(buf: ByteArray, readBytes: Int) = rampFrames(buf, readBytes, fadingIn = true)
+
+        // Whether the URB buildUrb() last built carried real track audio, rather than pause or
+        // pre-roll silence -- what decides whether its frames are credited to position.
+        var lastUrbWasAudio = false
+
         /** Fills [urbBuffer]/[packetLengths] in place; returns how many bytes of [urbBuffer] are used. */
         fun buildUrb(): Int {
             var total = 0
@@ -251,8 +300,13 @@ internal class UsbIsoStreamEngine(
                 packetLengths[p] = bytes
                 total += bytes
             }
-            if (!paused()) {
+            lastUrbWasAudio = !paused() && !silenceGate
+            if (lastUrbWasAudio) {
                 val read = ringBuffer.readOrZeroPad(urbBuffer, total)
+                if (fadeInPending && read > 0) {
+                    fadeInPending = false
+                    fadeHeadFromSilence(urbBuffer, read)
+                }
                 // A genuine underrun (decoder/renderer thread couldn't keep up, ring buffer ran
                 // dry) rather than the deliberate pause-silence case above -- heard as a click/
                 // crackle, since real audio briefly drops to silence mid-stream. Rate-limited:
@@ -272,8 +326,9 @@ internal class UsbIsoStreamEngine(
                     if (read > 0) fadeTailToSilence(urbBuffer, read)
                 }
             } else {
-                // Reused buffer may still hold real audio from a prior, unpaused call -- must
-                // explicitly silence it rather than relying on a fresh zero-filled array.
+                // Pause or pre-roll silence. Reused buffer may still hold real audio from a prior,
+                // unpaused call -- must explicitly silence it rather than relying on a fresh
+                // zero-filled array.
                 urbBuffer.fill(0, 0, total)
             }
             return total
@@ -315,12 +370,10 @@ internal class UsbIsoStreamEngine(
                                     "-- this URB stays unsubmitted")
                         } else {
                             // Credited once reapIso() confirms this slot's URB actually
-                            // completed, in the steady-state loop below -- not now (#71). Prefill
-                            // always runs right after start() was called with paused already
-                            // confirmed false, so always creditable, same as the old
-                            // unconditional credit here.
+                            // completed, in the steady-state loop below -- not now (#71). Real
+                            // audio unless this is pre-roll silence (#127).
                             slotFrames[slot] = (total / frameBytes).toLong()
-                            slotCreditable[slot] = true
+                            slotCreditable[slot] = lastUrbWasAudio
                         }
                     }
 
@@ -374,6 +427,7 @@ internal class UsbIsoStreamEngine(
                         if (slotCreditable[slot]) {
                             framesOutput += slotFrames[slot]
                         }
+                        urbsReaped++
 
                         urbsPaced++
                         val waitNs = (streamStartNs + urbsPaced * urbRealTimeNs) - System.nanoTime()
@@ -402,14 +456,15 @@ internal class UsbIsoStreamEngine(
                         submitted++
                         lastUrbSubmittedAtMs = System.currentTimeMillis()
                         // Recorded now, credited above next time this slot comes back around
-                        // through reapIso() confirming it completed. Not creditable while paused:
+                        // through reapIso() confirming it completed. Not creditable while paused
+                        // or in pre-roll (#127):
                         // this is synthetic silence standing in for the USB clock's unstoppable
                         // schedule, not real consumed track audio -- see UsbAudioOutput.paused's
                         // doc comment. Crediting it would let getPositionUs() catch up to
                         // framesWritten mid-pause and re-trigger the exact premature-isEnded()
                         // stall this counter exists to prevent.
                         slotFrames[slot] = (total / frameBytes).toLong()
-                        slotCreditable[slot] = !paused()
+                        slotCreditable[slot] = lastUrbWasAudio
                         // ~20 URBs at this class's ~8ms-of-real-audio-per-URB pacing (see
                         // UsbAudioTuning.BASE_PACKETS_PER_URB) is roughly a 160ms cadence -- frequent enough
                         // for a live pipeline visualizer to feel real-time without pushing a

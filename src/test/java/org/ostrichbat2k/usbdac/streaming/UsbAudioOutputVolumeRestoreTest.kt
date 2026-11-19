@@ -208,10 +208,30 @@ class UsbAudioOutputVolumeRestoreTest {
         // ever got back to onActivationAttemptFinished.
         val output = output(session, fakeUsbSettings(-2000), usbAudioManager)
 
-        output.onActivationAttemptFinished(succeeded = true)
+        assertFalse(output.onActivationAttemptFinished(succeeded = true))
 
         verify { usbAudioManager.releaseClaim() }
         verify(exactly = 0) { usbAudioManager.notifyStreamingStarted() }
+    }
+
+    /**
+     * #127: phase 2 of a relock runs with the stream already going in pre-roll; a [pause] in the
+     * meantime stops that stream, so when phase 2 finishes there's nothing to open and nothing
+     * to stop. (The branches that do start or open a stream reach [UsbNative], see above.)
+     */
+    @Test
+    fun `onSettleFinished leaves a paused instance alone, settled or not`() {
+        val featureUnit = FakeFeatureUnit(unitId = 7, controlInterfaceId = 0)
+        val session = sessionWith(featureUnit)
+        val usbAudioManager = mockk<UsbAudioManager>(relaxed = true)
+        val output = output(session, fakeUsbSettings(-2000), usbAudioManager)
+
+        output.onSettleFinished(settled = true)
+        output.onSettleFinished(settled = false)
+
+        verify(exactly = 0) { usbAudioManager.notifyStreamingStarted() }
+        verify(exactly = 0) { usbAudioManager.notifyStreamingStopped() }
+        verify(exactly = 0) { usbAudioManager.setDirectPlaybackActive(any()) }
     }
 
     @Test

@@ -343,6 +343,40 @@ class UsbIsoStreamEngineTest {
         engine.stop()
     }
 
+    /**
+     * Regression shape for #148: a flush with URBs in flight. The four prefilled URBs carry
+     * pre-seek audio and must not count once they complete after the flush; slot 0 refilled after
+     * the flush must.
+     */
+    @Test
+    fun `after resetPosition only URBs filled since the flush are credited`() {
+        val readyToReap = CountDownLatch(1)
+        val flushed = CountDownLatch(1)
+        val bridge =
+            FakeNativeBridge(
+                reapResults = listOf(mainSlot(0), mainSlot(1), mainSlot(2), mainSlot(3), mainSlot(0), FATAL),
+                beforeReap = { idx ->
+                    if (idx == 0) {
+                        readyToReap.countDown()
+                        flushed.await()
+                    }
+                })
+        var fatal = false
+        val engine = engineWith(bridge, paused = false, onFatalStreamError = { fatal = true })
+
+        engine.start()
+        assertTrue(readyToReap.await(2, TimeUnit.SECONDS))
+        engine.resetPosition()
+        assertEquals(0L, engine.framesOutput)
+        flushed.countDown()
+        assertTrue(waitUntil { fatal })
+
+        // Exactly one URB: 8 full-speed packets of 44 or 45 frames at 44.1 kHz.
+        val frames = engine.framesOutput
+        assertTrue(frames in 352L..360L, "expected one post-flush URB credited, got $frames frames")
+        engine.stop()
+    }
+
     /** Regression shape for #107: a feedback submitIsoRead failure must not abandon later slots' prefill. */
     @Test
     fun `a feedback submitIsoRead failing twice for a slot is logged and prefill still continues to the next slot`() {

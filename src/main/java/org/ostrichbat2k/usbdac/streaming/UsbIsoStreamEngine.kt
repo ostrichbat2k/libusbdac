@@ -87,8 +87,20 @@ internal class UsbIsoStreamEngine(
     private var isoHandle = 0L
     private var streamThread: Thread? = null
 
-    @Volatile var streaming: Boolean = false
-        private set
+    /**
+     * One [start]..[stop] cycle. Its own flag, captured by its own thread, so a [stop]ped run can
+     * never be switched back on by a later [start] -- a single shared flag did exactly that to a
+     * thread [stop] had to leave stuck, which then streamed alongside the new one (#147).
+     */
+    private class Run {
+        @Volatile var active = true
+    }
+
+    @Volatile private var currentRun: Run? = null
+
+    /** Whether the current run is streaming -- false once [stop] has been called on it. */
+    val streaming: Boolean
+        get() = currentRun?.active == true
 
     @Volatile var lastUrbSubmittedAtMs: Long = 0L
         private set
@@ -155,7 +167,7 @@ internal class UsbIsoStreamEngine(
      * thread reaps everything and hands each completion to the stream that owns it.
      */
     fun start(holdSilence: Boolean = false) {
-        if (streaming) return
+        if (streaming || !previousRunCleared()) return
         silenceGate = holdSilence
         fadeInPending = false
         urbsReaped = 0L
@@ -355,7 +367,8 @@ internal class UsbIsoStreamEngine(
         val feedbackDecoder = FeedbackDecoder(sampleRateHz, packetsPerSecond, maxSamplesPerPacket)
         val feedback = openFeedbackStreamIfApplicable(fd, scheduler, feedbackDecoder)
 
-        streaming = true
+        val run = Run()
+        currentRun = run
         lastUrbSubmittedAtMs = System.currentTimeMillis()
         streamThread =
             Thread {
@@ -418,9 +431,9 @@ internal class UsbIsoStreamEngine(
                     var urbsPaced = 0L
                     var submitted = 0
                     var reapErrors = 0
-                    while (streaming) {
+                    while (run.active) {
                         val reaped = nativeBridge.reapIsoAny(handle)
-                        if (!streaming) break
+                        if (!run.active) break
                         if (reaped < 0) {
                             reapErrors++
                             if (reaped == UsbNativeBridge.REAP_ERROR_FATAL.toLong()) {
@@ -650,7 +663,7 @@ internal class UsbIsoStreamEngine(
 
     fun stop() {
         if (!streaming && isoHandle == 0L && feedbackHandle == 0L) return
-        streaming = false
+        currentRun?.active = false
         // Cancelling either stream's URBs wakes the one thread reaping them both.
         if (isoHandle != 0L) nativeBridge.cancelIso(isoHandle)
         if (feedbackHandle != 0L) nativeBridge.cancelIso(feedbackHandle)
@@ -685,6 +698,19 @@ internal class UsbIsoStreamEngine(
         // all) -- clear rather than leave the pipeline visualizer showing numbers frozen from a
         // track that isn't playing anymore.
         reportPipelineStats(null)
+    }
+
+    /**
+     * True when no earlier run is still holding its handles. A previous [stop] may have had to
+     * leave its thread stuck, holding them (see [stop]); this tries that stop again. Opening a
+     * new run over it would overwrite those handles, so they could never be closed (#147).
+     */
+    private fun previousRunCleared(): Boolean {
+        if (streamThread != null) stop()
+        if (streamThread != null) {
+            L.e("UsbIsoStreamEngine: previous streaming thread is still stuck -- not starting a new stream")
+        }
+        return streamThread == null
     }
 
     /**

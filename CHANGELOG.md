@@ -8,6 +8,60 @@ Pin to an exact tag or commit rather than a version range.
 
 ## [Unreleased]
 
+### Added
+- Added a user-configurable max-volume safety cap (#109).
+- Check each format's largest packet against the endpoint's
+  `wMaxPacketSize` (high-bandwidth multiplier bits decoded) when choosing
+  a format, instead of stalling when the kernel rejects the URB (#130).
+- Stream pre-roll silence while the DAC settles after a clock change,
+  unmute onto silence, and fade the first real frames in (#127).
+- Measure the URB queue margin -- minimum time to spare, times the queue
+  ran dry, longest pacing wait -- in `UsbPipelineStats` and logcat, with
+  `UsbDacPreferences.urbQueueOverride` for queue-depth experiments (#123).
+- Cross-check a clock change against an Asynchronous device's feedback,
+  reporting a different standard rate in the diagnostic log and
+  `UsbControlState.feedbackRateMismatchHz` (detection only) (#124).
+- Device quirk table seeded from Linux `snd-usb-audio`'s quirk flags, with
+  an app override (`UsbDeviceQuirks.setOverride`) (#132).
+- Warn when an Asynchronous endpoint has no feedback endpoint (implicit
+  feedback, not supported) (#133).
+
+### Fixed
+- Decode high-speed feedback per microframe, so async feedback is
+  actually applied, and keep the scheduler's fractional phase across
+  feedback updates instead of quantizing the rate (#119, #120); the
+  feedback loop no longer allocates per packet (#121).
+- UAC1 devices that don't implement the Sampling Frequency control no
+  longer fail activation (#128).
+- Honour the UAC2/3 Clock Source's `bmControls`: a read-only frequency is
+  not written, an unreadable validity control is not polled (#131).
+- Change the UAC2/3 clock with the streaming interface on alt-setting 0,
+  then select the streaming alt-setting (#122).
+- Resolve the UAC2 playback clock through the streaming terminal's
+  `bCSourceID`, Clock Selectors and Clock Multipliers, instead of taking
+  the first Clock Source declared (#129).
+- Gave clock/endpoint-rate writes and power domain writes typed outcomes
+  instead of a bare `Boolean`/ignored result (#111).
+- `doReleaseClaim()`'s delayed-release recheck now also accounts for
+  `claimAttemptsInFlight`, closing the same race #36 already fixed for
+  the synchronous release path (#106).
+- Signal a fatal streaming error (e.g. the DAC being unplugged) to the
+  caller immediately instead of leaving `isStalled()` to discover it by
+  polling, which turned one teardown into a repeating pulse
+  (Auxio#51).
+
+### Infrastructure
+- One implementation of the set-sample-rate and settle steps, shared by
+  activation and playback (#136).
+- Software Asynchronous DAC simulator running the real stream engine in
+  unit tests (#126).
+- Kernel-level USB diagnostics recipe (xHCI trace) in
+  `docs/kernel-usb-diagnostics.md` (#125).
+- Added test coverage for `UsbIsoStreamEngine`'s feedback-thread
+  lifecycle (async-clocked DACs) (#107).
+- Fixed detekt violations that accumulated while `CI`/`Release` were
+  temporarily disabled, and regenerated the detekt baseline (#115).
+
 ## [v0.2.0] - 2026-11-07
 
 ### Added

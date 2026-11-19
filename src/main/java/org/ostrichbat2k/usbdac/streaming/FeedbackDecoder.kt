@@ -43,7 +43,7 @@ import org.ostrichbat2k.usbdac.protocol.u8
  * of 8 for every spec-conforming high-speed device, every such value fell outside the tolerance
  * band, and feedback was silently never applied.
  *
- * One instance per stream; used only from the feedback thread. [decode] allocates nothing.
+ * One instance per stream; used only from the streaming thread (#139). [decode] allocates nothing.
  */
 internal class FeedbackDecoder(
     nominalRateHz: Int,

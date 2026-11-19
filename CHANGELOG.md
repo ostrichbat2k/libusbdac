@@ -31,6 +31,11 @@ Pin to an exact tag or commit rather than a version range.
   actually applied, and keep the scheduler's fractional phase across
   feedback updates instead of quantizing the rate (#119, #120); the
   feedback loop no longer allocates per packet (#121).
+- Asynchronous devices with a feedback endpoint: one thread now reaps the
+  shared fd and routes each completion to its stream, instead of the main
+  and feedback threads taking each other's URBs (duplicate submissions,
+  lost queue slots, stalled feedback) (#139). `UsbNativeBridge.reapIso` is
+  replaced by `reapIsoAny`.
 - UAC1 devices that don't implement the Sampling Frequency control no
   longer fail activation (#128).
 - Honour the UAC2/3 Clock Source's `bmControls`: a read-only frequency is

@@ -18,7 +18,10 @@
 
 package org.ostrichbat2k.usbdac.streaming
 
-import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.DelayQueue
+import java.util.concurrent.Delayed
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
 /** How [AsyncDacSimulator] encodes its clock on the feedback endpoint. All four exist in the wild. */
 internal enum class FeedbackWire {
@@ -56,6 +59,14 @@ internal enum class FeedbackWire {
  * definition, so [deliveredRateHz] is exact and does not depend on how the test machine schedules
  * threads.
  *
+ * Completions behave like usbfs (#139): both streams are opened on the same fd, and the kernel
+ * keeps one completion list per open file (`usb_dev_state.async_completed`, `reap_as()` in
+ * drivers/usb/core/devio.c), so a reap returns the next finished URB on the fd whichever stream
+ * submitted it. This simulator keeps one shared queue the same way, and counts every submission
+ * of a slot that is still in flight ([doubleSubmissions]) -- what a host that confuses the two
+ * streams' URBs does. Main URBs complete in bus time, one after another, as the device plays them;
+ * feedback URBs a millisecond after they are submitted.
+ *
  * What it does not model: anything electrical, a control loop inside the device (the reported
  * value is constant), lost packets, or host-controller scheduling. A Linux `dummy_hcd` gadget was
  * the first idea for this and cannot do it: `dummy_hcd` fails every isochronous transfer.
@@ -73,18 +84,32 @@ internal class AsyncDacSimulator(
         const val FEEDBACK_HANDLE = 2L
         const val USB_SPEED_FULL = 2
         const val CANCELLED = Int.MIN_VALUE
-        const val FEEDBACK_PERIOD_MS = 1L
+        const val FEEDBACK_PERIOD_NS = 1_000_000L
     }
 
     data class Snapshot(val frames: Long, val packets: Long)
+
+    /** One finished URB on the shared per-fd completion list, available once [dueNs] has passed. */
+    private class Completion(val handle: Long, val slot: Int, private val dueNs: Long) : Delayed {
+        override fun getDelay(unit: TimeUnit): Long = unit.convert(dueNs - System.nanoTime(), TimeUnit.NANOSECONDS)
+
+        override fun compareTo(other: Delayed): Int =
+            getDelay(TimeUnit.NANOSECONDS).compareTo(other.getDelay(TimeUnit.NANOSECONDS))
+    }
 
     private val isHighSpeed = usbSpeed != USB_SPEED_FULL
 
     /** Data packets per second of bus time -- the same rule [IsoPacing.forSpeed] implements. */
     val packetsPerSecond: Int = if (isHighSpeed) 8000 shr (dataBInterval - 1) else 1000
 
-    private val mainCompletions = LinkedBlockingQueue<Int>()
-    private val feedbackCompletions = LinkedBlockingQueue<Int>()
+    // One list for the whole fd, like the kernel's -- see this class's doc comment.
+    private val completions = DelayQueue<Completion>()
+    private val inFlight = mapOf(MAIN_HANDLE to mutableSetOf<Int>(), FEEDBACK_HANDLE to mutableSetOf())
+
+    // When the last main URB submitted finishes playing on the bus. Guarded by inFlight.
+    private var mainBusEndNs = 0L
+    private val packetDurationNs = 1_000_000_000L / packetsPerSecond
+
     // Updated and read together under countLock: a snapshot taken between the two additions
     // would be off by a whole URB of frames, which is far more than the tests' tolerance.
     private val countLock = Any()
@@ -96,6 +121,15 @@ internal class AsyncDacSimulator(
 
     @Volatile var smallestPacketFrames = Int.MAX_VALUE
         private set
+
+    /** Submissions of a slot whose previous URB had not completed yet. Always 0 for a correct host. */
+    val doubleSubmissions = AtomicInteger(0)
+
+    /** Feedback payloads the host read back -- how often it actually serviced the feedback stream. */
+    val feedbackReads = AtomicInteger(0)
+
+    /** Main-stream slots currently submitted and not yet reaped. */
+    fun mainInFlight(): Int = synchronized(inFlight) { inFlight.getValue(MAIN_HANDLE).size }
 
     fun snapshot() = synchronized(countLock) { Snapshot(frames, packets) }
 
@@ -127,6 +161,28 @@ internal class AsyncDacSimulator(
 
     private fun le(value: Long, size: Int) = ByteArray(size) { i -> ((value shr (8 * i)) and 0xFF).toByte() }
 
+    private fun submit(handle: Long, slot: Int, packets: Int) {
+        val dueNs =
+            synchronized(inFlight) {
+                if (!inFlight.getValue(handle).add(slot)) doubleSubmissions.incrementAndGet()
+                val now = System.nanoTime()
+                if (handle == MAIN_HANDLE) {
+                    mainBusEndNs = maxOf(now, mainBusEndNs) + packets * packetDurationNs
+                    mainBusEndNs
+                } else {
+                    now + FEEDBACK_PERIOD_NS
+                }
+            }
+        completions.put(Completion(handle, slot, dueNs))
+    }
+
+    /** The next finished URB on the fd, whichever stream it belongs to -- what REAPURB does. */
+    private fun reapNext(): Completion {
+        val c = completions.take()
+        if (c.slot != CANCELLED) synchronized(inFlight) { inFlight.getValue(c.handle).remove(c.slot) }
+        return c
+    }
+
     override fun disconnectKernelDriver(fd: Int, interfaceNumber: Int) = true
 
     override fun getUsbSpeed(fd: Int) = usbSpeed
@@ -146,33 +202,32 @@ internal class AsyncDacSimulator(
             frames += urbFrames
             packets += packetLengths.size
         }
-        mainCompletions.put(slot)
+        submit(MAIN_HANDLE, slot, packetLengths.size)
         return true
     }
 
-    override fun reapIso(handle: Long): Int {
-        val slot =
-            if (handle == FEEDBACK_HANDLE) {
-                Thread.sleep(FEEDBACK_PERIOD_MS)
-                feedbackCompletions.take()
-            } else {
-                mainCompletions.take()
-            }
-        return if (slot == CANCELLED) UsbNativeBridge.REAP_ERROR_FATAL else slot
+    override fun reapIsoAny(handle: Long): Long {
+        val c = reapNext()
+        return if (c.slot == CANCELLED) {
+            UsbNativeBridge.REAP_ERROR_FATAL.toLong()
+        } else {
+            UsbNativeBridge.reapResult(c.handle, c.slot)
+        }
     }
 
     override fun cancelIso(handle: Long) {
-        (if (handle == FEEDBACK_HANDLE) feedbackCompletions else mainCompletions).put(CANCELLED)
+        completions.put(Completion(handle, CANCELLED, System.nanoTime()))
     }
 
     override fun closeIsoStream(handle: Long) = Unit
 
     override fun submitIsoRead(handle: Long, slot: Int, packetLengths: IntArray): Boolean {
-        feedbackCompletions.put(slot)
+        submit(FEEDBACK_HANDLE, slot, packetLengths.size)
         return true
     }
 
     override fun readIsoSlotData(handle: Long, slot: Int, dst: ByteArray): Int {
+        feedbackReads.incrementAndGet()
         val bytes = feedbackBytes()
         val n = minOf(bytes.size, dst.size)
         bytes.copyInto(dst, 0, 0, n)

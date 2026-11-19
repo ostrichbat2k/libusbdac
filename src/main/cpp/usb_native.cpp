@@ -98,10 +98,16 @@ Java_org_ostrichbat2k_usbdac_streaming_UsbNative_getUsbSpeed(JNIEnv* /*env*/, jo
 // instead reports its own real
 // consumption rate back over a dedicated feedback endpoint (UAC 5.12.4.2); submitIsoRead/
 // readIsoSlotData below exist for that second, IN-direction stream (#25) -- opened via
-// the same openIsoStream, reaped via the same reapIso, cancelled/closed via the same
+// the same openIsoStream, reaped via the same reapIsoAny, cancelled/closed via the same
 // cancelIso/closeIsoStream as the main OUT data stream, since none of those four care
 // which direction a given handle's endpoint is. Only submission (this comment's whole
 // point) and result-readback differ enough to need their own entry points.
+//
+// Both streams live on the same fd (Android hands out one per device connection), and the
+// kernel keeps one completion list per open file, not per endpoint (usb_dev_state's
+// async_completed, reap_as() in drivers/usb/core/devio.c) -- REAPURB returns the next finished
+// URB on the fd whichever stream submitted it. So exactly one thread reaps per fd, and
+// reapIsoAny tells it which open stream a completion belongs to by the URB's address (#139).
 
 struct IsoStream {
     int fd;
@@ -110,7 +116,7 @@ struct IsoStream {
     int numUrbs;
     unsigned int bufferLength;
     struct usbdevfs_urb** urbs;
-    // Cumulative across this stream's whole lifetime, written by reapIso() on the streaming
+    // Cumulative across this stream's whole lifetime, written by reapIsoAny() on the streaming
     // thread and read by getPacketErrorStats() -- plausibly from a different thread (a host
     // diagnostics screen's own refresh timer), so these need to be atomic, not plain counters.
     // See #78: exposes processReapedUrb's per-URB packet scan beyond just a logcat line.
@@ -133,7 +139,7 @@ constexpr jint kMaxNumUrbs = 64;
 constexpr jint kMaxPacketsPerUrb = 4096;
 constexpr jint kMaxPacketSize = 4096;
 
-// reapIso()'s two failure codes -- mirrored exactly by UsbNative.kt's REAP_ERROR_TRANSIENT/
+// reapIsoAny()'s two failure codes -- mirrored exactly by UsbNative.kt's REAP_ERROR_TRANSIENT/
 // REAP_ERROR_FATAL constants (keep them in sync if these ever change). Distinct from each other
 // (and from -1 meaning "something went wrong" generically) specifically so the streaming loop in
 // UsbAudioOutput.kt can tell "retry immediately, nothing is actually wrong" (an EINTR, the only
@@ -396,7 +402,7 @@ Java_org_ostrichbat2k_usbdac_streaming_UsbNative_submitIso(
 // Scans a just-reaped (completed) URB's per-packet results and returns the slot index to
 // refill/resubmit, or -1 if its usercontext slot is bogus. Pure data processing over an
 // already-completed urb -- no I/O of its own, the real ioctl() that produces one happens in
-// reapIso() below -- split out specifically so this logic is directly testable with a hand-built
+// reapIsoAny() below -- split out specifically so this logic is directly testable with a hand-built
 // usbdevfs_urb, without a real USB device ever completing one for real (see
 // native-test/usb_native_test.cpp). External linkage (no `static`/anonymous namespace) so that
 // test binary can call it directly.
@@ -452,8 +458,8 @@ int processReapedUrb(const struct usbdevfs_urb* reaped, int packetsPerUrb, int n
         // The caller uses this return value directly as an array index to refill/resubmit --
         // an out-of-range value here must never reach it. This can only mean the reaped urb
         // isn't one we actually submitted (corrupted usercontext, or a kernel/driver bug) --
-        // never transient, so it gets the fatal code like any other unrecoverable reapIso()
-        // failure, not the generic -1 this used to return before #60 gave reapIso() distinct
+        // never transient, so it gets the fatal code like any other unrecoverable reapIsoAny()
+        // failure, not the generic -1 this used to return before #60 gave reapIsoAny() distinct
         // failure codes.
         LOGE("Reaped urb has out-of-range usercontext slot=%ld (numUrbs=%d)",
              (long) slot, numUrbs);
@@ -462,12 +468,12 @@ int processReapedUrb(const struct usbdevfs_urb* reaped, int packetsPerUrb, int n
     return (int) slot;
 }
 
-// Maps a failed REAPURB's errno to the right reapIso() return code. Split out purely so this
+// Maps a failed REAPURB's errno to the right reapIsoAny() return code. Split out purely so this
 // decision is directly testable without a real interrupted syscall (see
 // native-test/usb_native_test.cpp) -- same reasoning as processReapedUrb's own extraction above.
 int reapErrorCodeForErrno(int err) {
     // EINTR means the blocking wait was interrupted by a signal, not that anything is actually
-    // wrong with the stream or device -- the caller should just call reapIso() again. Every
+    // wrong with the stream or device -- the caller should just call reapIsoAny() again. Every
     // other errno (ENODEV when the device is unplugged, EINVAL/ENOENT/EBADF, anything else)
     // means this stream cannot produce anything more, so it's treated as fatal rather than
     // trying to enumerate every errno that really means "device gone" -- see #60: retrying
@@ -476,12 +482,51 @@ int reapErrorCodeForErrno(int err) {
     return err == EINTR ? kReapErrorTransient : kReapErrorFatal;
 }
 
-// Blocks until a submitted URB completes (or is cancelled by closeIsoStream from another
-// thread), returning its slot index so the caller can refill and resubmit it, or one of
-// kReapErrorTransient/kReapErrorFatal (mirrored as UsbNative.REAP_ERROR_TRANSIENT/
-// REAP_ERROR_FATAL on the Kotlin side) on failure.
-extern "C" JNIEXPORT jint JNICALL
-Java_org_ostrichbat2k_usbdac_streaming_UsbNative_reapIso(JNIEnv* /*env*/, jobject /*thiz*/, jlong handle) {
+// The handle of the open stream on [fd] that [reaped] belongs to, or 0 if none does. Found by
+// address, since every stream on the fd numbers its slots from 0, so usercontext alone cannot
+// tell them apart (#139). A handful of streams with a handful of URBs each, so a linear scan.
+// The caller still has to acquireStream() the result, which fails cleanly if it was closed in
+// between. External linkage so native-test/usb_native_test.cpp can call it directly.
+int64_t reapedUrbOwnerHandle(int fd, const struct usbdevfs_urb* reaped) {
+    std::lock_guard<std::mutex> lock(g_streamsMutex);
+    for (const auto& entry : g_streams) {
+        const IsoStream* stream = entry.second;
+        if (stream->fd != fd) continue;
+        for (int i = 0; i < stream->numUrbs; i++) {
+            if (stream->urbs[i] == reaped) return entry.first;
+        }
+    }
+    return 0;
+}
+
+// Test-only (native-test/usb_native_test.cpp): the URB a stream submits for [slot], so a test can
+// hand reapedUrbOwnerHandle a real address without a device ever completing one. nullptr for an
+// unknown handle or slot.
+const struct usbdevfs_urb* urbForTesting(jlong handle, int slot) {  // NOLINT(bugprone-easily-swappable-parameters)
+    IsoStream* stream = acquireStream(handle);
+    if (!stream) return nullptr;
+    StreamOpGuard guard(stream);
+    return slot >= 0 && slot < stream->numUrbs ? stream->urbs[slot] : nullptr;
+}
+
+// Packs a reaped URB's owning handle and slot into reapIsoAny()'s one return value. Mirrored by
+// UsbNativeBridge.reapedHandle/reapedSlot -- keep the shift in sync. Slots are < kMaxNumUrbs, and
+// handles count up from 1, far below 2^47, so the result is never negative and never collides
+// with the error codes.
+constexpr unsigned int kReapSlotBits = 16;
+
+jlong packReapResult(int64_t handle, int slot) {
+    return (jlong) (((uint64_t) handle << kReapSlotBits) | (uint64_t) slot);
+}
+
+// Blocks until any URB submitted on [handle]'s fd completes (or is cancelled by cancelIso), then
+// returns the owning stream's handle and the slot, packed (see packReapResult) -- which may be a
+// *different* stream from [handle] when several share the fd (#139: the main and feedback
+// streams). Returns kReapErrorTransient/kReapErrorFatal (mirrored as UsbNative.REAP_ERROR_*) on
+// failure. Exactly one thread may call this per fd: the kernel hands each completion to whichever
+// reaper asks first.
+extern "C" JNIEXPORT jlong JNICALL
+Java_org_ostrichbat2k_usbdac_streaming_UsbNative_reapIsoAny(JNIEnv* /*env*/, jobject /*thiz*/, jlong handle) {
     IsoStream* stream = acquireStream(handle);
     if (!stream) return kReapErrorFatal;
     StreamOpGuard guard(stream);
@@ -504,14 +549,25 @@ Java_org_ostrichbat2k_usbdac_streaming_UsbNative_reapIso(JNIEnv* /*env*/, jobjec
         LOGE("REAPURB succeeded but returned a null urb");
         return kReapErrorFatal;
     }
+
+    int64_t ownerHandle = reapedUrbOwnerHandle(stream->fd, reaped);
+    IsoStream* owner = ownerHandle != 0 ? acquireStream(ownerHandle) : nullptr;
+    if (!owner) {
+        // Its stream was already closed: nobody is waiting for it, and its memory must not be
+        // touched. Not the reaper's own failure, so the caller just reaps again.
+        LOGE("Reaped urb %p belongs to no open stream on fd %d -- dropped", (void*) reaped, stream->fd);
+        return kReapErrorTransient;
+    }
+    StreamOpGuard ownerGuard(owner);
     int badPackets = 0;
     int64_t shortBytes = 0;
-    int slot = processReapedUrb(reaped, stream->packetsPerUrb, stream->numUrbs, &badPackets, &shortBytes);
+    int slot = processReapedUrb(reaped, owner->packetsPerUrb, owner->numUrbs, &badPackets, &shortBytes);
     if (badPackets > 0) {
-        stream->cumulativeBadPackets.fetch_add(badPackets, std::memory_order_relaxed);
-        stream->cumulativeShortBytes.fetch_add(shortBytes, std::memory_order_relaxed);
+        owner->cumulativeBadPackets.fetch_add(badPackets, std::memory_order_relaxed);
+        owner->cumulativeShortBytes.fetch_add(shortBytes, std::memory_order_relaxed);
     }
-    return (jint) slot;
+    if (slot < 0) return slot;
+    return packReapResult(ownerHandle, slot);
 }
 
 // See #78: lets a host diagnostics screen tell "occasional dropped USB packets" apart from
@@ -549,13 +605,13 @@ static void discardAllUrbs(IsoStream* stream) {
     }
 }
 
-// Cancels all outstanding URBs, unblocking any reapIso() call in flight on another thread. A
+// Cancels all outstanding URBs, unblocking any reapIsoAny() call in flight on another thread. A
 // discarded urb's REAPURB still completes "successfully" (not an ioctl() failure, so not either
-// of reapIso()'s own failure codes) with a per-urb status reflecting the cancellation -- the
+// of reapIsoAny()'s own failure codes) with a per-urb status reflecting the cancellation -- the
 // streaming loop doesn't need to tell that apart from a normal completion because it always
 // checks its own `streaming` flag (already false by the time this is called, see
-// UsbAudioOutput.stopStreamingThread) right after reapIso() returns, regardless of what it
-// returns. Does NOT touch memory -- it's safe to call concurrently with reapIso()/submitIso() on
+// UsbAudioOutput.stopStreamingThread) right after reapIsoAny() returns, regardless of what it
+// returns. Does NOT touch memory -- it's safe to call concurrently with reapIsoAny()/submitIso() on
 // another thread, unlike closeIsoStream.
 extern "C" JNIEXPORT void JNICALL
 Java_org_ostrichbat2k_usbdac_streaming_UsbNative_cancelIso(JNIEnv* /*env*/, jobject /*thiz*/, jlong handle) {
@@ -566,7 +622,7 @@ Java_org_ostrichbat2k_usbdac_streaming_UsbNative_cancelIso(JNIEnv* /*env*/, jobj
 }
 
 // Drains any remaining completions and frees everything. Only safe once the caller has confirmed
-// (e.g. via Thread.join() after cancelIso()) that no other thread is still calling reapIso() or
+// (e.g. via Thread.join() after cancelIso()) that no other thread is still calling reapIsoAny() or
 // submitIso() on this handle -- this frees the same memory those functions read and write.
 extern "C" JNIEXPORT void JNICALL
 Java_org_ostrichbat2k_usbdac_streaming_UsbNative_closeIsoStream(JNIEnv* /*env*/, jobject /*thiz*/, jlong handle) {
@@ -594,7 +650,7 @@ Java_org_ostrichbat2k_usbdac_streaming_UsbNative_closeIsoStream(JNIEnv* /*env*/,
     // function's own doc comment), so activeOps is already expected to be 0 by the time the wait
     // below runs. This discard pass and that wait exist purely as hardening against a future
     // caller or bug that violates that contract (#76) -- not the normal path, but if it ever
-    // happens, this still unblocks a reapIso() call stuck in REAPURB on another thread instead of
+    // happens, this still unblocks a reapIsoAny() call stuck in REAPURB on another thread instead of
     // freeing the memory out from under it.
     discardAllUrbs(stream);
     while (stream->activeOps.load(std::memory_order_acquire) != 0) {
@@ -677,7 +733,7 @@ Java_org_ostrichbat2k_usbdac_streaming_UsbNative_submitIsoRead(
 }
 
 // Copies a just-reaped feedback URB's own payload back to the Kotlin side (#25) -- the first
-// code path in this file that ever reads URB buffer contents back out; processReapedUrb/reapIso
+// code path in this file that ever reads URB buffer contents back out; processReapedUrb/reapIsoAny
 // only ever inspect actual_length/status for the main audio data path, since that path's actual
 // bytes went the other direction (host to device) and were never meant to be read back.
 extern "C" JNIEXPORT jint JNICALL

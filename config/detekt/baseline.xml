@@ -156,7 +156,6 @@
     <ID>MaxLineLength:UsbAudioManagerImplTest.kt$UsbAudioManagerImplTest$fun</ID>
     <ID>MaxLineLength:UsbAudioOutputProvider.kt$UsbAudioOutputProvider$L.w("UsbAudioOutputProvider: no channel mask mapping for $channelCount channels, falling back to stereo")</ID>
     <ID>MaxLineLength:UsbAudioOutputVolumeRestoreTest.kt$UsbAudioOutputVolumeRestoreTest$fun</ID>
-    <ID>MaxLineLength:UsbClaimControllerImpl.kt$UsbClaimControllerImpl${ doReleaseClaim(awaitAndroidTakeover, effectiveDeactivateOnTimeout) }</ID>
     <ID>MaxLineLength:UsbDeviceDiscoveryImplTest.kt$UsbDeviceDiscoveryImplTest$fakeUsbDevice("composite", interfaceClasses = listOf(UsbConstants.USB_CLASS_HID, UsbConstants.USB_CLASS_AUDIO))</ID>
     <ID>MaxLineLength:UsbIsoStreamEngine.kt$UsbIsoStreamEngine$L.e("UsbIsoStreamEngine: reapIso() reported a fatal error -- stopping the streaming thread")</ID>
     <ID>MaxLineLength:UsbIsoStreamEngine.kt$UsbIsoStreamEngine$L.w("UsbIsoStreamEngine: feedback submitIsoRead failed twice for slot $slot -- this URB stays unsubmitted")</ID>
@@ -185,7 +184,7 @@
     <ID>ReturnCount:UsbAudioOutput.kt$UsbAudioOutput$override fun isStalled(): Boolean</ID>
     <ID>ReturnCount:UsbAudioOutput.kt$UsbAudioOutput$override fun write(buffer: ByteBuffer, encodedAccessUnitCount: Int, presentationTimeUs: Long): Boolean</ID>
     <ID>ReturnCount:UsbAudioOutput.kt$UsbAudioOutput$private fun activateAndStream(): ActivationResult</ID>
-    <ID>ReturnCount:UsbClaimControllerImpl.kt$UsbClaimControllerImpl$override fun requestClaim(session: UsbAudioSession?): UsbAudioManager.ClaimOutcome</ID>
+    <ID>ReturnCount:UsbClaimControllerImpl.kt$UsbClaimControllerImpl$private fun requestClaimLocked(session: UsbAudioSession?): UsbAudioManager.ClaimOutcome</ID>
     <ID>ReturnCount:UsbControlWriterImpl.kt$UsbControlWriterImpl$override fun setMixerGain(inputChannel: Int, outputChannel: Int, valueDb: Int)</ID>
     <ID>ReturnCount:UsbControlWriterImpl.kt$UsbControlWriterImpl$override fun setMuted(muted: Boolean)</ID>
     <ID>ReturnCount:UsbControlWriterImpl.kt$UsbControlWriterImpl$private fun scheduleVolumeWrite()</ID>

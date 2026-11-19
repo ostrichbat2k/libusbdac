@@ -1034,25 +1034,13 @@ class UsbAudioManagerImpl(
      * redundant and removed, since every caller gets the correct behavior from here instead.
      */
     private fun deactivateDac() {
-        claimController.cancelPendingRelease()
         val session = activeSession
-        if (session != null && claimController.isClaimed()) {
-            // Mirrors UsbClaimController's own UsbVolumeController.prepareForHalHandoff call
-            // (see its doc comment on why this has to happen before the interface is released,
-            // not after) -- without it, disabling USB DAC output while still claimed (e.g.
-            // mid-track, not between tracks where that path already did this) leaves the
-            // device's hardware Feature Unit at whatever gain/mute bit-perfect mode last set it
-            // to. Android's own STREAM_MUSIC volume has no visibility into or control over that
-            // -- confirmed, reproduced: every fallback track afterward showed the correct route,
-            // correct Android-side volume, and played silently, until the device was unplugged
-            // or USB DAC output was re-enabled.
-            volumeController.prepareForHalHandoff(session, session.topology.channelCount)
-        }
-        claimController.markReleased()
-        // Captured before clearing activeSession below -- see UsbClaimController's
-        // awaitAndroidOutputTakeover()'s fallback use of this, needed when this function is the
-        // one that triggered the switch to fallback rather than a per-track liveness check.
-        claimController.recordDeactivatedDevice(session?.device)
+        // Cancels pending releases, forces the hardware to the HAL-handoff level if still claimed
+        // (see that function's doc comment for the silent-fallback bug that prevents), marks the
+        // claim gone and records the device for the takeover wait -- under the claim
+        // controller's lock, so a release on its scheduler can't interleave (#142). Captured
+        // before activeSession is cleared below.
+        claimController.releaseForDeactivation(session)
         session?.let { UsbAudioController.release(it) }
         sessionState = SessionState.Idle
         _controlState.value = null

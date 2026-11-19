@@ -40,6 +40,10 @@ Pin to an exact tag or commit rather than a version range.
   track skip during a clock relock -- is replayed when the attempt ends
   instead of being dropped, so the DAC no longer stays claimed with
   nothing streaming (#141).
+- Claim controller decisions run under one lock: a claim can no longer
+  report `ALREADY_CLAIMED` on an interface a concurrent release is handing
+  to the kernel, and a release already running can no longer fire after
+  the claim that superseded it (#142).
 - UAC1 devices that don't implement the Sampling Frequency control no
   longer fail activation (#128).
 - Honour the UAC2/3 Clock Source's `bmControls`: a read-only frequency is

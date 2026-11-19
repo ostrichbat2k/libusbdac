@@ -47,6 +47,8 @@ Pin to an exact tag or commit rather than a version range.
 - A streaming thread that `stop()` had to leave stuck is no longer revived
   by the next `start()`, which also no longer overwrites (and so leaks)
   its native handles (#147).
+- A flush (seek) resets the playback position reliably and no longer
+  credits URBs filled before it (#148).
 - UAC1 devices that don't implement the Sampling Frequency control no
   longer fail activation (#128).
 - Honour the UAC2/3 Clock Source's `bmControls`: a read-only frequency is

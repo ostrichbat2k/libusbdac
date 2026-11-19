@@ -18,6 +18,7 @@
 
 package org.ostrichbat2k.usbdac.streaming
 
+import java.util.concurrent.atomic.AtomicInteger
 import org.ostrichbat2k.usbdac.UsbAudioTuning
 import org.ostrichbat2k.usbdac.protocol.SyncType
 import org.ostrichbat2k.usbdac.protocol.UacStreamFormat
@@ -107,9 +108,22 @@ internal class UsbIsoStreamEngine(
 
     // Frames actually handed to the device via a paced, submitted URB -- i.e. audibly played --
     // see UsbAudioOutput.getPositionUs's own doc comment for why this, not framesWritten, has to
-    // be what position reporting is based on.
-    @Volatile var framesOutput: Long = 0L
-        private set
+    // be what position reporting is based on. Written only by the streaming thread (#148).
+    @Volatile private var creditedFrames: Long = 0L
+
+    // Bumped by resetPosition() (a flush/seek, on the player thread); the streaming thread zeroes
+    // creditedFrames itself when it sees a new value, and only credits URBs filled in the current
+    // generation. Before, resetPosition() wrote framesOutput = 0 from the player thread while the
+    // streaming thread did framesOutput += ..., which could lose the reset, and URBs filled before
+    // the flush were still credited after it -- up to a whole queue of pre-seek audio (#148).
+    private val flushGeneration = AtomicInteger(0)
+
+    // The generation creditedFrames counts from. Written only by the streaming thread.
+    @Volatile private var appliedFlushGeneration = 0
+
+    /** Frames played since the last [resetPosition]: 0 until the streaming thread has applied it. */
+    val framesOutput: Long
+        get() = if (appliedFlushGeneration == flushGeneration.get()) creditedFrames else 0L
 
     // Feedback-clocked async support (#25) -- see UacFeedbackEndpoint's own doc comment. Stays 0
     // whenever this format isn't SyncType.ASYNC with a feedback endpoint, or when opening the
@@ -149,9 +163,12 @@ internal class UsbIsoStreamEngine(
         silenceGate = false
     }
 
-    /** Resets position accounting -- called from [UsbAudioOutput.flush]. */
+    /**
+     * Resets position accounting -- called from [UsbAudioOutput.flush]. Takes effect at once for
+     * [framesOutput]; the streaming thread zeroes its count on its next completion (#148).
+     */
     fun resetPosition() {
-        framesOutput = 0L
+        flushGeneration.incrementAndGet()
     }
 
     /**
@@ -250,6 +267,9 @@ internal class UsbIsoStreamEngine(
         // indexed by slot, overwritten every time that slot is resubmitted.
         val slotFrames = LongArray(urbQueue.numUrbs)
         val slotCreditable = BooleanArray(urbQueue.numUrbs)
+        // The flush generation each slot was filled in -- read before its audio was taken from
+        // the ring buffer, so a slot is never credited to a generation older than its data (#148).
+        val slotGeneration = IntArray(urbQueue.numUrbs)
 
         fun rampFrames(buf: ByteArray, readBytes: Int, fadingIn: Boolean) {
             val subslot = format.subslotSize
@@ -387,6 +407,7 @@ internal class UsbIsoStreamEngine(
                     setUrgentAudioPriority()
                     L.i("UsbIsoStreamEngine: streaming thread starting ($sampleRateHz Hz)")
                     for (slot in 0 until urbQueue.numUrbs) {
+                        val generation = flushGeneration.get()
                         val total = buildUrb()
                         // Retry once immediately before giving up on this slot -- see #59: a
                         // slot that's never submitted here never enters the reap/resubmit
@@ -408,6 +429,7 @@ internal class UsbIsoStreamEngine(
                             // audio unless this is pre-roll silence (#127).
                             slotFrames[slot] = (total / frameBytes).toLong()
                             slotCreditable[slot] = lastUrbWasAudio
+                            slotGeneration[slot] = generation
                         }
                     }
                     feedback?.submitAll()
@@ -475,8 +497,13 @@ internal class UsbIsoStreamEngine(
                         // reported playback as running ahead of what the device had actually
                         // consumed, by up to the whole prefill depth).
                         val reapedAtNs = System.nanoTime()
-                        if (slotCreditable[slot]) {
-                            framesOutput += slotFrames[slot]
+                        val currentGeneration = flushGeneration.get()
+                        if (currentGeneration != appliedFlushGeneration) {
+                            creditedFrames = 0L
+                            appliedFlushGeneration = currentGeneration
+                        }
+                        if (slotCreditable[slot] && slotGeneration[slot] == currentGeneration) {
+                            creditedFrames += slotFrames[slot]
                         }
                         urbsReaped++
 
@@ -486,6 +513,7 @@ internal class UsbIsoStreamEngine(
                             Thread.sleep(waitNs / 1_000_000L, (waitNs % 1_000_000L).toInt())
                         }
 
+                        val generation = flushGeneration.get()
                         val total = buildUrb()
                         // Retry once immediately before giving up on this slot -- see #59: unlike
                         // every other slot, which keeps cycling through reapIsoAny() even after a
@@ -517,6 +545,7 @@ internal class UsbIsoStreamEngine(
                         // stall this counter exists to prevent.
                         slotFrames[slot] = (total / frameBytes).toLong()
                         slotCreditable[slot] = lastUrbWasAudio
+                        slotGeneration[slot] = generation
                         // ~20 URBs at this class's ~8ms-of-real-audio-per-URB pacing (see
                         // UsbAudioTuning.BASE_PACKETS_PER_URB) is roughly a 160ms cadence -- frequent enough
                         // for a live pipeline visualizer to feel real-time without pushing a

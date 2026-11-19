@@ -19,6 +19,7 @@
 package org.ostrichbat2k.usbdac.streaming
 
 import org.ostrichbat2k.usbdac.UsbAudioManager
+import org.ostrichbat2k.usbdac.UsbAudioTuning
 import org.ostrichbat2k.usbdac.UsbDacPreferences
 import org.ostrichbat2k.usbdac.protocol.UacPlaybackTopology
 import org.ostrichbat2k.usbdac.protocol.UacStreamFormat
@@ -63,6 +64,13 @@ class UsbAudioOutputProvider(
     // null (the default) when the real depth is unknown or equals the container width, i.e.
     // nothing to narrow.
     private val realBitsPerSample: (androidx.media3.common.Format) -> Int? = { null },
+    /**
+     * The device's negotiated USB_SPEED_* value ([UsbNative.getUsbSpeed]), used to check each
+     * candidate format's packets against its `wMaxPacketSize` (#130). Null or a value not in
+     * [KNOWN_USB_SPEEDS] skips that check, since packets per second -- and so packet size --
+     * can't be known without it.
+     */
+    private val usbSpeed: Int? = null,
 ) : AudioOutputProvider {
 
     private companion object {
@@ -79,6 +87,10 @@ class UsbAudioOutputProvider(
         // track-switch depth (which the "upcoming track can run ahead" case this field already
         // documents only ever needs 2 of at once in practice).
         const val PADDED_CONFIGS_CAPACITY = 8
+
+        // low, full, high, super, super+ (linux/usb/ch9.h). Unknown (0), wireless (4) and the
+        // -1 error value are left out: IsoPacing can't say how often packets go out for them.
+        val KNOWN_USB_SPEEDS = setOf(1, 2, 3, 5, 6)
     }
 
     // Bridges getOutputConfig()'s knowledge of a specific track's real Format (and therefore
@@ -210,8 +222,23 @@ class UsbAudioOutputProvider(
         allFormats.firstOrNull { candidate ->
             encodingFor(candidate.subslotSize) == f.pcmEncoding &&
                 f.channelCount == channels &&
-                f.sampleRate in acceptedSampleRates(candidate)
+                f.sampleRate in acceptedSampleRates(candidate) &&
+                fitsPacketBudget(candidate, f.sampleRate)
         }
+
+    /**
+     * Whether [format]'s largest packet at [sampleRate] fits its endpoint's `wMaxPacketSize`
+     * (#130). One that doesn't would be rejected by the kernel at submit time and stop the
+     * stream, so it's skipped here instead, with the reason logged.
+     */
+    private fun fitsPacketBudget(format: UacStreamFormat, sampleRate: Int): Boolean {
+        val speed = usbSpeed?.takeIf { it in KNOWN_USB_SPEEDS } ?: return true
+        val packetsPerSecond =
+            IsoPacing.forSpeed(speed, UsbAudioTuning.BASE_PACKETS_PER_URB, format.bInterval).packetsPerSecond
+        val reason = IsoPacketBudget.rejectionReason(format, sampleRate, channels, packetsPerSecond)
+        reason?.let { L.w("UsbAudioOutputProvider: skipping format, $it") }
+        return reason == null
+    }
 
     /**
      * The best integer device format to convert wide (>16-bit) PCM down to -- used for *float*
@@ -243,7 +270,12 @@ class UsbAudioOutputProvider(
      */
     private fun wideIntTargetFormat(targetChannels: Int, sampleRate: Int): UacStreamFormat? =
         allFormats
-            .filter { it.subslotSize >= 3 && targetChannels == channels && sampleRate in acceptedSampleRates(it) }
+            .filter {
+                it.subslotSize >= 3 &&
+                    targetChannels == channels &&
+                    sampleRate in acceptedSampleRates(it) &&
+                    fitsPacketBudget(it, sampleRate)
+            }
             .minByOrNull { it.subslotSize }
 
     /**

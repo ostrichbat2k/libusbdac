@@ -48,6 +48,7 @@ import org.ostrichbat2k.usbdac.streaming.IsoPacketScheduler
 import org.ostrichbat2k.usbdac.streaming.RoutingAudioSink
 import org.ostrichbat2k.usbdac.streaming.UsbAudioOutput
 import org.ostrichbat2k.usbdac.streaming.UsbAudioOutputProvider
+import org.ostrichbat2k.usbdac.streaming.UsbNativeBridgeImpl
 import org.ostrichbat2k.usbdac.streaming.UsbPipelineStats
 import android.content.BroadcastReceiver
 import android.content.Context
@@ -830,7 +831,8 @@ class UsbAudioManagerImpl(
         if (!bitPerfectWanted || !isBitPerfectCapable()) return null
         val session = activeSession ?: return null
         return DefaultAudioSink.Builder(context)
-            .setAudioOutputProvider(UsbAudioOutputProvider(this, session, usbSettings, realBitsPerSample))
+            .setAudioOutputProvider(
+                UsbAudioOutputProvider(this, session, usbSettings, realBitsPerSample, usbSpeedOf(session)))
             // Off by default in DefaultAudioSink -- without this, getFormatSupport() silently
             // rewrites every float-PCM query back down to 16-bit before UsbAudioOutputProvider
             // ever sees it, which is exactly what made every decoder's own float-vs-16-bit
@@ -845,6 +847,17 @@ class UsbAudioManagerImpl(
             .build()
             .also { sink -> updateActiveSessionState { it.copy(sink = sink) } }
     }
+
+    /**
+     * [session]'s negotiated USB speed, for [UsbAudioOutputProvider]'s packet-size check (#130).
+     * Null when it can't be read -- including when the native library isn't loaded, as in JVM
+     * unit tests -- which makes the provider skip that check rather than reject formats on a
+     * guess.
+     */
+    private fun usbSpeedOf(session: UsbAudioSession): Int? =
+        runCatching { UsbNativeBridgeImpl.getUsbSpeed(session.connection.fileDescriptor) }
+            .onFailure { L.w(it, "UsbAudioManager: couldn't read USB speed; skipping packet-size checks") }
+            .getOrNull()
 
     /**
      * Switches the DAC's active alt-setting to [format] if it isn't already, and records

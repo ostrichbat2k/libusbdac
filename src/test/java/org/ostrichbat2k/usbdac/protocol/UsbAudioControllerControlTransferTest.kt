@@ -398,4 +398,23 @@ class UsbAudioControllerControlTransferTest {
             UsbAudioController.ControlWriteOutcome.Unsupported, UsbAudioController.selectFormat(session, format))
         verify(exactly = 0) { session.connection.setInterface(any()) }
     }
+
+    @Test
+    fun `selectZeroBandwidth selects the streaming interface's alt 0`() {
+        val altZero = mockk<UsbInterface>(relaxed = true)
+        val session = fakeSession().copy(streamingAltSettings = mapOf(0 to altZero))
+        every { session.connection.setInterface(altZero) } returns true
+
+        assertEquals(UsbAudioController.ControlWriteOutcome.Success, UsbAudioController.selectZeroBandwidth(session))
+        verify(exactly = 1) { session.connection.setInterface(altZero) }
+    }
+
+    @Test
+    fun `selectZeroBandwidth fails without touching the connection when alt 0 is unknown`() {
+        val session = fakeSession()
+
+        assertEquals(
+            UsbAudioController.ControlWriteOutcome.Unsupported, UsbAudioController.selectZeroBandwidth(session))
+        verify(exactly = 0) { session.connection.setInterface(any()) }
+    }
 }

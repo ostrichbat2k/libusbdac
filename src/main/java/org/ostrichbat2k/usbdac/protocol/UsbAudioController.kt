@@ -857,6 +857,21 @@ internal object UsbAudioController {
         }
     }
 
+    /**
+     * Switches the streaming interface to alternate setting 0, the zero-bandwidth setting with no
+     * streaming endpoint, so the clock can be changed with nothing streaming (#122).
+     */
+    fun selectZeroBandwidth(session: UsbAudioSession): ControlWriteOutcome {
+        val iface = session.streamingAltSettings[0]
+        if (iface == null) {
+            L.w("No interface for alternate setting 0")
+            return ControlWriteOutcome.Unsupported
+        }
+        val ok = session.connection.setInterface(iface)
+        L.i("setInterface(alt=0): $ok")
+        return if (ok) ControlWriteOutcome.Success else ControlWriteOutcome.TransferFailed
+    }
+
     /** Switches the streaming interface to the alternate setting for [format]. */
     fun selectFormat(session: UsbAudioSession, format: UacStreamFormat): ControlWriteOutcome {
         val iface = session.streamingAltSettings[format.alternateSetting]

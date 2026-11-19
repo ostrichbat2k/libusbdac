@@ -286,7 +286,7 @@ class UsbAudioOutputVolumeRestoreTest {
      * Regression coverage for #68: [UsbAudioOutput.stopStreamingThread] must not free the native
      * isochronous stream while the streaming thread might still be inside a blocked native call
      * using it (a confirmed, reproduced use-after-free risk when `cancelIso()` fails to unblock a
-     * wedged `reapIso()` in time -- see [org.ostrichbat2k.usbdac.UsbAudioTuning.
+     * wedged `reapIsoAny()` in time -- see [org.ostrichbat2k.usbdac.UsbAudioTuning.
      * STREAM_THREAD_JOIN_TIMEOUT_MS]'s doc comment). [UsbAudioOutput.isStreamThreadStuck] is the
      * exact decision [stopStreamingThread] gates on; tested directly, not through
      * `stopStreamingThread()` itself, since any real path through that function where

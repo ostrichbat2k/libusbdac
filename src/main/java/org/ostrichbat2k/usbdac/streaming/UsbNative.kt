@@ -60,13 +60,16 @@ object UsbNative {
     external fun submitIso(handle: Long, slot: Int, data: ByteArray, packetLengths: IntArray): Boolean
 
     /**
-     * Blocks until a submitted URB completes; returns its slot index, or one of
-     * [REAP_ERROR_TRANSIENT]/[REAP_ERROR_FATAL] on failure.
+     * Blocks until any URB submitted on [handle]'s fd completes and returns its owning stream's
+     * handle and slot packed into one value (unpack with [UsbNativeBridge.reapedHandle]/
+     * [UsbNativeBridge.reapedSlot]) -- possibly a different stream than [handle], since the
+     * kernel keeps one completion list per fd, not per endpoint (#139). Returns one of
+     * [REAP_ERROR_TRANSIENT]/[REAP_ERROR_FATAL] on failure. Exactly one thread may reap per fd.
      */
-    external fun reapIso(handle: Long): Int
+    external fun reapIsoAny(handle: Long): Long
 
     /**
-     * The wait was interrupted (EINTR) -- nothing is actually wrong, call [reapIso] again. Mirrors
+     * The wait was interrupted (EINTR) -- nothing is actually wrong, call [reapIsoAny] again. Mirrors
      * usb_native.cpp's `kReapErrorTransient` exactly (keep in sync if that ever changes).
      */
     const val REAP_ERROR_TRANSIENT = -1
@@ -83,20 +86,20 @@ object UsbNative {
      * Cumulative since [openIsoStream], as `[badPacketCount, shortBytesCount]` --
      * processReapedUrb's own per-URB packet scan (usb_native.cpp), surfaced beyond just a logcat
      * line (#78). `[0, 0]` for an unknown/already-closed handle. Safe to call from any thread --
-     * backed by native atomics, since the streaming thread writes these on every [reapIso] call.
+     * backed by native atomics, since the streaming thread writes these on every [reapIsoAny] call.
      */
     external fun getPacketErrorStats(handle: Long): LongArray
 
     /**
-     * Cancels all outstanding URBs, unblocking any in-flight [reapIso] call on another thread.
-     * Safe to call concurrently with [reapIso]/[submitIso]; always call this and join() the
+     * Cancels all outstanding URBs, unblocking any in-flight [reapIsoAny] call on another thread.
+     * Safe to call concurrently with [reapIsoAny]/[submitIso]; always call this and join() the
      * thread using the stream *before* [closeIsoStream], not after.
      */
     external fun cancelIso(handle: Long)
 
     /**
      * Drains remaining completions and frees the stream. Only safe once no other thread is still
-     * calling [reapIso]/[submitIso] on this handle (confirmed via [cancelIso] + Thread.join()).
+     * calling [reapIsoAny]/[submitIso] on this handle (confirmed via [cancelIso] + Thread.join()).
      */
     external fun closeIsoStream(handle: Long)
 
@@ -104,7 +107,7 @@ object UsbNative {
      * Submits URB [slot] as an IN (read) transfer of the given [packetLengths] -- the feedback-
      * endpoint counterpart of [submitIso] (#25): no data copied in (the buffer is zeroed instead,
      * since this is a read, not a write), everything else identical (lookup, slot bounds,
-     * overflow-checked length sum). [reapIso]/[cancelIso]/[closeIsoStream] work unchanged on a
+     * overflow-checked length sum). [reapIsoAny]/[cancelIso]/[closeIsoStream] work unchanged on a
      * handle opened for reading -- only submission direction differs.
      */
     external fun submitIsoRead(handle: Long, slot: Int, packetLengths: IntArray): Boolean
@@ -112,9 +115,9 @@ object UsbNative {
     /**
      * Copies up to [dst]'s size of bytes from URB [slot]'s completed transfer into [dst]. Returns
      * the number of bytes actually copied (the URB's own `actual_length`, capped to [dst].size),
-     * or -1 on an invalid handle/slot. Only meaningful to call right after [reapIso] returns this
+     * or -1 on an invalid handle/slot. Only meaningful to call right after [reapIsoAny] returns this
      * [slot] on a handle opened via [openIsoStream] for a feedback (IN) endpoint -- the main audio
-     * data path never reads URB buffer contents back, only [reapIso]'s own success/failure.
+     * data path never reads URB buffer contents back, only [reapIsoAny]'s own success/failure.
      */
     external fun readIsoSlotData(handle: Long, slot: Int, dst: ByteArray): Int
 }

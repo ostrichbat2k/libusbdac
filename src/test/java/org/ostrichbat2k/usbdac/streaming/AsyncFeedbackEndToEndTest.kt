@@ -60,6 +60,9 @@ class AsyncFeedbackEndToEndTest {
         const val MAX_RATE_ERROR_PPM = 50.0
         // One packet's rounding at either end of the window, with margin.
         const val MAX_BUFFER_DRIFT_FRAMES = 8.0
+        const val SHARED_QUEUE_MEASURE_MS = 1000L
+        // The feedback endpoint completes about once a millisecond; a third of that is plenty.
+        const val MIN_FEEDBACK_READS = 300
     }
 
     private val topology =
@@ -192,6 +195,61 @@ class AsyncFeedbackEndToEndTest {
     @Test
     fun `device clock exactly nominal stays exact`() =
         assertHostFollowsDeviceClock(Case(USB_SPEED_HIGH, 1, 44100, clockOffset = 1.0))
+
+    // ---- #139: both streams share one fd, and so one completion list ----
+
+    @Test
+    fun `main and feedback URBs reaped from one shared completion list stay with their own stream`() {
+        val dac =
+            AsyncDacSimulator(
+                usbSpeed = USB_SPEED_HIGH,
+                dataBInterval = 1,
+                deviceRateHz = 48000 * DEVICE_CLOCK_OFFSET,
+                frameBytes = CHANNELS * SUBSLOT_BYTES,
+                feedbackWire = FeedbackWire.SPEC,
+                feedbackEndpointAddress = FEEDBACK_ENDPOINT,
+            )
+        val format =
+            UacStreamFormat(
+                alternateSetting = 1,
+                bitResolution = 16,
+                subslotSize = SUBSLOT_BYTES,
+                clusterDescriptorId = -1,
+                endpointAddress = 0x01,
+                maxPacketSize = 1024,
+                syncType = SyncType.ASYNC,
+                feedbackEndpoint = UacFeedbackEndpoint(FEEDBACK_ENDPOINT, 4, bInterval = 4),
+            )
+        val engine =
+            UsbIsoStreamEngine(
+                session = session,
+                format = format,
+                channels = CHANNELS,
+                sampleRateHz = 48000,
+                ringBuffer = PcmRingBuffer(1 shl 16),
+                paused = { true },
+                reportPipelineStats = {},
+                nativeBridge = dac,
+            )
+        engine.start()
+        var minMainInFlight = Int.MAX_VALUE
+        try {
+            Thread.sleep(SETTLE_MS)
+            val until = System.currentTimeMillis() + SHARED_QUEUE_MEASURE_MS
+            while (System.currentTimeMillis() < until) {
+                minMainInFlight = minOf(minMainInFlight, dac.mainInFlight())
+                Thread.sleep(1)
+            }
+        } finally {
+            engine.stop()
+        }
+        assertEquals(0, dac.doubleSubmissions.get(), "a slot was resubmitted while its URB was still in flight")
+        // Between one reap and its resubmit a single slot is briefly out; never more than that.
+        assertTrue(
+            minMainInFlight >= engine.numUrbs - 1,
+            "main URBs dropped out of rotation: as few as $minMainInFlight of ${engine.numUrbs} in flight")
+        assertTrue(dac.feedbackReads.get() > MIN_FEEDBACK_READS, "feedback serviced only ${dac.feedbackReads.get()}x")
+    }
 
     // ---- #124: feedback as a cross-check on the clock change ----
 

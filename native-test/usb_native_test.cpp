@@ -37,7 +37,7 @@ jlong Java_org_ostrichbat2k_usbdac_streaming_UsbNative_openIsoStream(
         jint numUrbs);
 jboolean Java_org_ostrichbat2k_usbdac_streaming_UsbNative_submitIso(
         JNIEnv*, jobject, jlong handle, jint slot, jbyteArray data, jintArray packetLengths);
-jint Java_org_ostrichbat2k_usbdac_streaming_UsbNative_reapIso(JNIEnv*, jobject, jlong handle);
+jlong Java_org_ostrichbat2k_usbdac_streaming_UsbNative_reapIsoAny(JNIEnv*, jobject, jlong handle);
 void Java_org_ostrichbat2k_usbdac_streaming_UsbNative_cancelIso(JNIEnv*, jobject, jlong handle);
 void Java_org_ostrichbat2k_usbdac_streaming_UsbNative_closeIsoStream(JNIEnv*, jobject, jlong handle);
 }
@@ -48,6 +48,9 @@ void Java_org_ostrichbat2k_usbdac_streaming_UsbNative_closeIsoStream(JNIEnv*, jo
 int processReapedUrb(const struct usbdevfs_urb* reaped, int packetsPerUrb, int numUrbs,
                       int* badPacketsOut = nullptr, int64_t* shortBytesOut = nullptr);
 int reapErrorCodeForErrno(int err);
+int64_t reapedUrbOwnerHandle(int fd, const struct usbdevfs_urb* reaped);
+const struct usbdevfs_urb* urbForTesting(jlong handle, int slot);
+jlong packReapResult(int64_t handle, int slot);
 
 namespace {
 
@@ -175,7 +178,7 @@ TEST(HandleTable, CancelUnknownHandleIsASafeNoOp) {
 }
 
 TEST(HandleTable, ReapUnknownHandleReturnsFatal) {
-    EXPECT_EQ(Java_org_ostrichbat2k_usbdac_streaming_UsbNative_reapIso(nullptr, nullptr, 0x4242),
+    EXPECT_EQ(Java_org_ostrichbat2k_usbdac_streaming_UsbNative_reapIsoAny(nullptr, nullptr, 0x4242),
               kReapErrorFatal);
 }
 
@@ -208,7 +211,7 @@ TEST_F(DummyFd, ReapAfterCloseReturnsFatal) {
     jlong handle = openValidStream(fd_);
     ASSERT_NE(handle, 0);
     Java_org_ostrichbat2k_usbdac_streaming_UsbNative_closeIsoStream(nullptr, nullptr, handle);
-    EXPECT_EQ(Java_org_ostrichbat2k_usbdac_streaming_UsbNative_reapIso(nullptr, nullptr, handle),
+    EXPECT_EQ(Java_org_ostrichbat2k_usbdac_streaming_UsbNative_reapIsoAny(nullptr, nullptr, handle),
               kReapErrorFatal);
 }
 
@@ -341,7 +344,7 @@ TEST_F(SubmitIso, WellFormedInputReachesTheIoctlCall) {
     EXPECT_EQ(submitAndExpectLog(0, &data, &lens, "SUBMITURB failed"), JNI_FALSE);
 }
 
-// --- reapIso itself: the only two branches reachable without a real completed URB (the rest of
+// --- reapIsoAny itself: the only two branches reachable without a real completed URB (the rest of
 // its logic -- the packet scan -- is covered directly below via processReapedUrb). ---
 
 TEST_F(DummyFd, ReapOnFreshStreamReachesTheIoctlCallAndFails) {
@@ -350,12 +353,74 @@ TEST_F(DummyFd, ReapOnFreshStreamReachesTheIoctlCallAndFails) {
     ASSERT_NE(handle, 0);
     // /dev/null's ioctl() always fails with ENOTTY, never EINTR, so this always takes the fatal
     // branch -- see ReapErrorCodeForErrno below for the EINTR-specific case.
-    EXPECT_EQ(Java_org_ostrichbat2k_usbdac_streaming_UsbNative_reapIso(nullptr, nullptr, handle),
+    EXPECT_EQ(Java_org_ostrichbat2k_usbdac_streaming_UsbNative_reapIsoAny(nullptr, nullptr, handle),
               kReapErrorFatal);
     Java_org_ostrichbat2k_usbdac_streaming_UsbNative_closeIsoStream(nullptr, nullptr, handle);
 }
 
-// --- reapErrorCodeForErrno: the errno -> reapIso() return code mapping, extracted so it's
+// --- reapedUrbOwnerHandle: which stream on a shared fd a reaped URB belongs to (#139). The main
+// and feedback streams share one fd and both number their slots from 0, so the URB's address is
+// the only thing that tells them apart. ---
+
+TEST_F(DummyFd, ReapedUrbOwnerIsFoundByAddressAmongStreamsSharingTheFd) {
+    ASSERT_GE(fd_, 0);
+    jlong main = openValidStream(fd_, 8, 192, /*numUrbs=*/4);
+    jlong feedback = openValidStream(fd_, 1, 4, /*numUrbs=*/2);
+    ASSERT_NE(main, 0);
+    ASSERT_NE(feedback, 0);
+
+    for (int slot = 0; slot < 2; slot++) {
+        // Same slot number on both streams -- usercontext alone would be ambiguous.
+        EXPECT_EQ(reapedUrbOwnerHandle(fd_, urbForTesting(main, slot)), main);
+        EXPECT_EQ(reapedUrbOwnerHandle(fd_, urbForTesting(feedback, slot)), feedback);
+    }
+    EXPECT_EQ(reapedUrbOwnerHandle(fd_, urbForTesting(main, 3)), main);
+
+    Java_org_ostrichbat2k_usbdac_streaming_UsbNative_closeIsoStream(nullptr, nullptr, main);
+    Java_org_ostrichbat2k_usbdac_streaming_UsbNative_closeIsoStream(nullptr, nullptr, feedback);
+}
+
+TEST_F(DummyFd, ReapedUrbOwnerIgnoresStreamsOnOtherFds) {
+    ASSERT_GE(fd_, 0);
+    jlong handle = openValidStream(fd_);
+    ASSERT_NE(handle, 0);
+    EXPECT_EQ(reapedUrbOwnerHandle(fd_ + 1000, urbForTesting(handle, 0)), 0);
+    Java_org_ostrichbat2k_usbdac_streaming_UsbNative_closeIsoStream(nullptr, nullptr, handle);
+}
+
+TEST_F(DummyFd, ReapedUrbOwnerIsNoneForAnAddressNoStreamOwns) {
+    ASSERT_GE(fd_, 0);
+    jlong handle = openValidStream(fd_);
+    ASSERT_NE(handle, 0);
+    struct usbdevfs_urb stray {};
+    EXPECT_EQ(reapedUrbOwnerHandle(fd_, &stray), 0);
+    Java_org_ostrichbat2k_usbdac_streaming_UsbNative_closeIsoStream(nullptr, nullptr, handle);
+}
+
+TEST_F(DummyFd, ReapedUrbOwnerIsNoneOnceItsStreamIsClosed) {
+    ASSERT_GE(fd_, 0);
+    jlong closing = openValidStream(fd_);
+    jlong staying = openValidStream(fd_);
+    ASSERT_NE(closing, 0);
+    ASSERT_NE(staying, 0);
+    const struct usbdevfs_urb* urb = urbForTesting(closing, 0);
+    Java_org_ostrichbat2k_usbdac_streaming_UsbNative_closeIsoStream(nullptr, nullptr, closing);
+    // Only the address is compared, never dereferenced -- safe even though it was just freed. No
+    // allocation happens in between, so `staying` cannot have been given that address.
+    EXPECT_EQ(reapedUrbOwnerHandle(fd_, urb), 0);
+    Java_org_ostrichbat2k_usbdac_streaming_UsbNative_closeIsoStream(nullptr, nullptr, staying);
+}
+
+TEST(PackReapResult, HandleAndSlotRoundTripAndNeverLookLikeAnError) {
+    jlong packed = packReapResult(/*handle=*/7, /*slot=*/3);
+    EXPECT_GE(packed, 0);
+    EXPECT_EQ(packed >> 16, 7);
+    EXPECT_EQ(packed & 0xFFFF, 3);
+    // The smallest real result (first handle, slot 0) is still well clear of both error codes.
+    EXPECT_GT(packReapResult(1, 0), 0);
+}
+
+// --- reapErrorCodeForErrno: the errno -> reapIsoAny() return code mapping, extracted so it's
 // testable without a real interrupted syscall (see #60). ---
 
 TEST(ReapErrorCodeForErrno, EintrIsTransient) {
@@ -373,7 +438,7 @@ TEST(ReapErrorCodeForErrno, UnrecognizedErrnoIsFatalNotRetriedForever) {
     EXPECT_EQ(reapErrorCodeForErrno(EBADF), kReapErrorFatal);
 }
 
-// --- processReapedUrb: reapIso's packet-scan logic, extracted so it's testable with a
+// --- processReapedUrb: reapIsoAny's packet-scan logic, extracted so it's testable with a
 // hand-built urb instead of a real completed ioctl(). usbdevfs_urb ends in a flexible array
 // member (iso_frame_desc[]) -- same allocate-raw-bytes-then-placement pattern usb_native.cpp
 // itself uses in openIsoStream, just on the stack/heap here instead of via calloc. ---

@@ -33,7 +33,7 @@ import kotlin.math.abs
  * (44.1 kHz asked, 48 kHz or a power-of-two multiple running, or the reverse) and other standard
  * rates within the octave. The reported rate is the one inside that octave.
  *
- * Used only from the feedback thread.
+ * Used only from the streaming thread (#139).
  */
 internal class FeedbackRateCrossCheck(private val requestedRateHz: Int, private val packetsPerSecond: Int) {
     companion object {

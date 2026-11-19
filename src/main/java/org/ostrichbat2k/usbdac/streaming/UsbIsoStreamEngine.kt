@@ -25,8 +25,9 @@ import org.ostrichbat2k.usbdac.protocol.UsbAudioSession
 import timber.log.Timber as L
 
 /**
- * Owns the native isochronous handle(s), the URB submit/reap loop(s) (main OUT stream plus the
- * optional feedback IN stream, #25), and frames-submitted/frames-completed position accounting
+ * Owns the native isochronous handle(s), the URB submit/reap loop (main OUT stream plus the
+ * optional feedback IN stream, #25, both reaped by one thread -- see [start]), and
+ * frames-submitted/frames-completed position accounting
  * -- pulled out of [UsbAudioOutput] (#73) so this, the one part of the library every serious
  * concurrency/correctness bug from two independent reviews has lived in (#68, #59, #60, #70,
  * #71), is reachable by a test at all: [UsbAudioOutput] itself still can't be driven through
@@ -51,16 +52,15 @@ internal class UsbIsoStreamEngine(
     private val paused: () -> Boolean,
     private val reportPipelineStats: (UsbPipelineStats?) -> Unit,
     private val nativeBridge: UsbNativeBridge = UsbNativeBridgeImpl,
-    // Called exactly once, from the main streaming thread, the instant the main loop itself
-    // discovers the device is gone (REAP_ERROR_FATAL) -- strictly earlier than any caller's own
-    // isStalled() polling could notice. Deliberately not wired to the feedback loop's own fatal
-    // branch (see startFeedbackThreadIfApplicable's doc comment: a feedback failure only means
-    // lost rate-correction, not device loss) -- see UsbAudioManager.notifyStreamFatalError's own
-    // doc comment for what a caller does with this.
+    // Called exactly once, from the streaming thread, the instant it discovers the device is gone
+    // (REAP_ERROR_FATAL) -- strictly earlier than any caller's own isStalled() polling could
+    // notice. Not called for a lost feedback URB (see FeedbackStream: that only means lost rate
+    // correction, not device loss) -- see UsbAudioManager.notifyStreamFatalError's own doc
+    // comment for what a caller does with this.
     private val onFatalStreamError: () -> Unit = {},
     // See UrbQueueShape; the default everywhere but the #123 queue-depth experiment.
     private val urbQueue: UrbQueueShape = UrbQueueShape.DEFAULT,
-    // Called once, from the feedback thread, when an Asynchronous device's feedback keeps
+    // Called once, from the streaming thread, when an Asynchronous device's feedback keeps
     // decoding to a different standard rate than the one requested (#124) -- see
     // FeedbackRateCrossCheck. Detection only.
     private val onFeedbackRateMismatch: (requestedHz: Int, observedHz: Int) -> Unit = { _, _ -> },
@@ -99,16 +99,13 @@ internal class UsbIsoStreamEngine(
     @Volatile var framesOutput: Long = 0L
         private set
 
-    // Feedback-clocked async support (#25) -- see UacFeedbackEndpoint's own doc comment. Stay at
-    // their zero/null/false defaults whenever this format isn't SyncType.ASYNC with a feedback
-    // endpoint, or when opening the feedback stream itself failed; a feedback failure never
-    // affects the main fields above -- see stop()'s mirrored-but-independent shutdown of these.
+    // Feedback-clocked async support (#25) -- see UacFeedbackEndpoint's own doc comment. Stays 0
+    // whenever this format isn't SyncType.ASYNC with a feedback endpoint, or when opening the
+    // feedback stream itself failed; a feedback failure never affects the main fields above.
+    // Reaped by the streaming thread itself, never a thread of its own (#139) -- see start().
     private var feedbackHandle = 0L
-    private var feedbackThread: Thread? = null
 
-    @Volatile private var feedbackStreaming = false
-
-    // Set in start() before the feedback thread starts; only that thread uses it (#124).
+    // Set in start() before the streaming thread starts; only that thread uses it (#124).
     private var feedbackCrossCheck: FeedbackRateCrossCheck? = null
 
     // Only ever read/written from the single native streaming thread -- not actually volatile for
@@ -126,7 +123,7 @@ internal class UsbIsoStreamEngine(
     @Volatile private var fadeInPending = false
 
     /**
-     * URBs whose completion [UsbNativeBridge.reapIso] has confirmed since [start]. A caller
+     * Main-stream URBs whose completion [UsbNativeBridge.reapIsoAny] has confirmed since [start]. A caller
      * waiting for the stream to be established (#127) watches this go past
      * [numUrbs].
      */
@@ -146,9 +143,16 @@ internal class UsbIsoStreamEngine(
     }
 
     /**
-     * Opens the native stream and starts the streaming thread. With [holdSilence] it starts in
+     * Opens the native stream(s) and starts the streaming thread. With [holdSilence] it starts in
      * pre-roll (#127): silence, not credited to position and not taken from the ring buffer,
      * until [openSilenceGate].
+     *
+     * The main and feedback streams share one fd (Android hands out one per device connection),
+     * and the kernel keeps one completion list per fd, not per endpoint: `REAPURB` returns the
+     * next finished URB whichever stream submitted it. Two threads reaping the same fd therefore
+     * take each other's URBs -- the feedback thread this used to have lost main URBs from the
+     * rotation, and the main loop resubmitted slots still in flight (#139). So the one streaming
+     * thread reaps everything and hands each completion to the stream that owns it.
      */
     fun start(holdSilence: Boolean = false) {
         if (streaming) return
@@ -228,7 +232,7 @@ internal class UsbIsoStreamEngine(
         val maxBytesPerPacket = maxSamplesPerPacket * frameBytes
         val urbBuffer = ByteArray(packetsPerUrb * maxBytesPerPacket)
         val packetLengths = IntArray(packetsPerUrb)
-        // What's currently loaded into each URB slot, for framesOutput to credit once reapIso()
+        // What's currently loaded into each URB slot, for framesOutput to credit once reapIsoAny()
         // confirms *that* slot's URB actually completed -- not when it was merely submitted (#71).
         // Reused across this stream's whole lifetime the same way urbBuffer/packetLengths are:
         // indexed by slot, overwritten every time that slot is resubmitted.
@@ -347,6 +351,10 @@ internal class UsbIsoStreamEngine(
             return total
         }
 
+        feedbackCrossCheck = FeedbackRateCrossCheck(sampleRateHz, packetsPerSecond)
+        val feedbackDecoder = FeedbackDecoder(sampleRateHz, packetsPerSecond, maxSamplesPerPacket)
+        val feedback = openFeedbackStreamIfApplicable(fd, scheduler, feedbackDecoder)
+
         streaming = true
         lastUrbSubmittedAtMs = System.currentTimeMillis()
         streamThread =
@@ -382,24 +390,25 @@ internal class UsbIsoStreamEngine(
                                 "UsbIsoStreamEngine: initial submitIso failed twice for slot $slot " +
                                     "-- this URB stays unsubmitted")
                         } else {
-                            // Credited once reapIso() confirms this slot's URB actually
+                            // Credited once reapIsoAny() confirms this slot's URB actually
                             // completed, in the steady-state loop below -- not now (#71). Real
                             // audio unless this is pre-roll silence (#127).
                             slotFrames[slot] = (total / frameBytes).toLong()
                             slotCreditable[slot] = lastUrbWasAudio
                         }
                     }
+                    feedback?.submitAll()
 
                     // USBDEVFS_REAPURB is supposed to block until a submitted URB has genuinely
                     // completed in real USB bus time, so correct real-time pacing should come for
                     // free from the kernel/host controller blocking on it. Confirmed, on a real
-                    // device, that assumption doesn't hold on its own: reapIso() was observed
+                    // device, that assumption doesn't hold on its own: reapIsoAny() was observed
                     // completing URBs roughly 7x faster than real time allows (now understood: on
                     // this high-speed device, the true packet duration is 125us, and this
                     // mismeasurement -- taken against an assumed 1ms -- was actually consistent
                     // with that, within measurement noise, rather than a genuinely unexplained
                     // host-controller quirk). Pacing explicitly against wall-clock time here,
-                    // rather than trusting reapIso()'s own timing, is still the right approach
+                    // rather than trusting reapIsoAny()'s own timing, is still the right approach
                     // regardless -- it just needs packetDurationNs to be correct for this
                     // device's real negotiated speed (see above) to actually pace against the
                     // real rate instead of papering over the symptom with an equally-wrong delay.
@@ -410,13 +419,13 @@ internal class UsbIsoStreamEngine(
                     var submitted = 0
                     var reapErrors = 0
                     while (streaming) {
-                        val slot = nativeBridge.reapIso(handle)
+                        val reaped = nativeBridge.reapIsoAny(handle)
                         if (!streaming) break
-                        if (slot < 0) {
+                        if (reaped < 0) {
                             reapErrors++
-                            if (slot == UsbNativeBridge.REAP_ERROR_FATAL) {
+                            if (reaped == UsbNativeBridge.REAP_ERROR_FATAL.toLong()) {
                                 // The stream cannot produce anything more (device gone, most
-                                // likely) -- see #60: looping back to reapIso() here is exactly
+                                // likely) -- see #60: looping back to reapIsoAny() here is exactly
                                 // the busy-spin this check exists to stop. isStalled() (already
                                 // polled by callers, e.g. play()'s retry path) still picks this up
                                 // on its own once lastUrbSubmittedAtMs stops advancing, but #51
@@ -424,14 +433,28 @@ internal class UsbIsoStreamEngine(
                                 // repeatedly (each rebuild wedging again) before that poll ever
                                 // fires -- onFatalStreamError lets the caller react right now
                                 // instead of waiting for it.
-                                L.e("UsbIsoStreamEngine: reapIso() reported a fatal error -- stopping the streaming thread")
+                                L.e(
+                                    "UsbIsoStreamEngine: reapIsoAny() reported a fatal error -- " +
+                                        "stopping the streaming thread")
                                 onFatalStreamError()
                                 break
                             }
                             continue
                         }
+                        val slot = UsbNativeBridge.reapedSlot(reaped)
+                        val owner = UsbNativeBridge.reapedHandle(reaped)
+                        if (owner != handle) {
+                            // Not one of ours: a feedback URB, serviced inline (#139). No pacing
+                            // wait -- only main URBs advance the audio schedule.
+                            if (feedback != null && owner == feedback.handle) {
+                                feedback.onReaped(slot)
+                            } else {
+                                L.w("UsbIsoStreamEngine: reaped a URB for unknown handle $owner -- ignored")
+                            }
+                            continue
+                        }
 
-                        // This slot's URB has now genuinely completed (reapIso() returning it is
+                        // This slot's URB has now genuinely completed (reapIsoAny() returning it is
                         // exactly that confirmation) -- credit framesOutput for whatever was
                         // loaded into it back when IT was submitted (prefill above, or a previous
                         // trip through this loop), not for the new content built below (#71:
@@ -452,15 +475,15 @@ internal class UsbIsoStreamEngine(
 
                         val total = buildUrb()
                         // Retry once immediately before giving up on this slot -- see #59: unlike
-                        // every other slot, which keeps cycling through reapIso() even after a
+                        // every other slot, which keeps cycling through reapIsoAny() even after a
                         // failed resubmit (so a future reap just finds it still full of stale
                         // data), a slot that's never resubmitted here never comes back through
-                        // reapIso() at all, permanently shrinking the rotation by one.
+                        // reapIsoAny() at all, permanently shrinking the rotation by one.
                         val resubmitted =
                             nativeBridge.submitIso(handle, slot, urbBuffer, packetLengths) ||
                                 nativeBridge.submitIso(handle, slot, urbBuffer, packetLengths)
                         if (!resubmitted) {
-                            // Lost for good now -- same reasoning as the fatal reapIso() branch
+                            // Lost for good now -- same reasoning as the fatal reapIsoAny() branch
                             // above: stop rather than keep draining the ring buffer into a
                             // shrinking, eventually-empty set of URB slots.
                             L.e(
@@ -472,7 +495,7 @@ internal class UsbIsoStreamEngine(
                         margin.record(System.nanoTime() - reapedAtNs, waitNs.coerceAtLeast(0L))
                         lastUrbSubmittedAtMs = System.currentTimeMillis()
                         // Recorded now, credited above next time this slot comes back around
-                        // through reapIso() confirming it completed. Not creditable while paused
+                        // through reapIsoAny() confirming it completed. Not creditable while paused
                         // or in pre-roll (#127):
                         // this is synthetic silence standing in for the USB clock's unstoppable
                         // schedule, not real consumed track audio -- see UsbAudioOutput.paused's
@@ -523,29 +546,25 @@ internal class UsbIsoStreamEngine(
                     start()
                 }
 
-        val feedbackDecoder = FeedbackDecoder(sampleRateHz, packetsPerSecond, maxSamplesPerPacket)
-        feedbackCrossCheck = FeedbackRateCrossCheck(sampleRateHz, packetsPerSecond)
-        startFeedbackThreadIfApplicable(fd, scheduler, feedbackDecoder)
     }
 
     /**
-     * Opens and starts the feedback-endpoint reader thread (#25) when [format] is
-     * [SyncType.ASYNC] and declares a [org.ostrichbat2k.usbdac.protocol.UacFeedbackEndpoint] -- a
-     * second, independent blocking native loop on a second handle/fd pair, same
-     * [UsbNativeBridge.openIsoStream]/[UsbNativeBridge.reapIso] pattern [start]'s own main loop
-     * already uses, just reading instead of writing. [scheduler] is the exact same instance the
-     * main loop paces packets against -- captured here by closure, not promoted to an instance
-     * field, since both threads are started from within this one call to [start] and never need
-     * to reach it from anywhere else.
+     * Opens the feedback-endpoint stream (#25) when [format] is [SyncType.ASYNC] and declares a
+     * [org.ostrichbat2k.usbdac.protocol.UacFeedbackEndpoint], or returns null. It has no thread of
+     * its own: the streaming thread submits and reaps its URBs alongside the main ones (#139).
+     * [scheduler] is the exact same instance the main loop paces packets against.
      *
-     * Every failure here (open failed, fatal reap error) is logged and leaves this thread/handle
-     * stopped, but never touches [streaming]/[isoHandle]/the main loop -- a feedback failure
-     * means the scheduler stops getting corrected and stays at whatever rate was last set, not
-     * that playback itself is at risk.
+     * A failure here is logged and leaves the main stream untouched -- without feedback the
+     * scheduler stays at the nominal rate, which is no worse than a device without a feedback
+     * endpoint.
      */
-    private fun startFeedbackThreadIfApplicable(fd: Int, scheduler: IsoPacketScheduler, decoder: FeedbackDecoder) {
+    private fun openFeedbackStreamIfApplicable(
+        fd: Int,
+        scheduler: IsoPacketScheduler,
+        decoder: FeedbackDecoder,
+    ): FeedbackStream? {
         val feedback = format.feedbackEndpoint
-        if (format.syncType != SyncType.ASYNC || feedback == null) return
+        if (format.syncType != SyncType.ASYNC || feedback == null) return null
 
         val handle =
             nativeBridge.openIsoStream(
@@ -556,72 +575,55 @@ internal class UsbIsoStreamEngine(
                 UsbAudioTuning.FEEDBACK_NUM_URBS)
         if (handle == 0L) {
             L.w("UsbIsoStreamEngine: failed to open feedback iso stream -- continuing without rate correction")
-            return
+        } else {
+            L.i("UsbIsoStreamEngine: opened feedback iso stream endpoint=${feedback.address} handle=$handle")
+            feedbackHandle = handle
         }
-        L.i("UsbIsoStreamEngine: opened feedback iso stream endpoint=${feedback.address} handle=$handle")
-        feedbackHandle = handle
-        feedbackStreaming = true
-
-        feedbackThread =
-            Thread { runFeedbackLoop(handle, feedback.maxPacketSize, scheduler, decoder) }
-                .apply {
-                    isDaemon = true
-                    name = "UsbAudioOutput-feedback"
-                    start()
-                }
+        return if (handle == 0L) null else FeedbackStream(handle, feedback.maxPacketSize, scheduler, decoder)
     }
 
     /**
-     * The feedback thread's body, split out of [startFeedbackThreadIfApplicable] purely to keep
-     * that function's own cyclomatic complexity within detekt's threshold -- behaves identically
-     * either way, since [handle]/[maxPacketSize]/[scheduler]/[decoder] are exactly what the
-     * closure captured before this split.
+     * The feedback IN stream's URB rotation, driven entirely from the streaming thread (#139):
+     * [submitAll] once after the main prefill, then [onReaped] for every feedback completion the
+     * main loop reaps. Its buffers are allocated once here, never per packet (#121).
      */
-    private fun runFeedbackLoop(
-        handle: Long,
+    private inner class FeedbackStream(
+        val handle: Long,
         maxPacketSize: Int,
-        scheduler: IsoPacketScheduler,
-        decoder: FeedbackDecoder,
+        private val scheduler: IsoPacketScheduler,
+        private val decoder: FeedbackDecoder,
     ) {
-        val packetLengths = IntArray(UsbAudioTuning.FEEDBACK_PACKETS_PER_URB) { maxPacketSize }
-        val buffer = ByteArray(maxPacketSize)
+        private val packetLengths = IntArray(UsbAudioTuning.FEEDBACK_PACKETS_PER_URB) { maxPacketSize }
+        private val buffer = ByteArray(maxPacketSize)
 
-        fun resubmit(slot: Int) {
+        fun submitAll() {
+            for (slot in 0 until UsbAudioTuning.FEEDBACK_NUM_URBS) submit(slot)
+        }
+
+        fun onReaped(slot: Int) {
+            val bytesRead = nativeBridge.readIsoSlotData(handle, slot, buffer)
+            if (bytesRead > 0) applyFeedback(buffer, bytesRead, scheduler, decoder)
+            submit(slot)
+        }
+
+        // A slot that fails twice stays out of the rotation; with none left, rate correction
+        // simply stops -- the audio keeps flowing.
+        private fun submit(slot: Int) {
             val ok =
                 nativeBridge.submitIsoRead(handle, slot, packetLengths) ||
                     nativeBridge.submitIsoRead(handle, slot, packetLengths)
             if (!ok) {
-                L.w("UsbIsoStreamEngine: feedback submitIsoRead failed twice for slot $slot -- this URB stays unsubmitted")
+                L.w(
+                    "UsbIsoStreamEngine: feedback submitIsoRead failed twice for slot $slot -- " +
+                        "this URB stays unsubmitted")
             }
         }
-
-        setUrgentAudioPriority()
-        L.i("UsbIsoStreamEngine: feedback thread starting")
-        for (slot in 0 until UsbAudioTuning.FEEDBACK_NUM_URBS) resubmit(slot)
-
-        while (feedbackStreaming) {
-            val slot = nativeBridge.reapIso(handle)
-            if (!feedbackStreaming) break
-            if (slot < 0) {
-                if (slot == UsbNativeBridge.REAP_ERROR_FATAL) {
-                    L.e(
-                        "UsbIsoStreamEngine: feedback reapIso() reported a fatal error -- stopping " +
-                            "the feedback thread only")
-                    break
-                }
-                continue
-            }
-            val bytesRead = nativeBridge.readIsoSlotData(handle, slot, buffer)
-            if (bytesRead > 0) applyFeedback(buffer, bytesRead, scheduler, decoder)
-            resubmit(slot)
-        }
-        L.i("UsbIsoStreamEngine: feedback thread exiting")
     }
 
     /**
      * Decodes one feedback payload and, if it is usable, hands the rate to [scheduler]. Logs only
      * when the detected wire format changes -- once per stream on a healthy device -- so the
-     * steady state allocates nothing on the feedback thread (#121).
+     * steady state allocates nothing on the streaming thread (#121).
      */
     private fun applyFeedback(
         buffer: ByteArray,
@@ -647,61 +649,38 @@ internal class UsbIsoStreamEngine(
     }
 
     fun stop() {
-        val mainIdle = !streaming && isoHandle == 0L
-        val feedbackIdle = !feedbackStreaming && feedbackHandle == 0L
-        if (mainIdle && feedbackIdle) return
+        if (!streaming && isoHandle == 0L && feedbackHandle == 0L) return
         streaming = false
-        if (isoHandle != 0L) {
-            nativeBridge.cancelIso(isoHandle)
-        }
-        feedbackStreaming = false
-        if (feedbackHandle != 0L) {
-            nativeBridge.cancelIso(feedbackHandle)
-        }
+        // Cancelling either stream's URBs wakes the one thread reaping them both.
+        if (isoHandle != 0L) nativeBridge.cancelIso(isoHandle)
+        if (feedbackHandle != 0L) nativeBridge.cancelIso(feedbackHandle)
         streamThread?.join(UsbAudioTuning.STREAM_THREAD_JOIN_TIMEOUT_MS)
-        feedbackThread?.join(UsbAudioTuning.STREAM_THREAD_JOIN_TIMEOUT_MS)
 
-        // The feedback stream (#25) is shut down independently of the main one below: a stuck
-        // feedback thread must never block freeing the main stream, and vice versa -- the same
-        // documented-but-structurally-unfixed concurrent-close contract #76 already tracks for a
-        // single stream applies separately to each of these two, not jointly.
-        val mainStuck = isStreamThreadStuck(streamThread)
-        if (mainStuck) {
+        if (isStreamThreadStuck(streamThread)) {
             // cancelIso() failed to unblock the thread's native call within the timeout --
-            // freeing isoHandle now would race a still-running reapIso()/submitIso() over memory
-            // closeIsoStream() frees underneath it, a genuine use-after-free (confirmed,
-            // reproduced -- see UsbAudioTuning.STREAM_THREAD_JOIN_TIMEOUT_MS's doc comment).
-            // Leaking the handle and the stuck thread is the safe failure mode here: [streaming]
-            // is already false, so nothing further gets submitted from this instance, and a
-            // later call into this same function (e.g. a retried pause()/release()) will attempt
-            // the same cancel-and-join sequence again rather than being permanently blocked.
+            // freeing either handle now would race a still-running reapIsoAny()/submitIso() over
+            // memory closeIsoStream() frees underneath it, a genuine use-after-free (confirmed,
+            // reproduced -- see UsbAudioTuning.STREAM_THREAD_JOIN_TIMEOUT_MS's doc comment). The
+            // one thread uses both streams, so both stay open. Leaking the handles and the stuck
+            // thread is the safe failure mode here: [streaming] is already false, so nothing
+            // further gets submitted from this instance, and a later call into this same
+            // function (e.g. a retried pause()/release()) will attempt the same cancel-and-join
+            // sequence again rather than being permanently blocked.
             L.e(
                 "UsbIsoStreamEngine: streaming thread did not stop within " +
                     "${UsbAudioTuning.STREAM_THREAD_JOIN_TIMEOUT_MS}ms of cancelIso() -- leaving " +
-                    "the native stream open rather than risk a use-after-free")
-        } else {
-            streamThread = null
-            if (isoHandle != 0L) {
-                nativeBridge.closeIsoStream(isoHandle)
-                isoHandle = 0L
-            }
+                    "the native stream(s) open rather than risk a use-after-free")
+            return
         }
-
-        val feedbackStuck = isStreamThreadStuck(feedbackThread)
-        if (feedbackStuck) {
-            L.e(
-                "UsbIsoStreamEngine: feedback thread did not stop within " +
-                    "${UsbAudioTuning.STREAM_THREAD_JOIN_TIMEOUT_MS}ms of cancelIso() -- leaving " +
-                    "the native feedback stream open rather than risk a use-after-free")
-        } else {
-            feedbackThread = null
-            if (feedbackHandle != 0L) {
-                nativeBridge.closeIsoStream(feedbackHandle)
-                feedbackHandle = 0L
-            }
+        streamThread = null
+        if (isoHandle != 0L) {
+            nativeBridge.closeIsoStream(isoHandle)
+            isoHandle = 0L
         }
-
-        if (mainStuck) return
+        if (feedbackHandle != 0L) {
+            nativeBridge.closeIsoStream(feedbackHandle)
+            feedbackHandle = 0L
+        }
         // Stream genuinely stopped (not a transient pause-silence gap, which doesn't call this at
         // all) -- clear rather than leave the pipeline visualizer showing numbers frozen from a
         // track that isn't playing anymore.
@@ -720,7 +699,7 @@ internal class UsbIsoStreamEngine(
     private fun isStreamThreadStuck(thread: Thread?): Boolean = thread?.isAlive == true
 
     /**
-     * Raises the calling (streaming or feedback) thread to [android.os.Process.THREAD_PRIORITY_URGENT_AUDIO]
+     * Raises the calling (streaming) thread to [android.os.Process.THREAD_PRIORITY_URGENT_AUDIO]
      * -- see [start]'s own doc comment on that call for why. Caught, not left to crash the whole
      * thread: real Android never throws here for this constant, but
      * [android.os.Process.setThreadPriority] is documented as being able to (e.g. a

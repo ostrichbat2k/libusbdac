@@ -30,8 +30,8 @@ package org.ostrichbat2k.usbdac.streaming
  * full-speed device (one packet per 1 ms frame), 8000 for high speed with bInterval 1 (one per
  * 125 us microframe). See [IsoPacing.forSpeed].
  *
- * An Asynchronous device's feedback thread changes the rate while the streaming thread is asking
- * for packet sizes. A rate change replaces the step only. The phase is deliberately kept: feedback
+ * An Asynchronous device's feedback changes the rate between the packet sizes the streaming thread
+ * asks for. A rate change replaces the step only. The phase is deliberately kept: feedback
  * arrives about once per millisecond, and clearing the phase that often throws away the fraction
  * every time, which pins the delivered rate to a multiple of the update frequency no matter what
  * the device asked for (#120).
@@ -79,7 +79,7 @@ class IsoPacketScheduler(
 
     /**
      * Sets the rate from an Asynchronous device's feedback, as Q16.16 samples per packet -- the
-     * unit [FeedbackDecoder] produces. Called from the feedback thread. Keeps the phase.
+     * unit [FeedbackDecoder] produces. Called from the streaming thread (#139). Keeps the phase.
      */
     fun updateSamplesPerPacketQ16(samplesPerPacketQ16: Long) {
         synchronized(lock) { stepPerPacket = samplesPerPacketQ16 * packetsPerSecond }

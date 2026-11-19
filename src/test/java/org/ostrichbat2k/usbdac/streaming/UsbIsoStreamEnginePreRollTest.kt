@@ -104,10 +104,10 @@ class UsbIsoStreamEnginePreRollTest {
             return true
         }
 
-        override fun reapIso(handle: Long): Int {
+        override fun reapIsoAny(handle: Long): Long {
             val slot = nextSlot
             nextSlot = (nextSlot + 1) % 4
-            return slot
+            return UsbNativeBridge.reapResult(handle, slot)
         }
 
         override fun cancelIso(handle: Long) = Unit

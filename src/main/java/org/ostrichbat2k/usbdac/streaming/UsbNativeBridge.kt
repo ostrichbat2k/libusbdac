@@ -51,8 +51,8 @@ interface UsbNativeBridge {
     /** See [UsbNative.submitIso]. */
     fun submitIso(handle: Long, slot: Int, data: ByteArray, packetLengths: IntArray): Boolean
 
-    /** See [UsbNative.reapIso]. */
-    fun reapIso(handle: Long): Int
+    /** See [UsbNative.reapIsoAny]. */
+    fun reapIsoAny(handle: Long): Long
 
     /** See [UsbNative.cancelIso]. */
     fun cancelIso(handle: Long)
@@ -79,6 +79,19 @@ interface UsbNativeBridge {
 
         /** Mirrors [UsbNative.REAP_ERROR_FATAL] exactly -- see [REAP_ERROR_TRANSIENT]'s doc comment. */
         const val REAP_ERROR_FATAL = -2
+
+        /** Mirrors usb_native.cpp's `kReapSlotBits` -- keep in sync. */
+        private const val REAP_SLOT_BITS = 16
+        private const val REAP_SLOT_MASK = (1L shl REAP_SLOT_BITS) - 1
+
+        /** Packs what a successful [reapIsoAny] returns -- for fakes; the native layer packs its own. */
+        fun reapResult(handle: Long, slot: Int): Long = (handle shl REAP_SLOT_BITS) or slot.toLong()
+
+        /** The owning stream's handle from a successful (non-negative) [reapIsoAny] result. */
+        fun reapedHandle(result: Long): Long = result ushr REAP_SLOT_BITS
+
+        /** The slot from a successful (non-negative) [reapIsoAny] result. */
+        fun reapedSlot(result: Long): Int = (result and REAP_SLOT_MASK).toInt()
     }
 }
 
@@ -105,7 +118,7 @@ object UsbNativeBridgeImpl : UsbNativeBridge {
     override fun submitIso(handle: Long, slot: Int, data: ByteArray, packetLengths: IntArray) =
         UsbNative.submitIso(handle, slot, data, packetLengths)
 
-    override fun reapIso(handle: Long) = UsbNative.reapIso(handle)
+    override fun reapIsoAny(handle: Long) = UsbNative.reapIsoAny(handle)
 
     override fun cancelIso(handle: Long) = UsbNative.cancelIso(handle)
 

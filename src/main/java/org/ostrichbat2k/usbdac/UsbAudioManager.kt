@@ -139,7 +139,7 @@ interface UsbAudioManager : UsbDacPreferences.Listener {
     /**
      * Called from the streaming thread itself (#51) the instant [UsbIsoStreamEngine
      * ][org.ostrichbat2k.usbdac.streaming.UsbIsoStreamEngine] discovers the main stream can never
-     * produce anything more (a fatal `reapIso()` error -- device loss, most likely). Lets the
+     * produce anything more (a fatal `reapIsoAny()` error -- device loss, most likely). Lets the
      * session deactivate right now instead of waiting for a [UsbAudioOutputProvider
      * ][org.ostrichbat2k.usbdac.streaming.UsbAudioOutputProvider]-driven rebuild to also wedge
      * against the same dead session, or for the generic `isStalled()` poll to eventually notice.
@@ -147,7 +147,7 @@ interface UsbAudioManager : UsbDacPreferences.Listener {
     fun notifyStreamFatalError()
 
     /**
-     * Called from the feedback thread when an Asynchronous device's feedback keeps decoding to
+     * Called from the streaming thread when an Asynchronous device's feedback keeps decoding to
      * [observedHz], a different standard rate from the [requestedHz] its clock was set to (#124):
      * the clock change may not have really taken effect. Detection only; recorded in the
      * diagnostic log and [UsbControlState.feedbackRateMismatchHz]. See

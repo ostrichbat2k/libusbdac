@@ -58,8 +58,14 @@ internal class UsbIsoStreamEngine(
     // lost rate-correction, not device loss) -- see UsbAudioManager.notifyStreamFatalError's own
     // doc comment for what a caller does with this.
     private val onFatalStreamError: () -> Unit = {},
+    // See UrbQueueShape; the default everywhere but the #123 queue-depth experiment.
+    private val urbQueue: UrbQueueShape = UrbQueueShape.DEFAULT,
 ) {
+    /** URBs kept in flight. */
+    val numUrbs: Int get() = urbQueue.numUrbs
+
     private companion object {
+        const val NANOS_PER_MICRO = 1000L
         // factor(i) = 1.0 - (i+1)/UsbAudioTuning.UNDERRUN_FADE_FRAMES for the common case where a short read's
         // fade window is the full UsbAudioTuning.UNDERRUN_FADE_FRAMES (true whenever the read has at least that
         // many real frames in it, the overwhelming majority of underruns) -- computed once here
@@ -115,7 +121,7 @@ internal class UsbIsoStreamEngine(
     /**
      * URBs whose completion [UsbNativeBridge.reapIso] has confirmed since [start]. A caller
      * waiting for the stream to be established (#127) watches this go past
-     * [UsbAudioTuning.NUM_URBS].
+     * [numUrbs].
      */
     @Volatile var urbsReaped: Long = 0L
         private set
@@ -174,14 +180,14 @@ internal class UsbIsoStreamEngine(
                 6 -> "super+"
                 else -> "unknown"
             }
-        val pacing = IsoPacing.forSpeed(usbSpeed, UsbAudioTuning.BASE_PACKETS_PER_URB, format.bInterval)
+        val pacing = IsoPacing.forSpeed(usbSpeed, urbQueue.basePacketsPerUrb, format.bInterval)
         val packetsPerSecond = pacing.packetsPerSecond
         val packetDurationNs = pacing.packetDurationNs
         val packetsPerUrb = pacing.packetsPerUrb
 
         val handle =
             nativeBridge.openIsoStream(
-                fd, format.endpointAddress, format.maxPacketSize, packetsPerUrb, UsbAudioTuning.NUM_URBS)
+                fd, format.endpointAddress, format.maxPacketSize, packetsPerUrb, urbQueue.numUrbs)
         if (handle == 0L) {
             L.w("UsbIsoStreamEngine: failed to open iso stream")
             return
@@ -219,8 +225,8 @@ internal class UsbIsoStreamEngine(
         // confirms *that* slot's URB actually completed -- not when it was merely submitted (#71).
         // Reused across this stream's whole lifetime the same way urbBuffer/packetLengths are:
         // indexed by slot, overwritten every time that slot is resubmitted.
-        val slotFrames = LongArray(UsbAudioTuning.NUM_URBS)
-        val slotCreditable = BooleanArray(UsbAudioTuning.NUM_URBS)
+        val slotFrames = LongArray(urbQueue.numUrbs)
+        val slotCreditable = BooleanArray(urbQueue.numUrbs)
 
         fun rampFrames(buf: ByteArray, readBytes: Int, fadingIn: Boolean) {
             val subslot = format.subslotSize
@@ -352,7 +358,7 @@ internal class UsbIsoStreamEngine(
                     // audio output thread would.
                     setUrgentAudioPriority()
                     L.i("UsbIsoStreamEngine: streaming thread starting ($sampleRateHz Hz)")
-                    for (slot in 0 until UsbAudioTuning.NUM_URBS) {
+                    for (slot in 0 until urbQueue.numUrbs) {
                         val total = buildUrb()
                         // Retry once immediately before giving up on this slot -- see #59: a
                         // slot that's never submitted here never enters the reap/resubmit
@@ -392,6 +398,7 @@ internal class UsbIsoStreamEngine(
                     // real rate instead of papering over the symptom with an equally-wrong delay.
                     val streamStartNs = System.nanoTime()
                     val urbRealTimeNs = packetsPerUrb * packetDurationNs
+                    val margin = UrbQueueMarginTracker((urbQueue.numUrbs - 1) * urbRealTimeNs)
                     var urbsPaced = 0L
                     var submitted = 0
                     var reapErrors = 0
@@ -424,6 +431,7 @@ internal class UsbIsoStreamEngine(
                         // submission time != completion time -- crediting at submission there
                         // reported playback as running ahead of what the device had actually
                         // consumed, by up to the whole prefill depth).
+                        val reapedAtNs = System.nanoTime()
                         if (slotCreditable[slot]) {
                             framesOutput += slotFrames[slot]
                         }
@@ -454,6 +462,7 @@ internal class UsbIsoStreamEngine(
                             break
                         }
                         submitted++
+                        margin.record(System.nanoTime() - reapedAtNs, waitNs.coerceAtLeast(0L))
                         lastUrbSubmittedAtMs = System.currentTimeMillis()
                         // Recorded now, credited above next time this slot comes back around
                         // through reapIso() confirming it completed. Not creditable while paused
@@ -481,7 +490,10 @@ internal class UsbIsoStreamEngine(
                                     bufferedBytes = ringBuffer.availableToRead(),
                                     bufferCapacityBytes = ringBuffer.availableToRead() + ringBuffer.availableToWrite(),
                                     badPacketCount = packetErrorStats[0],
-                                    shortBytesCount = packetErrorStats[1]))
+                                    shortBytesCount = packetErrorStats[1],
+                                    minQueueMarginUs = margin.minMarginNs?.let { it / NANOS_PER_MICRO },
+                                    queueRanDryCount = margin.ranDryCount,
+                                    maxPacingWaitUs = margin.maxPacingWaitNs / NANOS_PER_MICRO))
                         }
                         if (submitted % 500 == 0) {
                             val realElapsedMs = (System.nanoTime() - streamStartNs) / 1_000_000L
@@ -489,7 +501,11 @@ internal class UsbIsoStreamEngine(
                             L.i(
                                 "UsbIsoStreamEngine: $submitted URBs submitted, $reapErrors reap " +
                                     "errors, ${ringBuffer.availableToRead()} bytes buffered, " +
-                                    "${pacedMs}ms of audio paced over ${realElapsedMs}ms real time")
+                                    "${pacedMs}ms of audio paced over ${realElapsedMs}ms real time; " +
+                                    "queue ${urbQueue.numUrbs}x${urbRealTimeNs / 1_000_000L}ms, " +
+                                    "min margin ${margin.minMarginNs?.let { it / NANOS_PER_MICRO }}us, " +
+                                    "ran dry ${margin.ranDryCount}x, " +
+                                    "max pacing wait ${margin.maxPacingWaitNs / NANOS_PER_MICRO}us")
                         }
                     }
                     L.i("UsbIsoStreamEngine: streaming thread exiting ($submitted submitted, $reapErrors reap errors)")

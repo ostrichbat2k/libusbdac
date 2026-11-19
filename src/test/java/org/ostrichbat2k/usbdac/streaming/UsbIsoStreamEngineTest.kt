@@ -180,6 +180,7 @@ class UsbIsoStreamEngineTest {
         paused: Boolean = true,
         format: UacStreamFormat = testFormat,
         onFatalStreamError: () -> Unit = {},
+        urbQueue: UrbQueueShape = UrbQueueShape.DEFAULT,
     ) = UsbIsoStreamEngine(
         session = testSession,
         format = format,
@@ -190,6 +191,7 @@ class UsbIsoStreamEngineTest {
         reportPipelineStats = {},
         nativeBridge = bridge,
         onFatalStreamError = onFatalStreamError,
+        urbQueue = urbQueue,
     )
 
     @Test
@@ -490,5 +492,20 @@ class UsbIsoStreamEngineTest {
             "closeIsoStream must not run for the feedback stream while its thread might still be using the handle")
 
         blockFeedbackForever.countDown()
+    }
+
+    /** #123: a queue-shape override reaches the native layer and the prefill, not just the default 4. */
+    @Test
+    fun `a queue-shape override sets how many URBs are opened and prefilled`() {
+        val reachedReap = CountDownLatch(1)
+        val bridge = FakeNativeBridge(beforeReap = { reachedReap.countDown() })
+        val engine = engineWith(bridge, paused = false, urbQueue = UrbQueueShape(numUrbs = 6, basePacketsPerUrb = 2))
+
+        engine.start()
+        assertTrue(reachedReap.await(2, TimeUnit.SECONDS), "background thread never reached reapIso()")
+
+        assertEquals(6, engine.numUrbs)
+        assertEquals(6, bridge.submitIsoCallCount.get())
+        engine.stop()
     }
 }

@@ -21,7 +21,6 @@ package org.ostrichbat2k.usbdac.claim
 import org.ostrichbat2k.usbdac.UsbAudioManager
 import org.ostrichbat2k.usbdac.protocol.UsbAudioSession
 import org.ostrichbat2k.usbdac.streaming.UsbAudioOutput
-import android.hardware.usb.UsbDevice
 import kotlinx.coroutines.flow.StateFlow
 
 /**
@@ -74,14 +73,13 @@ internal interface UsbClaimController {
     /** Records that the interface is already claimed by some other, earlier one-time call. */
     fun markAlreadyClaimed()
 
-    /** Marks the claim gone without going through the normal [releaseClaim] dance. */
-    fun markReleased()
-
-    /** Cancels any release scheduled before a full session teardown. */
-    fun cancelPendingRelease()
-
-    /** Records which device to wait for in [releaseClaim]'s own Android-takeover verification. */
-    fun recordDeactivatedDevice(device: UsbDevice?)
+    /**
+     * For a full session teardown: cancels any pending release, forces the hardware to the
+     * HAL-handoff level if still claimed, marks the claim gone, and records [session]'s device
+     * for [releaseClaim]'s own Android-takeover verification -- as one step, atomic with every
+     * other claim/release decision.
+     */
+    fun releaseForDeactivation(session: UsbAudioSession?)
 
     /**
      * Claims the interface (evicting whatever the kernel driver currently has bound) if we don't

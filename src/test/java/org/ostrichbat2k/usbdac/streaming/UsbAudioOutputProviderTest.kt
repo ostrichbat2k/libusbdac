@@ -23,9 +23,11 @@ import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbInterface
 import android.media.AudioFormat
 import androidx.media3.common.C
+import androidx.media3.common.Format
 import androidx.media3.exoplayer.audio.AudioOutputProvider
 import io.mockk.every
 import io.mockk.mockk
+import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Test
@@ -107,5 +109,57 @@ class UsbAudioOutputProviderTest {
         val output = providerWith(usbAudioManager).getAudioOutput(testConfig())
 
         assertNotNull(output)
+    }
+
+    // #130: format selection skips alt-settings whose wMaxPacketSize can't hold the rate's packets.
+
+    private fun uac1Format(alt: Int, maxPacketSize: Int) =
+        testFormat.copy(alternateSetting = alt, maxPacketSize = maxPacketSize, sampleRates = listOf(48000, 96000))
+
+    private fun providerFor(formats: List<UacStreamFormat>, usbSpeed: Int?): UsbAudioOutputProvider {
+        val session = testSession.copy(topology = testTopology.copy(uacVersion = 1, formats = formats))
+        return UsbAudioOutputProvider(mockk(relaxed = true), session, mockk(relaxed = true), usbSpeed = usbSpeed)
+    }
+
+    private fun supportLevel(provider: UsbAudioOutputProvider, sampleRate: Int): Int =
+        provider
+            .getFormatSupport(
+                AudioOutputProvider.FormatConfig.Builder(
+                        Format.Builder()
+                            .setChannelCount(2)
+                            .setSampleRate(sampleRate)
+                            .setPcmEncoding(C.ENCODING_PCM_16BIT)
+                            .build())
+                    .build())
+            .supportLevel
+
+    @Test
+    fun `a rate whose packets overflow wMaxPacketSize at full speed is unsupported`() {
+        // 96 frames x 4 bytes = 384 bytes per 1 ms packet, against a 192-byte endpoint.
+        val provider = providerFor(listOf(uac1Format(1, 192)), usbSpeed = 2)
+
+        assertEquals(AudioOutputProvider.FORMAT_UNSUPPORTED, supportLevel(provider, 96000))
+        assertEquals(AudioOutputProvider.FORMAT_SUPPORTED_DIRECTLY, supportLevel(provider, 48000))
+    }
+
+    @Test
+    fun `the same endpoint carries the rate at high speed`() {
+        val provider = providerFor(listOf(uac1Format(1, 192)), usbSpeed = 3)
+
+        assertEquals(AudioOutputProvider.FORMAT_SUPPORTED_DIRECTLY, supportLevel(provider, 96000))
+    }
+
+    @Test
+    fun `a too-small alt-setting is skipped in favour of one that fits`() {
+        val provider = providerFor(listOf(uac1Format(1, 192), uac1Format(2, 400)), usbSpeed = 2)
+
+        assertEquals(AudioOutputProvider.FORMAT_SUPPORTED_DIRECTLY, supportLevel(provider, 96000))
+    }
+
+    @Test
+    fun `an unknown USB speed skips the check rather than rejecting formats`() {
+        val provider = providerFor(listOf(uac1Format(1, 192)), usbSpeed = null)
+
+        assertEquals(AudioOutputProvider.FORMAT_SUPPORTED_DIRECTLY, supportLevel(provider, 96000))
     }
 }

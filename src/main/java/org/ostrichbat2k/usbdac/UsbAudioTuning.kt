@@ -66,6 +66,14 @@ internal object UsbAudioTuning {
     const val DAC_SETTLE_DELAY_MS = 600L
 
     /**
+     * How long phase 2 of a relock waits for the pre-roll stream's first [NUM_URBS] URBs to
+     * complete before going on regardless (#127). They take about 32 ms; this only bounds a
+     * stream that never gets going, which [org.ostrichbat2k.usbdac.streaming.UsbAudioOutput.isStalled]
+     * then reports.
+     */
+    const val STREAM_ESTABLISH_TIMEOUT_MS = 500L
+
+    /**
      * The real sample rate this library asks every UAC2/3 device's Clock Source for, and the
      * fallback used whenever a UAC1 device's own declared rates don't include it or 44.1kHz.
      * Also [UsbAudioManagerImpl]'s own `activeRateHz` fallback default for display when nothing

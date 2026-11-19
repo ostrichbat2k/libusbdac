@@ -246,7 +246,7 @@ class UsbIsoStreamEngineTest {
         val proceed = CountDownLatch(1)
         val bridge =
             FakeNativeBridge(
-                // First reap confirms slot 0 (prefilled, so creditable); the second ends the loop.
+                // First reap confirms slot 0 (prefilled with audio, so creditable); the second ends the loop.
                 reapResults = listOf(0, UsbNativeBridge.REAP_ERROR_FATAL),
                 beforeReap = { idx ->
                     if (idx == 0) {
@@ -254,7 +254,9 @@ class UsbIsoStreamEngineTest {
                         proceed.await()
                     }
                 })
-        val engine = engineWith(bridge)
+        // Not paused: only URBs that carried track audio are credited (#127), so a paused
+        // engine's prefill -- silence -- never would be.
+        val engine = engineWith(bridge, paused = false)
 
         engine.start()
         assertTrue(readyToReap.await(2, TimeUnit.SECONDS), "background thread never reached its first reapIso()")
@@ -310,7 +312,9 @@ class UsbIsoStreamEngineTest {
                         proceed.await()
                     }
                 })
-        val engine = engineWith(bridge)
+        // Not paused: only URBs that carried track audio are credited (#127), so a paused
+        // engine's prefill -- silence -- never would be.
+        val engine = engineWith(bridge, paused = false)
         engine.start()
         assertTrue(readyToReap.await(2, TimeUnit.SECONDS))
         proceed.countDown()

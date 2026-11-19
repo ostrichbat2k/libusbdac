@@ -137,6 +137,28 @@ private object D {
 
     fun uac2ClockSource(id: Int) = cs(4, 0x0A) { setU8(3, id) }
 
+    /** A full-length (17-byte) UAC2 Input Terminal, carrying bCSourceID at offset 7 (#129). */
+    fun uac2InputTerminalWithClock(id: Int, terminalType: Int, channelCount: Int, clockId: Int) =
+        cs(17, 0x02) {
+            setU8(3, id)
+            setU16(4, terminalType)
+            setU8(7, clockId)
+            setU8(8, channelCount)
+        }
+
+    fun uac2ClockSelector(id: Int, inputs: List<Int>) =
+        cs(7 + inputs.size, 0x0B) {
+            setU8(3, id)
+            setU8(4, inputs.size)
+            inputs.forEachIndexed { i, input -> setU8(5 + i, input) }
+        }
+
+    fun uac2ClockMultiplier(id: Int, sourceId: Int) =
+        cs(7, 0x0C) {
+            setU8(3, id)
+            setU8(4, sourceId)
+        }
+
     /** A full-length UAC2 Clock Source descriptor (8 bytes) carrying [bmControls] at offset 5. */
     fun uac2ClockSourceWithControls(id: Int, bmControls: Int) =
         cs(8, 0x0A) {
@@ -425,6 +447,58 @@ class UsbAudioDescriptorParserUac2Test {
         assertNotNull(withFeedback.feedbackEndpoint)
         assertFalse(withFeedback.needsImplicitFeedback)
         assertFalse(withFeedback.copy(syncType = SyncType.SYNCHRONOUS, feedbackEndpoint = null).needsImplicitFeedback)
+    }
+
+    // ---- #129: the playback path's clock, followed from the terminal's bCSourceID ----
+
+    private fun multiClockConfig(terminalClockId: Int, clockEntities: ByteArray): ByteArray {
+        val config = D.configuration(1)
+        val acIface = D.iface(0, 0, 1, 1, 0x20)
+        val input =
+            D.uac2InputTerminalWithClock(id = 1, terminalType = 0x0101, channelCount = 2, clockId = terminalClockId)
+        val output = D.outputTerminal(terminalType = 0x0301, sourceId = 15)
+        val asIface = D.iface(1, 1, 1, 2, 0x20)
+        val asGeneral = D.uac2AsGeneral(terminalLink = 1)
+        val formatType = D.uac2FormatType(subslotSize = 2, bitResolution = 16)
+        val endpoint = D.endpoint(address = 0x07, attributes = 0x05, maxPacketSize = 196, bInterval = 4)
+        return config + acIface + input + clockEntities + output + asIface + asGeneral + formatType + endpoint
+    }
+
+    @Test
+    fun `the clock named by bCSourceID is used, not the first one declared`() {
+        // S/PDIF clock (11) declared first; the terminal is clocked by the internal one (10).
+        val clocks =
+            D.uac2ClockSourceWithControls(id = 11, bmControls = 0b0001) + D.uac2ClockSourceWithControls(10, 0b0111)
+        val topology = UsbAudioDescriptorParserUac2.parseUac2Playback(multiClockConfig(10, clocks))!!
+        assertEquals(10, topology.clockSourceId)
+        assertTrue(topology.clockFrequencyWritable) // clock 10's controls, not clock 11's read-only ones
+        assertEquals(-1, topology.clockSelectorId)
+    }
+
+    @Test
+    fun `a clock selector is resolved through its first input that leads to a source`() {
+        // Pin 1 names an entity that doesn't exist; pin 2 leads to clock 10.
+        val clocks =
+            D.uac2ClockSource(11) + D.uac2ClockSource(10) + D.uac2ClockSelector(id = 20, inputs = listOf(99, 10))
+        val topology = UsbAudioDescriptorParserUac2.parseUac2Playback(multiClockConfig(20, clocks))!!
+        assertEquals(10, topology.clockSourceId)
+        assertEquals(20, topology.clockSelectorId)
+        assertEquals(2, topology.clockSelectorPin)
+    }
+
+    @Test
+    fun `a clock multiplier is followed to its source`() {
+        val clocks = D.uac2ClockSource(11) + D.uac2ClockSource(10) + D.uac2ClockMultiplier(id = 30, sourceId = 10)
+        val topology = UsbAudioDescriptorParserUac2.parseUac2Playback(multiClockConfig(30, clocks))!!
+        assertEquals(10, topology.clockSourceId)
+        assertEquals(-1, topology.clockSelectorId)
+    }
+
+    @Test
+    fun `a bCSourceID that leads nowhere falls back to the first clock source`() {
+        val clocks = D.uac2ClockSource(11) + D.uac2ClockSource(10)
+        val topology = UsbAudioDescriptorParserUac2.parseUac2Playback(multiClockConfig(42, clocks))!!
+        assertEquals(11, topology.clockSourceId)
     }
 
     @Test

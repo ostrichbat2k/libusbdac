@@ -187,6 +187,13 @@ data class UacPlaybackTopology(
      * bmControls non-zero. When it cannot, the clock is assumed valid without asking.
      */
     val clockValidityReadable: Boolean = true,
+    /**
+     * UAC 2.0: the Clock Selector on the playback path's clock, -1 if there is none (#129) --
+     * see [Uac2ClockPath]. [clockSelectorPin] (1-based) is the input leading to [clockSourceId];
+     * it is selected before the rate is written.
+     */
+    val clockSelectorId: Int = -1,
+    val clockSelectorPin: Int = 0,
 )
 
 /**

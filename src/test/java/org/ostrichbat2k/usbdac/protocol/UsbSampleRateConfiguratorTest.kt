@@ -430,4 +430,29 @@ class UsbSampleRateConfiguratorTest {
         assertTrue(result.write.accepted)
         assertFalse(result.altRestored)
     }
+
+    // ---- #129 ----
+
+    @Test
+    fun `the clock selector is set before the clock it leads to is written`() {
+        val base = session(2)
+        val session = base.copy(topology = base.topology.copy(clockSelectorId = 5, clockSelectorPin = 1))
+        every { UsbAudioController.selectClockInput(session) } returns ControlWriteOutcome.Success
+        every { UsbAudioController.setClockFrequency(session, RATE) } returns ClockWriteOutcome.Confirmed(RATE)
+
+        assertTrue(write(session, format()).accepted)
+        verifyOrder {
+            UsbAudioController.selectClockInput(session)
+            UsbAudioController.setClockFrequency(session, RATE)
+        }
+    }
+
+    @Test
+    fun `no selector request without a selector on the path`() {
+        val session = session(2)
+        every { UsbAudioController.setClockFrequency(session, RATE) } returns ClockWriteOutcome.Confirmed(RATE)
+
+        write(session, format())
+        verify(exactly = 0) { UsbAudioController.selectClockInput(any()) }
+    }
 }

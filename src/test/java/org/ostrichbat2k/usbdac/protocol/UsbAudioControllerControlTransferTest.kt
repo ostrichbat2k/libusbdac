@@ -417,4 +417,38 @@ class UsbAudioControllerControlTransferTest {
             UsbAudioController.ControlWriteOutcome.Unsupported, UsbAudioController.selectZeroBandwidth(session))
         verify(exactly = 0) { session.connection.setInterface(any()) }
     }
+
+    // ---- #129: clock selector ----
+
+    private fun selectorSession() = fakeSession(topology().copy(clockSelectorId = 5, clockSelectorPin = 2))
+
+    @Test
+    fun `selectClockInput writes the pin when the selector is on another input`() {
+        val session = selectorSession()
+        stub(session.connection, 0xA1, 0x01, 0x0100, 0x0500, byteArrayOf(1))
+        every { session.connection.controlTransfer(0x21, any(), any(), any(), any(), any(), any()) } returns 1
+
+        assertEquals(UsbAudioController.ControlWriteOutcome.Success, UsbAudioController.selectClockInput(session))
+        verify {
+            session.connection.controlTransfer(
+                0x21, 0x01, 0x0100, 0x0500, match<ByteArray> { it.contentEquals(byteArrayOf(2)) }, 1, 1000)
+        }
+    }
+
+    @Test
+    fun `selectClockInput sends nothing when the selector is already on the pin`() {
+        val session = selectorSession()
+        stub(session.connection, 0xA1, 0x01, 0x0100, 0x0500, byteArrayOf(2))
+
+        assertEquals(UsbAudioController.ControlWriteOutcome.Success, UsbAudioController.selectClockInput(session))
+        verify(exactly = 0) { session.connection.controlTransfer(0x21, any(), any(), any(), any(), any(), any()) }
+    }
+
+    @Test
+    fun `selectClockInput does nothing on a path without a selector`() {
+        val session = fakeSession()
+
+        assertEquals(UsbAudioController.ControlWriteOutcome.Unsupported, UsbAudioController.selectClockInput(session))
+        verify(exactly = 0) { session.connection.controlTransfer(any(), any(), any(), any(), any(), any(), any()) }
+    }
 }

@@ -62,6 +62,8 @@ internal object UsbAudioDescriptorHelper {
     const val AC2_SELECTOR_UNIT = 0x05
     const val AC2_FEATURE_UNIT = 0x06
     const val AC2_CLOCK_SOURCE = 0x0A
+    const val AC2_CLOCK_SELECTOR = 0x0B
+    const val AC2_CLOCK_MULTIPLIER = 0x0C
 
     // Clock Source descriptor, same layout up to here in UAC 2.0 and 3.0: bLength, bDescriptorType,
     // bDescriptorSubtype, bClockID, bmAttributes, bmControls. bmControls holds two bits per

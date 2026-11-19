@@ -18,6 +18,8 @@
 
 package org.ostrichbat2k.usbdac.protocol
 
+import org.ostrichbat2k.usbdac.protocol.UsbAudioDescriptorHelper.AC2_CLOCK_MULTIPLIER
+import org.ostrichbat2k.usbdac.protocol.UsbAudioDescriptorHelper.AC2_CLOCK_SELECTOR
 import org.ostrichbat2k.usbdac.protocol.UsbAudioDescriptorHelper.AC2_CLOCK_SOURCE
 import org.ostrichbat2k.usbdac.protocol.UsbAudioDescriptorHelper.AC2_MIXER_UNIT
 import org.ostrichbat2k.usbdac.protocol.UsbAudioDescriptorHelper.AC_INPUT_TERMINAL
@@ -73,9 +75,11 @@ internal object UsbAudioDescriptorParserUac2 {
 
         var controlInterfaceNumber = -1
         var streamingInterfaceNumber = -1
-        var clockSourceId = -1
-        var clockFrequencyWritable = true
-        var clockValidityReadable = true
+        // Every clock entity, so the playback path's clock can be resolved after the walk (#129).
+        val clockSources = linkedMapOf<Int, ByteArray>()
+        val clockSelectors = mutableMapOf<Int, List<Int>>()
+        val clockMultipliers = mutableMapOf<Int, Int>()
+        var streamingTerminalClockId = -1
         var usbStreamingTerminalId = -1
         var outputFeatureUnitId = -1
         var mixerUnitId = -1
@@ -177,15 +181,21 @@ internal object UsbAudioDescriptorParserUac2 {
                                 terminalChannelCounts[terminalId] = bytes.u8(8) // bNrChannels
                                 if (terminalType == TERMINAL_USB_STREAMING) {
                                     usbStreamingTerminalId = terminalId
+                                    if (bytes.size > IT_CSOURCE_ID_OFFSET) {
+                                        streamingTerminalClockId = bytes.u8(IT_CSOURCE_ID_OFFSET)
+                                    }
                                 }
                             }
-                            AC2_CLOCK_SOURCE -> {
-                                if (clockSourceId < 0) {
-                                    clockSourceId = bytes.u8(3)
-                                    clockFrequencyWritable = UsbAudioDescriptorHelper.clockFrequencyWritable(bytes)
-                                    clockValidityReadable = UsbAudioDescriptorHelper.clockValidityReadable(bytes)
+                            AC2_CLOCK_SOURCE -> clockSources.putIfAbsent(bytes.u8(3), bytes)
+                            AC2_CLOCK_SELECTOR -> {
+                                // bClockID, bNrInPins, baCSourceID(1..p)
+                                val pins = bytes.u8(4)
+                                if (bytes.size >= SELECTOR_FIRST_PIN_OFFSET + pins) {
+                                    clockSelectors[bytes.u8(3)] =
+                                        (0 until pins).map { bytes.u8(SELECTOR_FIRST_PIN_OFFSET + it) }
                                 }
                             }
+                            AC2_CLOCK_MULTIPLIER -> clockMultipliers[bytes.u8(3)] = bytes.u8(4)
                             AC_OUTPUT_TERMINAL -> {
                                 val terminalType = bytes.u16(4)
                                 if (terminalType != TERMINAL_USB_STREAMING && outputFeatureUnitId < 0) {
@@ -257,6 +267,10 @@ internal object UsbAudioDescriptorParserUac2 {
         }
         flushPendingFormat(currentInterfaceNumber)
 
+        val clock = resolveClock(streamingTerminalClockId, clockSources, clockSelectors, clockMultipliers)
+        val clockSourceId = clock?.sourceId ?: -1
+        val clockDescriptor = clockSources[clockSourceId]
+
         if (controlInterfaceNumber < 0 || streamingInterfaceNumber < 0 || clockSourceId < 0) {
             L.d(
                 "No UAC2 playback topology in this configuration " +
@@ -285,7 +299,39 @@ internal object UsbAudioDescriptorParserUac2 {
             channelCount = terminalChannelCounts[usbStreamingTerminalId] ?: -1,
             formats = formats,
             nonPcmFormats = nonPcmFormatsByInterface[streamingInterfaceNumber].orEmpty(),
-            clockFrequencyWritable = clockFrequencyWritable,
-            clockValidityReadable = clockValidityReadable)
+            clockFrequencyWritable =
+                clockDescriptor?.let { UsbAudioDescriptorHelper.clockFrequencyWritable(it) } ?: true,
+            clockValidityReadable =
+                clockDescriptor?.let { UsbAudioDescriptorHelper.clockValidityReadable(it) } ?: true,
+            clockSelectorId = clock?.selectorId ?: -1,
+            clockSelectorPin = clock?.selectorPin ?: 0)
+    }
+
+    // UAC 2.0 Input Terminal: bCSourceID follows bTerminalID, wTerminalType and bAssocTerminal.
+    private const val IT_CSOURCE_ID_OFFSET = 7
+
+    // UAC 2.0 Clock Selector: the first baCSourceID follows bClockID and bNrInPins.
+    private const val SELECTOR_FIRST_PIN_OFFSET = 5
+
+    /**
+     * The playback path's clock (#129), see [Uac2ClockPath]: followed from the streaming
+     * terminal's bCSourceID, or, when that leads nowhere (no such entity, an unknown one, or a
+     * descriptor too short to carry the field), the first Clock Source declared, as before.
+     */
+    private fun resolveClock(
+        terminalClockId: Int,
+        sources: Map<Int, ByteArray>,
+        selectors: Map<Int, List<Int>>,
+        multipliers: Map<Int, Int>,
+    ): Uac2ClockPath.Resolved? {
+        val resolved =
+            terminalClockId.takeIf { it > 0 }?.let { Uac2ClockPath.resolve(it, sources.keys, selectors, multipliers) }
+        val first = sources.keys.firstOrNull()
+        when {
+            resolved != null -> L.i("UAC2 playback clock via bCSourceID $terminalClockId: $resolved")
+            first != null && terminalClockId > 0 ->
+                L.w("UAC2: bCSourceID $terminalClockId leads to no clock source; using the first, $first")
+        }
+        return resolved ?: first?.let { Uac2ClockPath.Resolved(it) }
     }
 }

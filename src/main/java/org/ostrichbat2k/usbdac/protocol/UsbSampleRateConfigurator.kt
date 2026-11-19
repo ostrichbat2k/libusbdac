@@ -97,6 +97,9 @@ internal object UsbSampleRateConfigurator {
                 retries = 0,
                 acceptedBecause = "endpoint declares no sampling frequency control; nothing sent")
         }
+        // The playback path's Clock Selector, if any, has to be on the input leading to the clock
+        // about to be written, or the write changes a clock nothing plays from (#129).
+        if (!isUac1 && session.topology.clockSelectorId >= 0) UsbAudioController.selectClockInput(session)
         fun attempt(retries: Int): RateWrite {
             val outcome =
                 when {

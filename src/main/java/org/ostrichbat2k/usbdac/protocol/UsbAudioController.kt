@@ -91,6 +91,9 @@ internal object UsbAudioController {
     private const val UAC1_REQUEST_GET_CUR = 0x81
     private const val CS_SAM_FREQ_CONTROL = 0x01
     private const val CS_CLOCK_VALID_CONTROL = 0x02
+
+    // UAC 2.0 Clock Selector control (CX_CLOCK_SELECTOR_CONTROL, A.17.8).
+    private const val CX_CLOCK_SELECTOR_CONTROL = 0x01
     // UAC3 request for a High Capability Descriptor -- unlike CUR/RANGE, wValue here is the
     // descriptor/cluster ID directly (not a (control<<8) selector), confirmed against the Linux
     // kernel's get_cluster_channels_v3() in sound/usb/mixer.c.
@@ -513,6 +516,39 @@ internal object UsbAudioController {
         val valid = (buffer[0].toInt() and 0x01) != 0
         L.i("Clock ${session.topology.clockSourceId} valid=$valid")
         return valid
+    }
+
+    /**
+     * Puts the playback path's Clock Selector on [UacPlaybackTopology.clockSelectorPin] (#129),
+     * unless it is already there; nothing is sent when the path has no selector. Reads the
+     * current pin first so a device already on the right input gets no write at all.
+     */
+    fun selectClockInput(session: UsbAudioSession): ControlWriteOutcome {
+        val selectorId = session.topology.clockSelectorId
+        val pin = session.topology.clockSelectorPin
+        if (selectorId < 0 || pin <= 0) return ControlWriteOutcome.Unsupported
+        val wValue = CX_CLOCK_SELECTOR_CONTROL shl 8
+        val wIndex = (selectorId shl 8) or session.controlInterface.id
+        val current = ByteArray(1)
+        val read =
+            session.connection.controlTransfer(
+                REQ_TYPE_CLASS_INTERFACE_GET, UAC_REQUEST_CUR, wValue, wIndex, current, current.size, 1000)
+        val currentPin = if (read == 1) current[0].toInt() and 0xFF else null
+        val result =
+            if (currentPin == pin) {
+                0
+            } else {
+                val buffer = byteArrayOf(pin.toByte())
+                session.connection
+                    .controlTransfer(
+                        REQ_TYPE_CLASS_INTERFACE_SET, UAC_REQUEST_CUR, wValue, wIndex, buffer, buffer.size, 1000)
+                    .also {
+                        L.i(
+                            "SET_CUR clock selector $selectorId to pin $pin " +
+                                "(was ${currentPin ?: "unreadable"}): result=$it")
+                    }
+            }
+        return if (result >= 0) ControlWriteOutcome.Success else ControlWriteOutcome.TransferFailed
     }
 
     /** Attempts to set the clock source sample rate in Hz, then reads it back to confirm. */

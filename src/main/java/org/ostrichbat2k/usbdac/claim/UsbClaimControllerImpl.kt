@@ -130,6 +130,22 @@ internal class UsbClaimControllerImpl(
     // path, reintroducing the exact HAL-recognition bug this parameter exists to fix.
     @Volatile private var pendingDeactivateOnTimeout = false
 
+    /**
+     * A [releaseClaim] that lost to an in-flight claim attempt, to replay once it ends (#141). Its
+     * deactivateOnTimeout goes into pendingDeactivateOnTimeout instead, which outlives this.
+     */
+    private data class DeferredRelease(val delayMs: Long)
+
+    // Set when a release arrives while a claim attempt is in flight; taken by the endClaimAttempt
+    // that brings the count to 0. Without it the release was dropped on the assumption that the
+    // attempt's own stream would release later -- but the release very often comes *from* that
+    // attempt (paused before it could start streaming, or paused/released during its phase-2
+    // settle, #127), so nothing ever did and the interface stayed claimed with nothing streaming.
+    // Read and written only under attemptLock, together with claimAttemptsInFlight, so a release
+    // can't be stored just after the last attempt ended and then never replayed.
+    private var deferredRelease: DeferredRelease? = null
+    private val attemptLock = Any()
+
     // See UsbClaimController.consumeHardwareReset's own doc comment. Set wherever
     // volumeController.prepareForHalHandoff() runs (the only place this hardware's gain gets
     // forced to a HAL-handoff level outside of a user-initiated change) -- below, in
@@ -177,11 +193,50 @@ internal class UsbClaimControllerImpl(
     }
 
     override fun beginClaimAttempt() {
-        claimAttemptsInFlight.incrementAndGet()
+        synchronized(attemptLock) { claimAttemptsInFlight.incrementAndGet() }
     }
 
+    /**
+     * Ends an attempt. When it was the last one, replays a release that arrived during it (#141)
+     * -- unless a stream started after all, whose own pause()/release() will release instead.
+     */
     override fun endClaimAttempt() {
-        claimAttemptsInFlight.updateAndGet { (it - 1).coerceAtLeast(0) }
+        val replay =
+            synchronized(attemptLock) {
+                val remaining = claimAttemptsInFlight.updateAndGet { (it - 1).coerceAtLeast(0) }
+                if (remaining > 0) null else deferredRelease.also { deferredRelease = null }
+            }
+        when {
+            replay == null -> Unit
+            activeStreamCount.get() > 0 ->
+                L.i("UsbClaimController: dropping a release deferred during a claim attempt -- a stream started")
+            else -> {
+                L.i("UsbClaimController: claim attempt over -- replaying the release deferred during it")
+                // Never blocks: whoever asked to wait for Android's takeover returned long ago.
+                // Picks up an escalated deactivateOnTimeout from pendingDeactivateOnTimeout,
+                // latched on deferral.
+                releaseClaim(replay.delayMs, awaitAndroidTakeover = false)
+            }
+        }
+    }
+
+    /**
+     * Records a release that lost to an in-flight attempt, merged with any already recorded (the
+     * sooner delay wins), and latches its deactivateOnTimeout (see pendingDeactivateOnTimeout).
+     * Returns false, recording nothing, once no attempt is in flight.
+     */
+    private fun deferReleaseIfAttemptInFlight(delayMs: Long, deactivateOnTimeout: Boolean): Boolean {
+        synchronized(attemptLock) {
+            if (claimAttemptsInFlight.get() == 0) return false
+            val prev = deferredRelease
+            deferredRelease = DeferredRelease(if (prev == null) delayMs else minOf(prev.delayMs, delayMs))
+            pendingDeactivateOnTimeout = pendingDeactivateOnTimeout || deactivateOnTimeout
+            return true
+        }
+    }
+
+    private fun clearDeferredRelease() {
+        synchronized(attemptLock) { deferredRelease = null }
     }
 
     override fun consumeHardwareReset(): Boolean {
@@ -210,12 +265,14 @@ internal class UsbClaimControllerImpl(
      */
     override fun markReleased() {
         _claimedState.value = false
+        clearDeferredRelease()
     }
 
     /** For [UsbAudioManager.deactivateDac], canceling any release scheduled before a teardown. */
     override fun cancelPendingRelease() {
         pendingRelease?.cancel(false)
         pendingRelease = null
+        clearDeferredRelease()
     }
 
     /**
@@ -243,6 +300,8 @@ internal class UsbClaimControllerImpl(
     override fun requestClaim(session: UsbAudioSession?): UsbAudioManager.ClaimOutcome {
         pendingRelease?.cancel(false)
         pendingRelease = null
+        // Someone needs the claim again, so a release still waiting on an attempt is stale (#141).
+        clearDeferredRelease()
         if (_claimedState.value) return UsbAudioManager.ClaimOutcome.ALREADY_CLAIMED
         session ?: return UsbAudioManager.ClaimOutcome.FAILED
         val ok = UsbAudioController.reclaimFromKernel(session)
@@ -297,16 +356,20 @@ internal class UsbClaimControllerImpl(
      */
     override fun releaseClaim(delayMs: Long, awaitAndroidTakeover: Boolean, deactivateOnTimeout: Boolean) {
         pendingRelease?.cancel(false)
-        if (activeStreamCount.get() > 0 || claimAttemptsInFlight.get() > 0) {
-            // Something is genuinely streaming right now (or an activation attempt is still
-            // claiming/relocking -- see beginClaimAttempt's own doc comment) and still needs the
-            // claim -- a caller here (a Settings-screen mutator, most likely) just wanted it
-            // briefly for its own one-off write and is in no position to know that. Not even
-            // worth scheduling: the active UsbAudioOutput's own pause()/release() -- or, for an
-            // in-flight attempt that fails outright, its next real activation/pause -- is what
-            // will actually call this once it's really done -- but see
-            // pendingDeactivateOnTimeout's own doc comment for why this caller's
-            // deactivateOnTimeout still has to be remembered rather than dropped.
+        // An activation attempt is still claiming/relocking (see beginClaimAttempt's own doc
+        // comment): releasing now would pull the interface out from under it. Remembered and
+        // replayed when the attempt ends, if nothing is streaming by then (#141).
+        if (deferReleaseIfAttemptInFlight(delayMs, deactivateOnTimeout)) {
+            pendingRelease = null
+            return
+        }
+        if (activeStreamCount.get() > 0) {
+            // Something is genuinely streaming right now and still needs the claim -- a caller
+            // here (a Settings-screen mutator, most likely) just wanted it briefly for its own
+            // one-off write and is in no position to know that. Not even worth scheduling: the
+            // active UsbAudioOutput's own pause()/release() is what will actually call this once
+            // it's really done -- but see pendingDeactivateOnTimeout's own doc comment for why
+            // this caller's deactivateOnTimeout still has to be remembered rather than dropped.
             pendingDeactivateOnTimeout = pendingDeactivateOnTimeout || deactivateOnTimeout
             pendingRelease = null
             return
@@ -324,13 +387,15 @@ internal class UsbClaimControllerImpl(
     }
 
     private fun doReleaseClaim(awaitAndroidTakeover: Boolean, deactivateOnTimeout: Boolean) {
-        if (activeStreamCount.get() > 0 || claimAttemptsInFlight.get() > 0) {
-            // The race can still be lost a second time between releaseClaim scheduling this and
-            // it actually firing -- a new stream started, or a new activation attempt began
-            // claiming/relocking (see beginClaimAttempt's own doc comment for why that alone,
-            // before notifyStreamingStarted, already needs guarding) -- re-latch for the same
-            // reason releaseClaim's own early-return branch does, rather than silently dropping
-            // an already-escalated request here.
+        // The race can still be lost a second time between releaseClaim scheduling this and it
+        // actually firing. A new activation attempt began claiming/relocking (see
+        // beginClaimAttempt's own doc comment for why that alone, before notifyStreamingStarted,
+        // already needs guarding): defer to its end, like releaseClaim does (#141) -- if that
+        // attempt never streams, this release is still owed.
+        if (deferReleaseIfAttemptInFlight(delayMs = 0, deactivateOnTimeout)) return
+        if (activeStreamCount.get() > 0) {
+            // A new stream started: re-latch for the same reason releaseClaim's own early-return
+            // branch does, rather than silently dropping an already-escalated request here.
             pendingDeactivateOnTimeout = pendingDeactivateOnTimeout || deactivateOnTimeout
             return
         }

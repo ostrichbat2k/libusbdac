@@ -354,6 +354,125 @@ class UsbClaimControllerImplTest {
         verify { UsbAudioController.releaseToKernel(session) }
     }
 
+    // ---- #141: a release that loses to an in-flight attempt is replayed when it ends ----
+
+    /** A live, claimed session the release can act on. */
+    private fun claimedSession(): UsbAudioSession {
+        val device = fakeDevice()
+        val session = fakeSession(device)
+        stubAlreadyRecognized(device)
+        activeSession = session
+        controller.markAlreadyClaimed()
+        return session
+    }
+
+    @Test
+    fun `a release during a claim attempt runs once the attempt ends with nothing streaming`() {
+        // The attempt's own pause/release path: UsbAudioOutput paused before (or while) settling.
+        val session = claimedSession()
+        controller.beginClaimAttempt()
+        controller.releaseClaim(delayMs = 0, awaitAndroidTakeover = false)
+        verify(exactly = 0) { UsbAudioController.releaseToKernel(any()) }
+
+        controller.endClaimAttempt()
+
+        assertFalse(controller.isClaimed())
+        verify(exactly = 1) { UsbAudioController.releaseToKernel(session) }
+    }
+
+    @Test
+    fun `a release during a claim attempt keeps its grace delay when replayed`() {
+        val session = claimedSession()
+        controller.beginClaimAttempt()
+        controller.releaseClaim(delayMs = 100, awaitAndroidTakeover = false)
+
+        controller.endClaimAttempt()
+
+        verify(exactly = 0) { UsbAudioController.releaseToKernel(any()) }
+        verify(timeout = 1000) { UsbAudioController.releaseToKernel(session) }
+    }
+
+    @Test
+    fun `releases deferred during one attempt merge to the soonest`() {
+        val session = claimedSession()
+        controller.beginClaimAttempt()
+        controller.releaseClaim(delayMs = 60_000, awaitAndroidTakeover = false)
+        controller.releaseClaim(delayMs = 0, awaitAndroidTakeover = false)
+
+        controller.endClaimAttempt()
+
+        verify(exactly = 1) { UsbAudioController.releaseToKernel(session) }
+    }
+
+    @Test
+    fun `a release during a claim attempt is dropped if a stream started`() {
+        claimedSession()
+        controller.beginClaimAttempt()
+        controller.releaseClaim(delayMs = 0, awaitAndroidTakeover = false)
+        controller.notifyStreamingStarted()
+
+        controller.endClaimAttempt()
+
+        assertTrue(controller.isClaimed())
+        verify(exactly = 0) { UsbAudioController.releaseToKernel(any()) }
+        // Dropped, not just postponed: the stream stopping later doesn't bring it back.
+        controller.notifyStreamingStopped()
+        Thread.sleep(50)
+        verify(exactly = 0) { UsbAudioController.releaseToKernel(any()) }
+    }
+
+    @Test
+    fun `a release during a claim attempt is cleared by a later claim`() {
+        val session = claimedSession()
+        controller.beginClaimAttempt()
+        controller.releaseClaim(delayMs = 0, awaitAndroidTakeover = false)
+        controller.requestClaim(session)
+
+        controller.endClaimAttempt()
+
+        assertTrue(controller.isClaimed())
+        verify(exactly = 0) { UsbAudioController.releaseToKernel(any()) }
+    }
+
+    @Test
+    fun `a release is replayed only when the last of overlapping attempts ends`() {
+        val session = claimedSession()
+        controller.beginClaimAttempt()
+        controller.beginClaimAttempt()
+        controller.releaseClaim(delayMs = 0, awaitAndroidTakeover = false)
+
+        controller.endClaimAttempt()
+        verify(exactly = 0) { UsbAudioController.releaseToKernel(any()) }
+        controller.endClaimAttempt()
+
+        verify(exactly = 1) { UsbAudioController.releaseToKernel(session) }
+    }
+
+    @Test
+    fun `a scheduled release that fires during a claim attempt runs once the attempt ends`() {
+        val session = claimedSession()
+        controller.releaseClaim(delayMs = 50, awaitAndroidTakeover = false)
+        controller.beginClaimAttempt()
+        Thread.sleep(200)
+        verify(exactly = 0) { UsbAudioController.releaseToKernel(any()) }
+
+        controller.endClaimAttempt()
+
+        verify(exactly = 1) { UsbAudioController.releaseToKernel(session) }
+    }
+
+    @Test
+    fun `cancelPendingRelease also drops a release deferred during a claim attempt`() {
+        claimedSession()
+        controller.beginClaimAttempt()
+        controller.releaseClaim(delayMs = 0, awaitAndroidTakeover = false)
+        controller.cancelPendingRelease()
+
+        controller.endClaimAttempt()
+
+        verify(exactly = 0) { UsbAudioController.releaseToKernel(any()) }
+    }
+
     @Test
     fun `endClaimAttempt never drives the in-flight count below zero`() {
         val device = fakeDevice()

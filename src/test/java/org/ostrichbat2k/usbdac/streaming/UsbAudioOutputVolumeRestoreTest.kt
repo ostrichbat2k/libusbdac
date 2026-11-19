@@ -214,6 +214,35 @@ class UsbAudioOutputVolumeRestoreTest {
         verify(exactly = 0) { usbAudioManager.notifyStreamingStarted() }
     }
 
+    /** #141: a release() during activation hands the claim back immediately, as release() itself does. */
+    @Test
+    fun `onActivationAttemptFinished releases immediately when the instance was released during activation`() {
+        val session = sessionWith(FakeFeatureUnit(unitId = 7, controlInterfaceId = 0))
+        val usbAudioManager = mockk<UsbAudioManager>(relaxed = true)
+        val output = output(session, fakeUsbSettings(-2000), usbAudioManager)
+        output.release()
+
+        assertFalse(output.onActivationAttemptFinished(succeeded = true))
+
+        verify { usbAudioManager.releaseClaim(delayMs = 0) }
+        verify(exactly = 0) { usbAudioManager.notifyStreamingStarted() }
+    }
+
+    /** #141/#31: paused during activation in manual mode keeps the claim, as pause() does. */
+    @Test
+    fun `onActivationAttemptFinished keeps the claim when paused in manual release mode`() {
+        val session = sessionWith(FakeFeatureUnit(unitId = 7, controlInterfaceId = 0))
+        val usbAudioManager = mockk<UsbAudioManager>(relaxed = true)
+        val settings = fakeUsbSettings(-2000)
+        every { settings.manualReleaseControl } returns true
+        val output = output(session, settings, usbAudioManager)
+
+        assertFalse(output.onActivationAttemptFinished(succeeded = true))
+
+        verify(exactly = 0) { usbAudioManager.releaseClaim(any(), any(), any()) }
+        verify(exactly = 0) { usbAudioManager.notifyStreamingStarted() }
+    }
+
     /**
      * #127: phase 2 of a relock runs with the stream already going in pre-roll; a [pause] in the
      * meantime stops that stream, so when phase 2 finishes there's nothing to open and nothing

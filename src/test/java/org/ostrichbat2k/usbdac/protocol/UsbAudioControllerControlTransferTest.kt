@@ -24,8 +24,10 @@ import io.mockk.every
 import io.mockk.mockk
 import io.mockk.verify
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Test
+import org.ostrichbat2k.usbdac.quirks.UsbDeviceQuirk
 
 /**
  * Covers [UsbAudioController]'s class-specific control-transfer requests: the wValue/wIndex
@@ -450,5 +452,52 @@ class UsbAudioControllerControlTransferTest {
 
         assertEquals(UsbAudioController.ControlWriteOutcome.Unsupported, UsbAudioController.selectClockInput(session))
         verify(exactly = 0) { session.connection.controlTransfer(any(), any(), any(), any(), any(), any(), any()) }
+    }
+
+    // ---- #132: quirk delays ----
+
+    private fun withSleeps(block: (MutableList<Long>) -> Unit) {
+        val sleeps = mutableListOf<Long>()
+        val original = UsbAudioController.sleep
+        UsbAudioController.sleep = { sleeps += it }
+        try {
+            block(sleeps)
+        } finally {
+            UsbAudioController.sleep = original
+        }
+    }
+
+    @Test
+    fun `a control-delay quirk pauses after every class request`() = withSleeps { sleeps ->
+        val session = fakeSession().copy(quirks = setOf(UsbDeviceQuirk.CONTROL_DELAY_20MS))
+        every { session.connection.controlTransfer(any(), any(), any(), any(), any(), any(), any()) } returns 1
+
+        UsbAudioController.setMute(session, muted = true)
+        UsbAudioController.getMute(session)
+
+        assertEquals(listOf(20L, 20L), sleeps)
+    }
+
+    @Test
+    fun `without quirks no request is followed by a pause`() = withSleeps { sleeps ->
+        val session = fakeSession()
+        every { session.connection.controlTransfer(any(), any(), any(), any(), any(), any(), any()) } returns 1
+
+        UsbAudioController.setMute(session, muted = true)
+
+        assertTrue(sleeps.isEmpty())
+    }
+
+    @Test
+    fun `the interface-delay quirk pauses 50 ms after SET_INTERFACE`() = withSleeps { sleeps ->
+        val altZero = mockk<UsbInterface>(relaxed = true)
+        val session =
+            fakeSession()
+                .copy(streamingAltSettings = mapOf(0 to altZero), quirks = setOf(UsbDeviceQuirk.INTERFACE_DELAY))
+        every { session.connection.setInterface(altZero) } returns true
+
+        UsbAudioController.selectZeroBandwidth(session)
+
+        assertEquals(listOf(50L), sleeps)
     }
 }

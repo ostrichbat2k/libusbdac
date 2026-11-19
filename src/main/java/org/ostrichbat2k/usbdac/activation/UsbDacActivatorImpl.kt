@@ -19,6 +19,7 @@
 package org.ostrichbat2k.usbdac.activation
 
 import org.ostrichbat2k.usbdac.UsbAudioTuning
+import org.ostrichbat2k.usbdac.quirks.UsbDeviceQuirk
 import org.ostrichbat2k.usbdac.UsbDacPreferences
 import org.ostrichbat2k.usbdac.protocol.UacPlaybackTopology
 import org.ostrichbat2k.usbdac.protocol.UacStreamFormat
@@ -201,16 +202,16 @@ internal class UsbDacActivatorImpl(
         // alternate setting ends up selected, so this can happen up front. UAC 1.0 has no Clock
         // Source at all -- its sample rate is a property of the streaming *endpoint* itself, set
         // further below, after selectFormat has made that endpoint active (see there for why).
-        val clockOk =
-            if (found.uacVersion != 1) {
-                val write =
-                    UsbSampleRateConfigurator.writeSampleRate(
-                        session, format, UsbAudioTuning.SUPPORTED_SAMPLE_RATE_HZ)
-                log("Clock set to ${UsbAudioTuning.SUPPORTED_SAMPLE_RATE_HZ} Hz: ${write.outcome}")
-                write.accepted
-            } else {
-                true
-            }
+        // A device with SET_INTERFACE_FIRST (#132) gets its clock written after selectFormat
+        // below instead, like UAC 1.0.
+        val clockAfterInterface = UsbDeviceQuirk.SET_INTERFACE_FIRST in session.quirks
+        fun writeUac2Clock(): Boolean {
+            val write =
+                UsbSampleRateConfigurator.writeSampleRate(session, format, UsbAudioTuning.SUPPORTED_SAMPLE_RATE_HZ)
+            log("Clock set to ${UsbAudioTuning.SUPPORTED_SAMPLE_RATE_HZ} Hz: ${write.outcome}")
+            return write.accepted
+        }
+        var clockOk = if (found.uacVersion != 1 && !clockAfterInterface) writeUac2Clock() else true
         val muted = UsbAudioController.getMute(session)
         if (muted != false) UsbAudioController.setMute(session, muted = false)
         // Was hardcoded 0..2 (master + stereo) -- the Feature Unit has one volume control per
@@ -278,6 +279,7 @@ internal class UsbDacActivatorImpl(
         val formatOk =
             UsbAudioController.selectFormat(session, format) == UsbAudioController.ControlWriteOutcome.Success
         log("Alt-setting ${format.alternateSetting} (${format.bitResolution}-bit) selected: ok=$formatOk")
+        if (found.uacVersion != 1 && clockAfterInterface) clockOk = writeUac2Clock()
 
         // UAC 1.0's Sampling Frequency Control lives on the streaming endpoint itself, which
         // doesn't functionally exist until selectFormat (just above) has made its alternate

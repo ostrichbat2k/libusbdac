@@ -35,6 +35,7 @@ import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.ostrichbat2k.usbdac.UsbAudioTuning
+import org.ostrichbat2k.usbdac.quirks.UsbDeviceQuirk
 import org.ostrichbat2k.usbdac.protocol.UsbAudioController.ClockWriteOutcome
 import org.ostrichbat2k.usbdac.protocol.UsbAudioController.ControlWriteOutcome
 
@@ -454,5 +455,46 @@ class UsbSampleRateConfiguratorTest {
 
         write(session, format())
         verify(exactly = 0) { UsbAudioController.selectClockInput(any()) }
+    }
+
+    // ---- #132: quirks ----
+
+    private fun UsbAudioSession.withQuirks(vararg quirks: UsbDeviceQuirk) = copy(quirks = quirks.toSet())
+
+    @Test
+    fun `SKIP_CLOCK_SELECTOR leaves the selector alone`() {
+        val base = session(2)
+        val session =
+            base.copy(topology = base.topology.copy(clockSelectorId = 5, clockSelectorPin = 1))
+                .withQuirks(UsbDeviceQuirk.SKIP_CLOCK_SELECTOR)
+        every { UsbAudioController.setClockFrequency(session, RATE) } returns ClockWriteOutcome.Confirmed(RATE)
+
+        write(session, format())
+        verify(exactly = 0) { UsbAudioController.selectClockInput(any()) }
+    }
+
+    @Test
+    fun `SET_INTERFACE_FIRST writes the clock with the streaming alt-setting left selected`() {
+        val session = session(2).withQuirks(UsbDeviceQuirk.SET_INTERFACE_FIRST)
+        every { UsbAudioController.setClockFrequency(session, RATE) } returns ClockWriteOutcome.Confirmed(RATE)
+
+        val result = UsbSampleRateConfigurator.writeSampleRateWithStreamIdle(session, format(), RATE, sleep = sleep)
+
+        assertTrue(result.write.accepted)
+        verify(exactly = 0) { UsbAudioController.selectZeroBandwidth(any()) }
+        verify(exactly = 0) { UsbAudioController.selectFormat(any(), any()) }
+    }
+
+    @Test
+    fun `SKIP_SAMPLE_RATE_READBACK writes the UAC1 rate without reading it back, and accepts it`() {
+        val session = session(1).withQuirks(UsbDeviceQuirk.SKIP_SAMPLE_RATE_READBACK)
+        every { UsbAudioController.setUac1EndpointSampleRate(session, ENDPOINT, RATE, readBack = false) } returns
+            ClockWriteOutcome.Mismatch(RATE, null)
+
+        val write = write(session, format())
+
+        assertTrue(write.accepted)
+        assertEquals("rate written; read-back skipped for this device (quirk)", write.acceptedBecause)
+        verify(exactly = 0) { UsbAudioController.setUac1EndpointSampleRate(any(), any(), any(), readBack = true) }
     }
 }

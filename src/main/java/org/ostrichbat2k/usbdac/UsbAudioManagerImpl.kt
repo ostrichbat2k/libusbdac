@@ -848,6 +848,16 @@ class UsbAudioManagerImpl(
             .also { sink -> updateActiveSessionState { it.copy(sink = sink) } }
     }
 
+    /** See [UacStreamFormat.needsImplicitFeedback] (#133). */
+    private fun logIfImplicitFeedback(format: UacStreamFormat) {
+        if (!format.needsImplicitFeedback) return
+        val message =
+            "alt=${format.alternateSetting} is Asynchronous with no feedback endpoint (implicit feedback, " +
+                "not supported): streaming at the nominal rate, so periodic clicks from clock drift are possible"
+        L.w("UsbAudioManager: $message")
+        diagnosticLogger.log("Warning: $message")
+    }
+
     /**
      * [session]'s negotiated USB speed, for [UsbAudioOutputProvider]'s packet-size check (#130).
      * Null when it can't be read -- including when the native library isn't loaded, as in JVM
@@ -907,6 +917,7 @@ class UsbAudioManagerImpl(
             if (ok) {
                 updateActiveSessionState { it.copy(format = format) }
                 diagnosticLogger.log("Switched to ${format.bitResolution}-bit (alt=${format.alternateSetting}) for upcoming track")
+                logIfImplicitFeedback(format)
             } else {
                 diagnosticLogger.log("Failed to switch to ${format.bitResolution}-bit (alt=${format.alternateSetting}) for upcoming track")
             }
@@ -966,6 +977,7 @@ class UsbAudioManagerImpl(
         sessionState = SessionState.Active(result.session, result.format, result.rateHz)
         controlWriter.refreshControlState(result.session, result.format, device.productName ?: device.deviceName)
         diagnosticLogger.log("DAC session ready: ${result.format} at ${result.rateHz} Hz")
+        logIfImplicitFeedback(result.format)
 
         // UsbAudioController.activate() (and selectFormat, inside dacActivator) claimed the
         // interface to do this one-time discovery/setup, but nothing's actually playing yet --

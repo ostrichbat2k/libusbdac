@@ -91,7 +91,17 @@ data class UacStreamFormat(
      * to the Clock Source and this is not consulted.
      */
     val hasSamplingFrequencyControl: Boolean = true,
-)
+) {
+    /**
+     * True for an Asynchronous endpoint with no feedback endpoint (#133). Such a device expects
+     * the host to take the rate from its own capture stream ("implicit feedback", Linux
+     * `sound/usb/implicit.c`), which this library does not do: it streams at the nominal rate,
+     * so the device's clock and ours drift apart until its buffer over- or underruns, heard as a
+     * periodic click. Surfaced so such a report can be recognised; nothing corrects it yet.
+     */
+    val needsImplicitFeedback: Boolean
+        get() = syncType == SyncType.ASYNC && feedbackEndpoint == null
+}
 
 /**
  * A non-PCM alt setting found on the streaming interface (e.g. raw DSD) -- excluded from

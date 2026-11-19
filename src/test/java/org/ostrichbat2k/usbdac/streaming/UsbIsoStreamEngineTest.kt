@@ -28,6 +28,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.ostrichbat2k.usbdac.protocol.SyncType
@@ -493,6 +494,95 @@ class UsbIsoStreamEngineTest {
             "closeIsoStream must not run for either stream while the thread might still be using it")
 
         blockForever.countDown()
+    }
+
+    /**
+     * A bridge whose first stream's reap ignores cancelIso (blocks until [unblockFirst]), then
+     * returns one ordinary completion; later streams reap normally and end on cancelIso. Counts
+     * submissions per handle.
+     */
+    private class StuckFirstStreamBridge : UsbNativeBridge {
+        val reachedFirstReap = CountDownLatch(1)
+        val unblockFirst = CountDownLatch(1)
+        val opened = CopyOnWriteArrayList<Long>()
+        val closed = CopyOnWriteArrayList<Long>()
+        val submitsByHandle = java.util.concurrent.ConcurrentHashMap<Long, AtomicInteger>()
+        private val cancelled = java.util.concurrent.ConcurrentHashMap<Long, CountDownLatch>()
+        private var nextHandle = 1L
+
+        override fun disconnectKernelDriver(fd: Int, interfaceNumber: Int) = true
+
+        override fun getUsbSpeed(fd: Int) = 2
+
+        override fun openIsoStream(
+            fd: Int,
+            endpointAddress: Int,
+            maxPacketSize: Int,
+            packetsPerUrb: Int,
+            numUrbs: Int,
+        ) =
+            nextHandle++.also {
+                opened += it
+                cancelled[it] = CountDownLatch(1)
+            }
+
+        override fun submitIso(handle: Long, slot: Int, data: ByteArray, packetLengths: IntArray): Boolean {
+            submitsByHandle.getOrPut(handle) { AtomicInteger() }.incrementAndGet()
+            return true
+        }
+
+        override fun reapIsoAny(handle: Long): Long {
+            if (handle == 1L) {
+                reachedFirstReap.countDown()
+                unblockFirst.await()
+                return UsbNativeBridge.reapResult(handle, 0)
+            }
+            cancelled.getValue(handle).await()
+            return UsbNativeBridge.REAP_ERROR_FATAL.toLong()
+        }
+
+        override fun cancelIso(handle: Long) {
+            cancelled[handle]?.countDown()
+        }
+
+        override fun closeIsoStream(handle: Long) {
+            closed += handle
+        }
+
+        override fun submitIsoRead(handle: Long, slot: Int, packetLengths: IntArray) = true
+
+        override fun readIsoSlotData(handle: Long, slot: Int, dst: ByteArray) = -1
+
+        override fun getPacketErrorStats(handle: Long) = longArrayOf(0L, 0L)
+    }
+
+    /** Regression shape for #147: a run stop() had to leave stuck is never revived or overwritten. */
+    @Test
+    fun `a stuck run is never revived by the next start, and its handle is closed once it exits`() {
+        val bridge = StuckFirstStreamBridge()
+        val engine = engineWith(bridge)
+
+        engine.start()
+        assertTrue(bridge.reachedFirstReap.await(2, TimeUnit.SECONDS))
+        engine.stop() // stuck: leaves handle 1 open
+        assertEquals(emptyList<Long>(), bridge.closed.toList())
+
+        engine.start() // retries the stop, still stuck: must refuse rather than open over it
+        assertEquals(listOf(1L), bridge.opened.toList(), "start() must not open a new stream over a stuck one")
+        assertFalse(engine.streaming)
+
+        // The stuck reap returns an ordinary completion. A revived run would resubmit it.
+        val prefill = bridge.submitsByHandle.getValue(1L).get()
+        bridge.unblockFirst.countDown()
+        Thread.sleep(100)
+        assertEquals(prefill, bridge.submitsByHandle.getValue(1L).get(), "the stopped run kept streaming")
+
+        engine.start() // the old thread has exited: its handle is closed, then a new run opens
+        assertEquals(listOf(1L), bridge.closed.toList())
+        assertEquals(listOf(1L, 2L), bridge.opened.toList())
+        assertTrue(engine.streaming)
+        engine.stop()
+        assertEquals(listOf(1L, 2L), bridge.closed.toList())
     }
 
     /** #123: a queue-shape override reaches the native layer and the prefill, not just the default 4. */

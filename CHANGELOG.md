@@ -44,6 +44,9 @@ Pin to an exact tag or commit rather than a version range.
   report `ALREADY_CLAIMED` on an interface a concurrent release is handing
   to the kernel, and a release already running can no longer fire after
   the claim that superseded it (#142).
+- A streaming thread that `stop()` had to leave stuck is no longer revived
+  by the next `start()`, which also no longer overwrites (and so leaks)
+  its native handles (#147).
 - UAC1 devices that don't implement the Sampling Frequency control no
   longer fail activation (#128).
 - Honour the UAC2/3 Clock Source's `bmControls`: a read-only frequency is

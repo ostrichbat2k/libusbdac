@@ -147,6 +147,15 @@ interface UsbAudioManager : UsbDacPreferences.Listener {
     fun notifyStreamFatalError()
 
     /**
+     * Called from the feedback thread when an Asynchronous device's feedback keeps decoding to
+     * [observedHz], a different standard rate from the [requestedHz] its clock was set to (#124):
+     * the clock change may not have really taken effect. Detection only; recorded in the
+     * diagnostic log and [UsbControlState.feedbackRateMismatchHz]. See
+     * [org.ostrichbat2k.usbdac.streaming.FeedbackRateCrossCheck] for what it can and can't see.
+     */
+    fun reportFeedbackRateMismatch(requestedHz: Int, observedHz: Int) {}
+
+    /**
      * Keeps (or stops keeping) a silent, inaudible [android.media.AudioTrack] actively playing
      * for as long as direct USB output itself is actually streaming -- not meant for host-app
      * callers.

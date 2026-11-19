@@ -94,6 +94,14 @@ internal class FeedbackDecoder(
         private set
 
     /**
+     * The last payload shifted into the octave around nominal, before the tolerance check -- what
+     * [FeedbackRateCrossCheck] reads (#124), since a device running at another rate is exactly
+     * what the tolerance check rejects. 0 when the payload could not be read.
+     */
+    var lastShiftedQ16: Long = 0L
+        private set
+
+    /**
      * Decodes the first [length] bytes of [raw]. Returns Q16.16 samples per data packet, or
      * [REJECTED] for a payload that is too short, zero, or not within the tolerance band of the
      * nominal rate under any shift. A caller treats [REJECTED] like a failed read: keep the rate
@@ -111,6 +119,7 @@ internal class FeedbackDecoder(
                 }
                 else -> shifted(wire, shift)
             }
+        lastShiftedQ16 = value
         val accepted = value in lowestAcceptedQ16..highestAcceptedQ16 && value > 0L
         // A rejected value is either garbage or means the remembered shift is wrong; either way
         // detect again on the next one. A payload that could not be read at all (wire == 0)

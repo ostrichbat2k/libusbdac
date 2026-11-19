@@ -60,6 +60,10 @@ internal class UsbIsoStreamEngine(
     private val onFatalStreamError: () -> Unit = {},
     // See UrbQueueShape; the default everywhere but the #123 queue-depth experiment.
     private val urbQueue: UrbQueueShape = UrbQueueShape.DEFAULT,
+    // Called once, from the feedback thread, when an Asynchronous device's feedback keeps
+    // decoding to a different standard rate than the one requested (#124) -- see
+    // FeedbackRateCrossCheck. Detection only.
+    private val onFeedbackRateMismatch: (requestedHz: Int, observedHz: Int) -> Unit = { _, _ -> },
 ) {
     /** URBs kept in flight. */
     val numUrbs: Int get() = urbQueue.numUrbs
@@ -103,6 +107,9 @@ internal class UsbIsoStreamEngine(
     private var feedbackThread: Thread? = null
 
     @Volatile private var feedbackStreaming = false
+
+    // Set in start() before the feedback thread starts; only that thread uses it (#124).
+    private var feedbackCrossCheck: FeedbackRateCrossCheck? = null
 
     // Only ever read/written from the single native streaming thread -- not actually volatile for
     // cross-thread visibility, just convenient to declare alongside the other stream-lifetime state.
@@ -517,6 +524,7 @@ internal class UsbIsoStreamEngine(
                 }
 
         val feedbackDecoder = FeedbackDecoder(sampleRateHz, packetsPerSecond, maxSamplesPerPacket)
+        feedbackCrossCheck = FeedbackRateCrossCheck(sampleRateHz, packetsPerSecond)
         startFeedbackThreadIfApplicable(fd, scheduler, feedbackDecoder)
     }
 
@@ -624,6 +632,12 @@ internal class UsbIsoStreamEngine(
         val shiftBefore = decoder.detectedShift
         val samplesPerPacketQ16 = decoder.decode(buffer, bytesRead)
         if (samplesPerPacketQ16 != FeedbackDecoder.REJECTED) scheduler.updateSamplesPerPacketQ16(samplesPerPacketQ16)
+        feedbackCrossCheck?.observe(decoder.lastShiftedQ16)?.let { observedHz ->
+            L.w(
+                "UsbIsoStreamEngine: feedback says the device runs at $observedHz Hz, " +
+                    "not the requested $sampleRateHz Hz")
+            onFeedbackRateMismatch(sampleRateHz, observedHz)
+        }
         if (decoder.detectedShift != shiftBefore) {
             L.i(
                 "UsbIsoStreamEngine: feedback format shift $shiftBefore -> ${decoder.detectedShift} " +

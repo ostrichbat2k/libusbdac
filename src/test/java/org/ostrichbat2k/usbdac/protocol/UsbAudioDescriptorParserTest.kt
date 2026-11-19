@@ -19,6 +19,7 @@
 package org.ostrichbat2k.usbdac.protocol
 
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
@@ -405,6 +406,25 @@ class UsbAudioDescriptorParserUac2Test {
         assertEquals(-1, format.clusterDescriptorId) // UAC2 never sets this -- UAC3-only concept
         assertTrue(format.sampleRates.isEmpty()) // UAC2 negotiates rate via the Clock Source
         assertEquals(4, format.bInterval)
+    }
+
+    @Test
+    fun `an Asynchronous endpoint with no feedback endpoint is flagged as needing implicit feedback`() {
+        // fiioLikeConfig's data endpoint is Asynchronous (attributes 0x05) and has no feedback endpoint.
+        val format = UsbAudioDescriptorParserUac2.parseUac2Playback(fiioLikeConfig())!!.formats.single()
+        assertEquals(SyncType.ASYNC, format.syncType)
+        assertNull(format.feedbackEndpoint)
+        assertTrue(format.needsImplicitFeedback)
+    }
+
+    @Test
+    fun `an Asynchronous endpoint with a feedback endpoint, or a Synchronous one, is not flagged`() {
+        val feedback = D.endpoint(address = 0x87, attributes = 0x11, maxPacketSize = 4, bInterval = 4)
+        val withFeedback =
+            UsbAudioDescriptorParserUac2.parseUac2Playback(fiioLikeConfig() + feedback)!!.formats.single()
+        assertNotNull(withFeedback.feedbackEndpoint)
+        assertFalse(withFeedback.needsImplicitFeedback)
+        assertFalse(withFeedback.copy(syncType = SyncType.SYNCHRONOUS, feedbackEndpoint = null).needsImplicitFeedback)
     }
 
     @Test

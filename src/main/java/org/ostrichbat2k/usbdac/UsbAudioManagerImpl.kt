@@ -78,6 +78,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlin.concurrent.withLock
 import timber.log.Timber as L
 
 /**
@@ -901,42 +902,52 @@ class UsbAudioManagerImpl(
         // UsbAudioOutput's own construction (right after this returns) needs it held too, so
         // this must succeed before selectFormat, not be left for later.
         if (requestClaim() == ClaimOutcome.FAILED) return false
-        val previousConfig = activeFormat?.let { ActiveStreamConfig(it, activeRateHz) }
-        val newConfig = ActiveStreamConfig(format, sampleRateHz)
-        val configChanged = previousConfig != newConfig
-        var ok = true
-        if (configChanged) {
-            // Re-selecting the alt-setting -- even to the *same* alternateSetting value when
-            // only the sample rate changed, not the bit depth -- always issues a real
-            // SET_INTERFACE request (UsbDeviceConnection.setInterface never short-circuits a
-            // same-value call), which resets the device's endpoint, flushing whatever's still
-            // sitting in its internal FIFO from the previous rate. Without this, a same-alt
-            // rate-only change (e.g. 24-bit 44.1kHz -> 24-bit 96kHz) never touched the
-            // interface at all, since the old condition only re-selected on a genuine bit-depth
-            // change -- confirmed, reproduced: exactly that rate-only case (not a bit-depth
-            // change, which already re-selected and so was never affected) produced an audible
-            // crackle right as streaming resumed, consistent with leftover samples from the old
-            // rate getting flushed out of the device's FIFO at the new rate's timing instead of
-            // discarded cleanly beforehand.
-            //
-            // Same reasoning as the identical call in activateDac(): Android's own ALSA driver
-            // can race to re-claim the interface, and evicting it again right before
-            // selectFormat is safe/cheap insurance against that.
-            UsbAudioController.reassertKernelEviction(session)
-            ok = UsbAudioController.selectFormat(session, format) == UsbAudioController.ControlWriteOutcome.Success
-            if (ok) {
-                updateActiveSessionState { it.copy(format = format) }
-                diagnosticLogger.log("Switched to ${format.bitResolution}-bit (alt=${format.alternateSetting}) for upcoming track")
-                logIfImplicitFeedback(format)
-            } else {
-                diagnosticLogger.log("Failed to switch to ${format.bitResolution}-bit (alt=${format.alternateSetting}) for upcoming track")
+        // Compare, select and record as one step: two callers (a track change -- the old
+        // output's activation and the new output's provider) interleaving here could leave the
+        // cached format recording one alt-setting while the device is on the other, and the next
+        // call would then skip selectFormat() and stream on the wrong one (#146). The session's
+        // device-sequence lock rather than one of our own, because an output's relock also moves
+        // the alt-setting (to alt 0 and back to its own format, around the clock change) and
+        // holds that lock while it does (#143). The cost: a new track's getAudioOutput() can wait
+        // for an old output's relock to finish.
+        return session.deviceSequenceLock.withLock {
+            val previousConfig = activeFormat?.let { ActiveStreamConfig(it, activeRateHz) }
+            val newConfig = ActiveStreamConfig(format, sampleRateHz)
+            val configChanged = previousConfig != newConfig
+            var ok = true
+            if (configChanged) {
+                // Re-selecting the alt-setting -- even to the *same* alternateSetting value when
+                // only the sample rate changed, not the bit depth -- always issues a real
+                // SET_INTERFACE request (UsbDeviceConnection.setInterface never short-circuits a
+                // same-value call), which resets the device's endpoint, flushing whatever's still
+                // sitting in its internal FIFO from the previous rate. Without this, a same-alt
+                // rate-only change (e.g. 24-bit 44.1kHz -> 24-bit 96kHz) never touched the
+                // interface at all, since the old condition only re-selected on a genuine bit-depth
+                // change -- confirmed, reproduced: exactly that rate-only case (not a bit-depth
+                // change, which already re-selected and so was never affected) produced an audible
+                // crackle right as streaming resumed, consistent with leftover samples from the old
+                // rate getting flushed out of the device's FIFO at the new rate's timing instead of
+                // discarded cleanly beforehand.
+                //
+                // Same reasoning as the identical call in activateDac(): Android's own ALSA driver
+                // can race to re-claim the interface, and evicting it again right before
+                // selectFormat is safe/cheap insurance against that.
+                UsbAudioController.reassertKernelEviction(session)
+                ok = UsbAudioController.selectFormat(session, format) == UsbAudioController.ControlWriteOutcome.Success
+                if (ok) {
+                    updateActiveSessionState { it.copy(format = format) }
+                    diagnosticLogger.log("Switched to ${format.bitResolution}-bit (alt=${format.alternateSetting}) for upcoming track")
+                    logIfImplicitFeedback(format)
+                } else {
+                    diagnosticLogger.log("Failed to switch to ${format.bitResolution}-bit (alt=${format.alternateSetting}) for upcoming track")
+                }
             }
+            if (configChanged) {
+                updateActiveSessionState { it.copy(rateHz = sampleRateHz) }
+                controlWriter.refreshControlState(session, activeFormat ?: format, session.device.productName ?: session.device.deviceName)
+            }
+            ok
         }
-        if (configChanged) {
-            updateActiveSessionState { it.copy(rateHz = sampleRateHz) }
-            controlWriter.refreshControlState(session, activeFormat ?: format, session.device.productName ?: session.device.deviceName)
-        }
-        return ok
     }
 
     /**

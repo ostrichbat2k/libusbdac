@@ -33,6 +33,7 @@ import io.mockk.verify
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.runBlocking
 import org.junit.jupiter.api.AfterEach
+import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertNull
@@ -560,6 +561,47 @@ class UsbAudioManagerImplTest {
         assertTrue(manager.ensureFormatActive(testFormat, 44100))
 
         verify(exactly = 1) { session.connection.setInterface(altIface) }
+    }
+
+    /**
+     * Regression shape for #146: two concurrent calls for different formats (a track change: the
+     * old output's activation and the new output's provider). A selects alt 1 on the device but
+     * hasn't recorded it yet when B selects and records alt 2; A then records alt 1 over it. The
+     * cache says alt 1 while the device is on alt 2, so a later call for alt 1 skips SET_INTERFACE
+     * and streams on the wrong alt-setting.
+     */
+    @Test
+    fun `concurrent ensureFormatActive calls leave the cache matching the device`() {
+        val alt1 = mockk<UsbInterface>(relaxed = true)
+        val alt2 = mockk<UsbInterface>(relaxed = true)
+        val session = activatedSession(streamingAltSettings = mapOf(1 to alt1, 2 to alt2))
+        every { session.connection.claimInterface(any(), any()) } returns true
+        val deviceAlt = java.util.concurrent.atomic.AtomicReference<UsbInterface?>()
+        val aSelected = java.util.concurrent.CountDownLatch(1)
+        val releaseA = java.util.concurrent.CountDownLatch(1)
+        var first = true
+        every { session.connection.setInterface(any()) } answers
+            {
+                deviceAlt.set(firstArg())
+                val isFirst = synchronized(this@UsbAudioManagerImplTest) { first.also { first = false } }
+                if (isFirst) {
+                    aSelected.countDown()
+                    releaseA.await(2, java.util.concurrent.TimeUnit.SECONDS)
+                }
+                true
+            }
+
+        val a = Thread { manager.ensureFormatActive(testFormat, 44100) }.apply { start() }
+        assertTrue(aSelected.await(2, java.util.concurrent.TimeUnit.SECONDS))
+        val b = Thread { manager.ensureFormatActive(testFormatAlt2, 48000) }.apply { start() }
+        b.join(300) // without serialisation B finishes here, inside A's window
+        releaseA.countDown()
+        a.join(2000)
+        b.join(2000)
+
+        // Whatever order they ran in, asking for alt 1 again must leave the device on alt 1.
+        assertTrue(manager.ensureFormatActive(testFormat, 44100))
+        assertEquals(alt1, deviceAlt.get(), "the cached format had drifted from the device's alt-setting")
     }
 
     @Test

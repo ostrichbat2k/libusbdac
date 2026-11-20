@@ -62,6 +62,10 @@ Pin to an exact tag or commit rather than a version range.
 - Overlapping DAC activations no longer leak a session, an activation
   finishing after USB output was turned off no longer brings the session
   back, and deactivating twice no longer closes the session twice (#144).
+- A fatal stream error now stops and closes the stream before the session
+  is torn down, off the streaming thread, and each native stream works on
+  its own duplicate of the connection's fd, so a stale stream can never act
+  on a reused fd number (#145).
 - UAC1 devices that don't implement the Sampling Frequency control no
   longer fail activation (#128).
 - Honour the UAC2/3 Clock Source's `bmControls`: a read-only frequency is

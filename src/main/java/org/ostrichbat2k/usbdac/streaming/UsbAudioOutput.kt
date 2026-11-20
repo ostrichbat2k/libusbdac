@@ -142,7 +142,7 @@ class UsbAudioOutput(
             ringBuffer = ringBuffer,
             paused = { paused },
             reportPipelineStats = usbAudioManager::reportPipelineStats,
-            onFatalStreamError = usbAudioManager::notifyStreamFatalError,
+            onFatalStreamError = ::onStreamFatalError,
             urbQueue = usbSettings.urbQueueOverride?.coerced() ?: UrbQueueShape.DEFAULT,
             onFeedbackRateMismatch = usbAudioManager::reportFeedbackRateMismatch,
             nativeBridge = nativeBridge,
@@ -184,7 +184,9 @@ class UsbAudioOutput(
     @Volatile private var activating = false
     // Set by release() so a background activation that's still running when this instance is
     // abandoned (e.g. a track skip landing mid-relock) hands back whatever it (re)claimed instead
-    // of starting a stream nothing will ever read from -- see play()'s completion callback.
+    // of starting a stream nothing will ever read from -- see play()'s completion callback. Also
+    // set after a fatal stream error (see tearDownAfterFatalError): this instance's session is
+    // deactivated then, so it can never stream again either.
     @Volatile private var released = false
 
     // Serializes every place that decides whether to start/stop the native stream together with
@@ -1044,6 +1046,39 @@ class UsbAudioOutput(
 
     /** See [UsbIsoStreamEngine.stop] -- the native handle lifetime/URB loop/position tracking live there (#73). */
     private fun stopStreamingThread() = streamEngine.stop()
+
+    /**
+     * The engine's fatal-error callback. Runs on the streaming thread itself, which can't stop the
+     * engine (that joins this very thread) -- and the session must not be torn down until the
+     * engine has: deactivating closes the connection's fd while the native streams are still
+     * open, and a stop() after that ran DISCARDURB and the close drain against whatever connection
+     * got that fd number next, stealing its completions (#145). So this only hands off.
+     */
+    private fun onStreamFatalError() {
+        Thread(::tearDownAfterFatalError, "usbdac-fatal-teardown")
+            .apply {
+                isDaemon = true
+                start()
+            }
+    }
+
+    /**
+     * Stops and closes the engine, retires this instance -- its session is about to be
+     * deactivated, so it can never stream again, and a running activation must not restart the
+     * stream -- and only then has [UsbAudioManager.notifyStreamFatalError] tear the session down.
+     */
+    private fun tearDownAfterFatalError() {
+        synchronized(activationLock) {
+            released = true
+            stopStreamingThread()
+            if (activated) {
+                activated = false
+                usbAudioManager.notifyStreamingStopped()
+                usbAudioManager.setDirectPlaybackActive(false)
+            }
+        }
+        usbAudioManager.notifyStreamFatalError()
+    }
 
     /**
      * Whether [thread] is still running after [stopStreamingThread]'s join -- i.e.

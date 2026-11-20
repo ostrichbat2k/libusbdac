@@ -32,12 +32,14 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
 #include <jni.h>
 #include <linux/usbdevice_fs.h>
 #include <mutex>
 #include <new>
 #include <sys/ioctl.h>
 #include <thread>
+#include <unistd.h>
 #include <unordered_map>
 
 #define LOG_TAG "UsbNative"
@@ -108,9 +110,17 @@ Java_org_ostrichbat2k_usbdac_streaming_UsbNative_getUsbSpeed(JNIEnv* /*env*/, jo
 // async_completed, reap_as() in drivers/usb/core/devio.c) -- REAPURB returns the next finished
 // URB on the fd whichever stream submitted it. So exactly one thread reaps per fd, and
 // reapIsoAny tells it which open stream a completion belongs to by the URB's address (#139).
+//
+// Each stream works on its own dup() of the caller's fd, made at open and closed at close (#145).
+// The caller's fd belongs to its UsbDeviceConnection, which can be closed while a stream is still
+// open -- and the number then handed to the next connection, so a stream still using it would
+// discard and drain that connection's URBs instead of its own. A dup refers to the same open file,
+// so claims and the completion list above stay shared between the streams of one connection.
 
 struct IsoStream {
-    int fd;
+    // This stream's own dup of the caller's fd; -1 until made. Explicit, since the zero
+    // value-initialisation `new IsoStream()` gives would otherwise make freeStream close fd 0.
+    int fd = -1;
     unsigned char endpoint;
     int packetsPerUrb;
     int numUrbs;
@@ -206,6 +216,7 @@ static void freeStream(IsoStream* stream) {
         }
         delete[] stream->urbs;
     }
+    if (stream->fd >= 0) close(stream->fd);
     delete stream;
 }
 
@@ -255,7 +266,12 @@ Java_org_ostrichbat2k_usbdac_streaming_UsbNative_openIsoStream(
         // understand it and this app crashes unpredictably rather than failing cleanly), so every
         // throwing call in this function must be inside this try block.
         stream = new IsoStream();
-        stream->fd = fd;
+        stream->fd = fcntl(fd, F_DUPFD_CLOEXEC, 0);
+        if (stream->fd < 0) {
+            LOGE("openIsoStream: could not dup fd %d: %s", fd, strerror(errno));
+            freeStream(stream);
+            return 0;
+        }
         stream->endpoint = (unsigned char) endpointAddress;
         stream->packetsPerUrb = packetsPerUrb;
         stream->numUrbs = numUrbs;
@@ -482,16 +498,17 @@ int reapErrorCodeForErrno(int err) {
     return err == EINTR ? kReapErrorTransient : kReapErrorFatal;
 }
 
-// The handle of the open stream on [fd] that [reaped] belongs to, or 0 if none does. Found by
-// address, since every stream on the fd numbers its slots from 0, so usercontext alone cannot
-// tell them apart (#139). A handful of streams with a handful of URBs each, so a linear scan.
-// The caller still has to acquireStream() the result, which fails cleanly if it was closed in
+// The handle of the open stream that [reaped] belongs to, or 0 if none does. Found by address,
+// since every stream numbers its slots from 0, so usercontext alone cannot tell them apart (#139).
+// The address alone is enough: it is unique among open streams, and REAPURB on a file only ever
+// returns URBs submitted on that file. Streams can't be matched by fd any more, since each holds
+// its own dup (#145). A handful of streams with a handful of URBs each, so a linear scan. The
+// caller still has to acquireStream() the result, which fails cleanly if it was closed in
 // between. External linkage so native-test/usb_native_test.cpp can call it directly.
-int64_t reapedUrbOwnerHandle(int fd, const struct usbdevfs_urb* reaped) {
+int64_t reapedUrbOwnerHandle(const struct usbdevfs_urb* reaped) {
     std::lock_guard<std::mutex> lock(g_streamsMutex);
     for (const auto& entry : g_streams) {
         const IsoStream* stream = entry.second;
-        if (stream->fd != fd) continue;
         for (int i = 0; i < stream->numUrbs; i++) {
             if (stream->urbs[i] == reaped) return entry.first;
         }
@@ -550,7 +567,7 @@ Java_org_ostrichbat2k_usbdac_streaming_UsbNative_reapIsoAny(JNIEnv* /*env*/, job
         return kReapErrorFatal;
     }
 
-    int64_t ownerHandle = reapedUrbOwnerHandle(stream->fd, reaped);
+    int64_t ownerHandle = reapedUrbOwnerHandle(reaped);
     IsoStream* owner = ownerHandle != 0 ? acquireStream(ownerHandle) : nullptr;
     if (!owner) {
         // Its stream was already closed: nobody is waiting for it, and its memory must not be

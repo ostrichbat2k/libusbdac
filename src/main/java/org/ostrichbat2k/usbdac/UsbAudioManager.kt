@@ -137,12 +137,16 @@ interface UsbAudioManager : UsbDacPreferences.Listener {
     fun notifyStreamingStopped()
 
     /**
-     * Called from the streaming thread itself (#51) the instant [UsbIsoStreamEngine
+     * Called (#51) as soon as [UsbIsoStreamEngine
      * ][org.ostrichbat2k.usbdac.streaming.UsbIsoStreamEngine] discovers the main stream can never
      * produce anything more (a fatal `reapIsoAny()` error -- device loss, most likely). Lets the
      * session deactivate right now instead of waiting for a [UsbAudioOutputProvider
      * ][org.ostrichbat2k.usbdac.streaming.UsbAudioOutputProvider]-driven rebuild to also wedge
      * against the same dead session, or for the generic `isStalled()` poll to eventually notice.
+     *
+     * Not called on the streaming thread itself, and only once the output has stopped the engine
+     * and closed its native streams, so the session's fd is closed after them, never under them
+     * (#145).
      */
     fun notifyStreamFatalError()
 

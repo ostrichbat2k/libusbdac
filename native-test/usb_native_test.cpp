@@ -48,7 +48,7 @@ void Java_org_ostrichbat2k_usbdac_streaming_UsbNative_closeIsoStream(JNIEnv*, jo
 int processReapedUrb(const struct usbdevfs_urb* reaped, int packetsPerUrb, int numUrbs,
                       int* badPacketsOut = nullptr, int64_t* shortBytesOut = nullptr);
 int reapErrorCodeForErrno(int err);
-int64_t reapedUrbOwnerHandle(int fd, const struct usbdevfs_urb* reaped);
+int64_t reapedUrbOwnerHandle(const struct usbdevfs_urb* reaped);
 const struct usbdevfs_urb* urbForTesting(jlong handle, int slot);
 jlong packReapResult(int64_t handle, int slot);
 
@@ -371,21 +371,47 @@ TEST_F(DummyFd, ReapedUrbOwnerIsFoundByAddressAmongStreamsSharingTheFd) {
 
     for (int slot = 0; slot < 2; slot++) {
         // Same slot number on both streams -- usercontext alone would be ambiguous.
-        EXPECT_EQ(reapedUrbOwnerHandle(fd_, urbForTesting(main, slot)), main);
-        EXPECT_EQ(reapedUrbOwnerHandle(fd_, urbForTesting(feedback, slot)), feedback);
+        EXPECT_EQ(reapedUrbOwnerHandle(urbForTesting(main, slot)), main);
+        EXPECT_EQ(reapedUrbOwnerHandle(urbForTesting(feedback, slot)), feedback);
     }
-    EXPECT_EQ(reapedUrbOwnerHandle(fd_, urbForTesting(main, 3)), main);
+    EXPECT_EQ(reapedUrbOwnerHandle(urbForTesting(main, 3)), main);
 
     Java_org_ostrichbat2k_usbdac_streaming_UsbNative_closeIsoStream(nullptr, nullptr, main);
     Java_org_ostrichbat2k_usbdac_streaming_UsbNative_closeIsoStream(nullptr, nullptr, feedback);
 }
 
-TEST_F(DummyFd, ReapedUrbOwnerIgnoresStreamsOnOtherFds) {
+// --- Each stream's own dup of the caller's fd (#145). ---
+
+// Whether [fd] is an open descriptor in this process.
+bool isOpenFd(int fd) { return fcntl(fd, F_GETFD) != -1; }
+
+// The lowest unused descriptor number -- what the next open (or the stream's dup) will get.
+int lowestFreeFd() {
+    int fd = open("/dev/null", O_RDONLY);
+    if (fd >= 0) close(fd);
+    return fd;
+}
+
+TEST_F(DummyFd, StreamKeepsItsOwnFdAfterTheCallersIsClosed) {
     ASSERT_GE(fd_, 0);
+    int own = lowestFreeFd();
     jlong handle = openValidStream(fd_);
     ASSERT_NE(handle, 0);
-    EXPECT_EQ(reapedUrbOwnerHandle(fd_ + 1000, urbForTesting(handle, 0)), 0);
+    close(fd_);  // the UsbDeviceConnection closing under a stream that is still open
+    fd_ = open("/dev/zero", O_RDONLY);  // a new connection, given the freed number
+
+    EXPECT_TRUE(isOpenFd(own)) << "the stream has no descriptor of its own";
     Java_org_ostrichbat2k_usbdac_streaming_UsbNative_closeIsoStream(nullptr, nullptr, handle);
+    EXPECT_FALSE(isOpenFd(own)) << "the stream's own fd leaked";
+    EXPECT_TRUE(isOpenFd(fd_)) << "closing the stream closed the new connection's fd";
+}
+
+TEST_F(DummyFd, OpenFailsCleanlyOnAnFdThatCannotBeDuplicated) {
+    ASSERT_GE(fd_, 0);
+    int closed = fd_;
+    close(fd_);
+    fd_ = -1;
+    EXPECT_EQ(openValidStream(closed), 0);
 }
 
 TEST_F(DummyFd, ReapedUrbOwnerIsNoneForAnAddressNoStreamOwns) {
@@ -393,7 +419,7 @@ TEST_F(DummyFd, ReapedUrbOwnerIsNoneForAnAddressNoStreamOwns) {
     jlong handle = openValidStream(fd_);
     ASSERT_NE(handle, 0);
     struct usbdevfs_urb stray {};
-    EXPECT_EQ(reapedUrbOwnerHandle(fd_, &stray), 0);
+    EXPECT_EQ(reapedUrbOwnerHandle(&stray), 0);
     Java_org_ostrichbat2k_usbdac_streaming_UsbNative_closeIsoStream(nullptr, nullptr, handle);
 }
 
@@ -407,7 +433,7 @@ TEST_F(DummyFd, ReapedUrbOwnerIsNoneOnceItsStreamIsClosed) {
     Java_org_ostrichbat2k_usbdac_streaming_UsbNative_closeIsoStream(nullptr, nullptr, closing);
     // Only the address is compared, never dereferenced -- safe even though it was just freed. No
     // allocation happens in between, so `staying` cannot have been given that address.
-    EXPECT_EQ(reapedUrbOwnerHandle(fd_, urb), 0);
+    EXPECT_EQ(reapedUrbOwnerHandle(urb), 0);
     Java_org_ostrichbat2k_usbdac_streaming_UsbNative_closeIsoStream(nullptr, nullptr, staying);
 }
 

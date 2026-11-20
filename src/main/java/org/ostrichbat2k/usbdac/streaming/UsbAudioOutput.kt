@@ -596,39 +596,69 @@ class UsbAudioOutput(
     override fun play() {
         L.i("UsbAudioOutput: play()")
         paused = false
-        if (!activated && !activating) {
-            activating = true
-            activationExecutor.execute {
-                // Brackets the whole attempt, not just requestClaim() itself -- see
-                // UsbClaimController.beginClaimAttempt's own doc comment for why
-                // notifyStreamingStarted() alone (only called below once this succeeds) isn't
-                // early enough a guard against a concurrent releaseClaim() mid-relock.
-                usbAudioManager.beginClaimAttempt()
-                try {
-                    val result = activateAndStream()
-                    val needsSettle = result == ActivationResult.NEEDS_SETTLE
-                    val started =
-                        onActivationAttemptFinished(result != ActivationResult.FAILED, holdSilence = needsSettle)
-                    if (needsSettle && started) {
-                        val settled =
-                            try {
-                                settleWhileStreaming()
-                            } catch (e: UsbVolumeSafetyException) {
-                                // See settleWhileStreaming()'s safety check -- surfaced to the
-                                // host app as a real, user-visible error (not just a log line)
-                                // rather than silently falling back to isStalled()'s generic
-                                // stuck-player detection, since this is specifically about not
-                                // streaming audio the user never had a chance to react to.
-                                L.e("UsbAudioOutput: aborting activation -- ${e.message}")
-                                usbAudioManager.reportVolumeSafetyViolation()
-                                false
-                            }
-                        onSettleFinished(settled)
+        // Check-and-set under activationLock: two play() calls (or one racing the end-of-attempt
+        // re-check below) must never both start an attempt -- the second would start the stream
+        // a second time over the first and count it twice (#149).
+        val startAttempt =
+            synchronized(activationLock) {
+                (!activated && !activating).also { if (it) activating = true }
+            }
+        if (startAttempt) activationExecutor.execute { runActivationAttempt() }
+    }
+
+    /** One background activation attempt, started by [play] -- see its doc comment. */
+    private fun runActivationAttempt() {
+        // Whether the hardware ended up ready -- the attempt itself didn't fail -- so that a
+        // play() it missed may simply try again (#149) without retrying a real failure forever.
+        var hardwareReady = false
+        // Brackets the whole attempt, not just requestClaim() itself -- see
+        // UsbClaimController.beginClaimAttempt's own doc comment for why
+        // notifyStreamingStarted() alone (only called below once this succeeds) isn't
+        // early enough a guard against a concurrent releaseClaim() mid-relock.
+        usbAudioManager.beginClaimAttempt()
+        try {
+            val result = activateAndStream()
+            hardwareReady = result == ActivationResult.READY
+            val needsSettle = result == ActivationResult.NEEDS_SETTLE
+            val started =
+                onActivationAttemptFinished(result != ActivationResult.FAILED, holdSilence = needsSettle)
+            if (needsSettle) {
+                // Paused before the stream could start: the hardware is configured up to the
+                // clock change, and a later play() redoes the relock from the start anyway.
+                hardwareReady = !started
+            }
+            if (needsSettle && started) {
+                val settled =
+                    try {
+                        settleWhileStreaming()
+                    } catch (e: UsbVolumeSafetyException) {
+                        // See settleWhileStreaming()'s safety check -- surfaced to the
+                        // host app as a real, user-visible error (not just a log line)
+                        // rather than silently falling back to isStalled()'s generic
+                        // stuck-player detection, since this is specifically about not
+                        // streaming audio the user never had a chance to react to.
+                        L.e("UsbAudioOutput: aborting activation -- ${e.message}")
+                        usbAudioManager.reportVolumeSafetyViolation()
+                        false
                     }
-                } finally {
-                    usbAudioManager.endClaimAttempt()
+                hardwareReady = settled
+                onSettleFinished(settled)
+            }
+        } finally {
+            usbAudioManager.endClaimAttempt()
+            // A play() landing after this attempt decided "not wanted" (paused) but before
+            // activating was cleared saw activating == true and did nothing, leaving nothing
+            // streaming until isStalled() forced a full stall recovery (#149). Re-checked under
+            // the same lock play() now checks under, so exactly one of them starts the next
+            // attempt.
+            val playArrivedLate =
+                synchronized(activationLock) {
                     activating = false
+                    hardwareReady && !paused && !activated && !released
                 }
+            if (playArrivedLate) {
+                L.i("UsbAudioOutput: play() arrived as the activation finished -- activating again")
+                play()
             }
         }
     }

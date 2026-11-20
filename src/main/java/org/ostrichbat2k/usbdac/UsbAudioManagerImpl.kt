@@ -499,12 +499,16 @@ class UsbAudioManagerImpl(
      * through [AtomicReference.updateAndGet]'s CAS retry loop instead, so a losing attempt
      * reapplies its own transform against the winner's result rather than being discarded.
      */
+    //
+    // Transitions between states are tied to the activation that makes them (#144): each
+    // [runActivation] publishes its own [SessionState.Activating] instance with compareAndSet
+    // from Idle, and only that same instance (compared by identity -- it's a data class, so two
+    // activations for one device are equal but not the same) may move on to Active or back to
+    // Idle. [deactivateDac] takes whatever is there with getAndSet. So there's no setter: every
+    // transition is one of those.
     private val sessionStateRef = AtomicReference<SessionState>(SessionState.Idle)
-    private var sessionState: SessionState
+    private val sessionState: SessionState
         get() = sessionStateRef.get()
-        set(value) {
-            sessionStateRef.set(value)
-        }
 
     /**
      * Atomically applies [transform] to the current state iff it's currently
@@ -529,7 +533,11 @@ class UsbAudioManagerImpl(
     // Set/cleared only in runActivation's own background thread, bracketing the *entire*
     // activateDac() call (see its own finally block) rather than just the part of it that happens
     // to run before sessionState's own transition.
-    @Volatile private var pendingActivationSettled: CompletableDeferred<Unit>? = null
+    // An AtomicReference so an activation clears only its own (#144): a superseded activation
+    // still finishing must not clear the one a newer runActivation has set.
+    private val pendingActivationSettledRef = AtomicReference<CompletableDeferred<Unit>?>(null)
+    private val pendingActivationSettled: CompletableDeferred<Unit>?
+        get() = pendingActivationSettledRef.get()
 
     private val activeSession: UsbAudioSession?
         get() = (sessionState as? SessionState.Active)?.session
@@ -618,19 +626,27 @@ class UsbAudioManagerImpl(
      * claimed it would.
      */
     private fun runActivation(device: UsbDevice) {
+        val activating = SessionState.Activating(device)
+        // Only from Idle: two callers (the player thread's resolveActiveSink/triggerActivation
+        // and discovery on the main thread) racing past ensureActivated's Idle check, or a
+        // retryActivation landing while an activation is already running, must not each start
+        // one -- the loser's session would never be closed (#144).
+        if (!sessionStateRef.compareAndSet(SessionState.Idle, activating)) {
+            L.i("runActivation: an activation is already running or a session is active -- not starting another")
+            return
+        }
         activationAttemptedFor = device.deviceName
         val deferred = CompletableDeferred<Unit>()
-        pendingActivationSettled = deferred
-        sessionState = SessionState.Activating(device)
+        pendingActivationSettledRef.set(deferred)
         updateBlockPlayback()
         activationThread =
             Thread {
                     try {
-                        activateDac(device)
+                        activateDac(device, activating)
                     } finally {
-                        settleActivation()
+                        settleActivation(activating)
                         deferred.complete(Unit)
-                        pendingActivationSettled = null
+                        pendingActivationSettledRef.compareAndSet(deferred, null)
                     }
                 }
                 .apply {
@@ -652,15 +668,19 @@ class UsbAudioManagerImpl(
         activationThread?.join(timeoutMs)
     }
 
+    internal fun activationThreadForTest(): Thread? = activationThread
+
+    internal fun activeSessionForTest(): UsbAudioSession? = activeSession
+
     /**
-     * Called when a background [activateDac] call returns, success or failure. If it already
-     * transitioned [sessionState] to [SessionState.Active], leave it alone -- this only has to
-     * recover from the failure case (still [SessionState.Activating]) or a concurrent
-     * [deactivateDac] that already reset to [SessionState.Idle] in the meantime (checking first
-     * avoids implying this call is what decided we're idle, when it wasn't).
+     * Called when a background [activateDac] call returns, success or failure. Moves back to
+     * Idle only if the state is still this activation's own [activating] -- the failure case.
+     * Anything else (it reached Active, a [deactivateDac] already took it, or a newer activation
+     * has started since) is left alone; before #144 this cleared any Activating, a newer
+     * activation's included.
      */
-    private fun settleActivation() {
-        if (sessionState is SessionState.Activating) sessionState = SessionState.Idle
+    private fun settleActivation(activating: SessionState.Activating) {
+        sessionStateRef.compareAndSet(activating, SessionState.Idle)
         updateBlockPlayback()
     }
 
@@ -993,9 +1013,21 @@ class UsbAudioManagerImpl(
      * activation that still belongs here rather than in [UsbDacActivator], since it's what
      * actually adopts a freshly-activated session into this class's own state machine.
      */
-    private fun activateDac(device: UsbDevice) {
+    private fun activateDac(device: UsbDevice, activating: SessionState.Activating) {
         val result = dacActivator.activate(device) ?: return
-        sessionState = SessionState.Active(result.session, result.format, result.rateHz)
+        // Marked claimed before the session is published, not after (where the tail below used
+        // to do it): a deactivateDac() landing after publication then sees the claim and hands
+        // the hardware off properly, instead of this marking a closed session claimed afterwards.
+        claimController.markAlreadyClaimed()
+        val active = SessionState.Active(result.session, result.format, result.rateHz)
+        if (!sessionStateRef.compareAndSet(activating, active)) {
+            // Deactivated (USB output turned off, a retryActivation, the device detached) while
+            // this activation ran. Publishing the session anyway would bring a deactivated session
+            // back, or leak this one's claimed interfaces when another activation's won (#144).
+            L.w("activateDac: deactivated while activating -- closing the new session")
+            closeSession(result.session)
+            return
+        }
         controlWriter.refreshControlState(result.session, result.format, device.productName ?: device.deviceName)
         diagnosticLogger.log("DAC session ready: ${result.format} at ${result.rateHz} Hz")
         logIfImplicitFeedback(result.format)
@@ -1019,8 +1051,7 @@ class UsbAudioManagerImpl(
         // before Android's own UsbAlsaManager catches up to the just-released device silently
         // succeeds routed to the speaker instead, and Android never revisits that choice for it
         // -- confirmed, reproduced: opening another app's player right after granting permission,
-        // before ever pressing play in this app at all.
-        claimController.markAlreadyClaimed()
+        // before ever pressing play in this app at all. (The claim was marked as ours above.)
         releaseClaim(delayMs = 0, awaitAndroidTakeover = true, deactivateOnTimeout = false)
     }
 
@@ -1045,15 +1076,13 @@ class UsbAudioManagerImpl(
      * redundant and removed, since every caller gets the correct behavior from here instead.
      */
     private fun deactivateDac() {
-        val session = activeSession
-        // Cancels pending releases, forces the hardware to the HAL-handoff level if still claimed
-        // (see that function's doc comment for the silent-fallback bug that prevents), marks the
-        // claim gone and records the device for the takeover wait -- under the claim
-        // controller's lock, so a release on its scheduler can't interleave (#142). Captured
-        // before activeSession is cleared below.
-        claimController.releaseForDeactivation(session)
-        session?.let { UsbAudioController.release(it) }
-        sessionState = SessionState.Idle
+        // Takes the state in one step, so two concurrent calls (a settings change and a fatal
+        // stream error) can't both close the same session; the second finds Idle (#144). An
+        // Activating taken here has no session yet -- its activation sees it's gone and closes
+        // its own session when it finishes (see activateDac).
+        val session = (sessionStateRef.getAndSet(SessionState.Idle) as? SessionState.Active)?.session
+        closeSession(session)
+        updateBlockPlayback()
         _controlState.value = null
         _capabilities.value = null
         // The whole session is genuinely done (device unplugged, or USB DAC output turned off)
@@ -1064,6 +1093,18 @@ class UsbAudioManagerImpl(
             directPlaybackTrack?.release()
             directPlaybackTrack = null
         }
+    }
+
+    /**
+     * Closes [session] (or, with null, just resets the claim state). Cancels pending releases,
+     * forces the hardware to the HAL-handoff level if still claimed (see that function's doc
+     * comment for the silent-fallback bug that prevents), marks the claim gone and records the
+     * device for the takeover wait -- under the claim controller's lock, so a release on its
+     * scheduler can't interleave (#142) -- then releases the interfaces and the connection.
+     */
+    private fun closeSession(session: UsbAudioSession?) {
+        claimController.releaseForDeactivation(session)
+        session?.let { UsbAudioController.release(it) }
     }
 
     /**

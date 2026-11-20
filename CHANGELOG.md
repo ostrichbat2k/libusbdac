@@ -56,6 +56,9 @@ Pin to an exact tag or commit rather than a version range.
   outputs' relock sequences on one session no longer interleave, so an
   old output can't unmute the DAC mid-way through the next one's clock
   change (#143).
+- Concurrent `ensureFormatActive()` calls (and an output's relock) can no
+  longer leave the cached format out of step with the device's actual
+  alt-setting (#146).
 - UAC1 devices that don't implement the Sampling Frequency control no
   longer fail activation (#128).
 - Honour the UAC2/3 Clock Source's `bmControls`: a read-only frequency is

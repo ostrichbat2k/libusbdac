@@ -27,6 +27,7 @@ import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbInterface
 import android.hardware.usb.UsbManager
+import java.util.concurrent.locks.ReentrantLock
 import org.ostrichbat2k.usbdac.quirks.UsbDeviceQuirk
 import org.ostrichbat2k.usbdac.quirks.UsbDeviceQuirks
 import timber.log.Timber as L
@@ -54,7 +55,18 @@ data class UsbAudioSession(
     val clockSupportedRates: List<Pair<Int, Int>> = emptyList(),
     /** This device's [UsbDeviceQuirk]s, looked up once at activation (#132). */
     val quirks: Set<UsbDeviceQuirk> = emptySet(),
-)
+) {
+    /**
+     * Held across each multi-write device sequence an output runs -- a relock's mute, clock
+     * change and the settle/volume/unmute that follows it -- so two [UsbAudioOutput]s on this
+     * session (a track change: the old one's activation still finishing as the new one starts)
+     * never interleave them. Interleaved, the old output could unmute the DAC in the middle of the
+     * new one's clock change, or restore its own rate's state over the new one's (#143). Not part
+     * of equals/hashCode; a [copy] gets its own, which is fine since copies are only made while
+     * activating, before any output sees the session.
+     */
+    val deviceSequenceLock = ReentrantLock()
+}
 
 /**
  * Switches a UAC3 device into its playback configuration, claims the relevant interfaces, and

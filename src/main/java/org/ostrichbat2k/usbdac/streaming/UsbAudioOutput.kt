@@ -34,6 +34,7 @@ import androidx.media3.common.PlaybackParameters
 import androidx.media3.exoplayer.audio.AudioOutput
 import java.nio.ByteBuffer
 import java.util.concurrent.Executors
+import kotlin.concurrent.withLock
 import timber.log.Timber as L
 
 /**
@@ -82,6 +83,9 @@ class UsbAudioOutput(
     // this instance genuinely stops being used, and reclaim it when actually needed again --
     // see activateAndStream()/pause()'s doc comments.
     private val usbAudioManager: UsbAudioManager,
+    // The engine's native calls -- a seam so a test can run the real activation through phase 2
+    // (#143) without touching UsbNative; see UsbNativeBridge's doc comment.
+    nativeBridge: UsbNativeBridge = UsbNativeBridgeImpl,
 ) : AudioOutput {
 
     /** What [write]'s `buffer` holds, and therefore how it needs to be converted -- see [write]'s own doc comment. */
@@ -141,6 +145,7 @@ class UsbAudioOutput(
             onFatalStreamError = usbAudioManager::notifyStreamFatalError,
             urbQueue = usbSettings.urbQueueOverride?.coerced() ?: UrbQueueShape.DEFAULT,
             onFeedbackRateMismatch = usbAudioManager::reportFeedbackRateMismatch,
+            nativeBridge = nativeBridge,
         )
 
     // The isochronous schedule can't actually stop (the USB clock must keep ticking), so "pause"
@@ -230,7 +235,8 @@ class UsbAudioOutput(
      * What [activateAndStream] left to do: nothing ([READY]), or phase 2 with the stream in
      * pre-roll ([NEEDS_SETTLE], #127).
      */
-    private enum class ActivationResult { FAILED, READY, NEEDS_SETTLE }
+    /** [RELEASED]: [release] landed mid-relock, so the attempt stopped writing to the device (#143). */
+    private enum class ActivationResult { FAILED, READY, NEEDS_SETTLE, RELEASED }
 
     private companion object {
         const val STREAM_ESTABLISH_POLL_MS = 5L
@@ -336,6 +342,28 @@ class UsbAudioOutput(
             return ActivationResult.READY
         }
 
+        return session.deviceSequenceLock.withLock { relockHardware() }
+    }
+
+    /**
+     * True, with a log line, once [release] has been called -- checked between [relockHardware]'s
+     * and [settleWhileStreaming]'s device writes, so a released instance stops writing to a device
+     * that the next output may be about to relock (#143). Stopping leaves the DAC muted, which is
+     * safe: the next output's own relock unmutes it, and a hand-off to Android unmutes it too
+     * (UsbVolumeController.prepareForHalHandoff).
+     */
+    private fun releasedMidSequence(step: String): Boolean {
+        if (released) L.i("UsbAudioOutput: released mid-relock -- stopping before $step")
+        return released
+    }
+
+    /**
+     * Phase 1's device writes -- mute, clock change, power-domain wake -- split out of
+     * [activateAndStream] so they run under [UsbAudioSession.deviceSequenceLock] (#143).
+     */
+    private fun relockHardware(): ActivationResult {
+        if (releasedMidSequence("muting")) return ActivationResult.RELEASED
+
         // Mute before touching the clock at all, not after -- a clock-frequency change makes the
         // DAC chip's PLL re-lock to a new rate, and many real DACs produce an audible transient
         // (a "thunk"/pop, the same reason higher-end gear often has an audible relay click on a
@@ -346,6 +374,7 @@ class UsbAudioOutput(
         // muted until settleWhileStreaming() has the clock confirmed locked, with the pre-roll
         // stream already running (#127).
         UsbAudioController.setMute(session, muted = true)
+        if (releasedMidSequence("the clock change")) return ActivationResult.RELEASED
 
         // UsbSampleRateConfigurator picks the UAC 1.0 endpoint request or the UAC 2.0/3.0 Clock
         // Source request -- see writeSampleRate's doc comment for why that choice matters.
@@ -402,10 +431,16 @@ class UsbAudioOutput(
      * so the device is unmuted onto silence, and only then does [onSettleFinished] let real
      * audio in, faded in.
      *
-     * Throws [UsbVolumeSafetyException] exactly as that sequence always has.
+     * Throws [UsbVolumeSafetyException] exactly as that sequence always has. Runs under
+     * [UsbAudioSession.deviceSequenceLock], and returns false (not settled) without further
+     * device writes once [release] has been called (#143).
      */
-    private fun settleWhileStreaming(): Boolean {
+    private fun settleWhileStreaming(): Boolean = session.deviceSequenceLock.withLock { settleLocked() }
+
+    /** [settleWhileStreaming]'s body; caller holds [UsbAudioSession.deviceSequenceLock]. */
+    private fun settleLocked(): Boolean {
         awaitStreamEstablished()
+        if (releasedMidSequence("the clock-valid poll")) return false
 
         // See UsbAudioTuning.DAC_SETTLE_DELAY_MS: give the clock change time to actually lock
         // before real audio goes out -- pre-roll silence is flowing meanwhile (#127), so a device
@@ -460,6 +495,7 @@ class UsbAudioOutput(
         // every HAL->DAC switch, which UsbVolumeProvider.applyRange() then read back as "the
         // current volume", computing every subsequent adjustment from a wrong (maxed) baseline.
         // Confirmed, reproduced: "switch to DAC, press volume down once, volume jumps to max".
+        if (releasedMidSequence("the volume restore")) return false
         restoreVolumeAfterRelock()
 
         // Last-instant safety read-back, right before this instance would otherwise unmute and
@@ -492,6 +528,7 @@ class UsbAudioOutput(
         // rather than just being corrected once, after the fact. The stream is still carrying
         // pre-roll silence here, so the device is unmuted onto silence; onSettleFinished() lets
         // the track in afterwards, faded in (#127).
+        if (releasedMidSequence("unmuting")) return false
         UsbAudioController.setMute(session, muted = false)
 
         hasConfiguredHardware = true

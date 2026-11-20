@@ -40,6 +40,8 @@ class FakeFeatureUnit(private val unitId: Int, private val controlInterfaceId: I
 
     fun volumeOf(channel: Int): Int = volume.getValue(channel)
 
+    fun isMuted(channel: Int): Boolean = mute.getValue(channel)
+
     fun install(connection: UsbDeviceConnection) {
         val wIndex = (unitId shl 8) or controlInterfaceId
         every { connection.controlTransfer(any(), any(), any(), any(), any(), any(), any()) } answers

@@ -25,7 +25,11 @@ import io.mockk.mockk
 import io.mockk.mockkObject
 import io.mockk.unmockkObject
 import io.mockk.verify
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import org.junit.jupiter.api.AfterEach
+import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.ostrichbat2k.usbdac.UsbAudioManager
@@ -96,7 +100,65 @@ class UsbAudioOutputActivationTest {
     private val manager = mockk<UsbAudioManager>(relaxed = true)
 
     /** What the stubbed clock write runs just before returning, to land calls mid-attempt. */
-    private var duringClockWrite: () -> Unit = {}
+    private var duringClockWrite: (hz: Int) -> Unit = {}
+
+    /** What the stubbed phase-2 clock-settled poll runs just before returning. */
+    private var duringClockSettle: () -> Unit = {}
+
+    /**
+     * A native stream that completes one URB per millisecond until cancelled, so the real engine
+     * runs and [UsbAudioOutput]'s phase 2 sees the pre-roll established.
+     */
+    private class TickingBridge : UsbNativeBridge {
+        @Volatile private var cancelled = false
+        private var slot = 0
+
+        override fun disconnectKernelDriver(fd: Int, interfaceNumber: Int) = true
+
+        override fun getUsbSpeed(fd: Int) = 3
+
+        override fun openIsoStream(
+            fd: Int,
+            endpointAddress: Int,
+            maxPacketSize: Int,
+            packetsPerUrb: Int,
+            numUrbs: Int,
+        ): Long {
+            cancelled = false
+            return 1L
+        }
+
+        override fun submitIso(handle: Long, slot: Int, data: ByteArray, packetLengths: IntArray) = true
+
+        override fun reapIsoAny(handle: Long): Long {
+            if (cancelled) return UsbNativeBridge.REAP_ERROR_FATAL.toLong()
+            Thread.sleep(1)
+            return UsbNativeBridge.reapResult(handle, slot++ % UrbQueueShape.DEFAULT.numUrbs)
+        }
+
+        override fun cancelIso(handle: Long) {
+            cancelled = true
+        }
+
+        override fun closeIsoStream(handle: Long) = Unit
+
+        override fun submitIsoRead(handle: Long, slot: Int, packetLengths: IntArray) = true
+
+        override fun readIsoSlotData(handle: Long, slot: Int, dst: ByteArray) = -1
+
+        override fun getPacketErrorStats(handle: Long) = longArrayOf(0L, 0L)
+    }
+
+    private fun newOutput(sampleRateHz: Int = 44100) =
+        UsbAudioOutput(
+            session = session,
+            format = format,
+            channels = topology.channelCount,
+            sampleRateHz = sampleRateHz,
+            usbSettings = settings,
+            usbAudioManager = manager,
+            nativeBridge = TickingBridge(),
+        )
 
     private lateinit var output: UsbAudioOutput
 
@@ -105,23 +167,21 @@ class UsbAudioOutputActivationTest {
         mockkObject(UsbSampleRateConfigurator)
         every { UsbSampleRateConfigurator.writeSampleRateWithStreamIdle(any(), any(), any(), any(), any()) } answers
             {
-                duringClockWrite()
+                val hz = arg<Int>(2)
+                duringClockWrite(hz)
                 UsbSampleRateConfigurator.IdleRateWrite(
                     UsbSampleRateConfigurator.RateWrite(
-                        UsbAudioController.ClockWriteOutcome.Confirmed(44100), retries = 0),
+                        UsbAudioController.ClockWriteOutcome.Confirmed(hz), retries = 0),
                     altRestored = true)
+            }
+        every { UsbSampleRateConfigurator.awaitClockSettled(any(), any(), any()) } answers
+            {
+                duringClockSettle()
+                UsbSampleRateConfigurator.ClockSettle(valid = true, extraWaits = 0)
             }
         every { manager.ensureFormatActive(any(), any()) } returns true
         every { manager.consumeHardwareReset() } returns false
-        output =
-            UsbAudioOutput(
-                session = session,
-                format = format,
-                channels = topology.channelCount,
-                sampleRateHz = 44100,
-                usbSettings = settings,
-                usbAudioManager = manager,
-            )
+        output = newOutput()
     }
 
     @AfterEach
@@ -167,5 +227,69 @@ class UsbAudioOutputActivationTest {
         verify(timeout = 2000) { manager.endClaimAttempt() }
         Thread.sleep(100)
         verify(exactly = 1) { manager.requestClaim() }
+    }
+
+    /**
+     * Regression shape for #143: a track change releases this output while its phase 2 is
+     * running. It must not go on to restore volume or unmute -- the next output may be relocking
+     * the device by then.
+     */
+    @Test
+    fun `release during phase 2 stops before the volume restore and unmute`() {
+        every { manager.requestClaim() } returns UsbAudioManager.ClaimOutcome.RECLAIMED
+        duringClockSettle = { output.release() }
+
+        output.play()
+
+        verify(timeout = 2000) { manager.endClaimAttempt() }
+        assertTrue(featureUnit.isMuted(0), "a released output unmuted the device")
+        assertEquals(0, featureUnit.volumeOf(1), "a released output restored its volume")
+    }
+
+    /** Sanity check for the test above: without a release, phase 2 restores volume and unmutes. */
+    @Test
+    fun `phase 2 restores volume and unmutes when not released`() {
+        every { manager.requestClaim() } returns UsbAudioManager.ClaimOutcome.RECLAIMED
+
+        output.play()
+
+        verify(timeout = 2000) { manager.endClaimAttempt() }
+        assertTrue(!featureUnit.isMuted(0))
+        assertEquals(-2000, featureUnit.volumeOf(1).toShort().toInt())
+        output.release()
+    }
+
+    /**
+     * #143: two outputs on one session (a track change) never interleave their device sequences.
+     * The new output's relock waits until the old one's phase 2 has finished.
+     */
+    @Test
+    fun `a second output's relock waits for the first output's phase 2`() {
+        every { manager.requestClaim() } returns UsbAudioManager.ClaimOutcome.RECLAIMED
+        val inSettle = CountDownLatch(1)
+        val finishSettle = CountDownLatch(1)
+        val clockWrites = java.util.concurrent.CopyOnWriteArrayList<Int>()
+        duringClockWrite = { hz -> clockWrites += hz }
+        duringClockSettle = {
+            if (clockWrites.size == 1) {
+                inSettle.countDown()
+                finishSettle.await()
+            }
+        }
+
+        output.play()
+        assertTrue(inSettle.await(2, TimeUnit.SECONDS))
+        val next = newOutput(sampleRateHz = 48000)
+        next.play()
+        Thread.sleep(200)
+        assertEquals(listOf(44100), clockWrites.toList(), "the second relock overlapped the first's phase 2")
+
+        finishSettle.countDown()
+        verify(timeout = 2000) {
+            UsbSampleRateConfigurator.writeSampleRateWithStreamIdle(any(), any(), 48000, any(), any())
+        }
+        assertEquals(listOf(44100, 48000), clockWrites.toList())
+        output.release()
+        next.release()
     }
 }

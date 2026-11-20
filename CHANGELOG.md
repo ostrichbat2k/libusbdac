@@ -52,6 +52,10 @@ Pin to an exact tag or commit rather than a version range.
 - A `play()` landing just as an activation declined by a pause was
   finishing is no longer dropped; the activation starts again instead of
   waiting for stall recovery (#149).
+- A released output's activation stops writing to the device, and two
+  outputs' relock sequences on one session no longer interleave, so an
+  old output can't unmute the DAC mid-way through the next one's clock
+  change (#143).
 - UAC1 devices that don't implement the Sampling Frequency control no
   longer fail activation (#128).
 - Honour the UAC2/3 Clock Source's `bmControls`: a read-only frequency is

@@ -95,6 +95,8 @@ class UsbAudioOutputActivationTest {
         mockk(relaxed = true) {
             every { volumeDb } returns -2000
             every { maxVolumePercent } returns 100
+            // Relaxed, this would be a mocked queue shape of 0 URBs.
+            every { urbQueueOverride } returns null
         }
 
     private val manager = mockk<UsbAudioManager>(relaxed = true)
@@ -109,9 +111,14 @@ class UsbAudioOutputActivationTest {
      * A native stream that completes one URB per millisecond until cancelled, so the real engine
      * runs and [UsbAudioOutput]'s phase 2 sees the pre-roll established.
      */
-    private class TickingBridge : UsbNativeBridge {
+    private open class TickingBridge(private val fatalAfterReaps: Int = Int.MAX_VALUE) : UsbNativeBridge {
         @Volatile private var cancelled = false
         private var slot = 0
+        private var reaps = 0
+
+        /** The thread that last reaped, i.e. the engine's streaming thread. */
+        @Volatile var streamingThread: Thread? = null
+        val events = java.util.concurrent.CopyOnWriteArrayList<String>()
 
         override fun disconnectKernelDriver(fd: Int, interfaceNumber: Int) = true
 
@@ -131,7 +138,8 @@ class UsbAudioOutputActivationTest {
         override fun submitIso(handle: Long, slot: Int, data: ByteArray, packetLengths: IntArray) = true
 
         override fun reapIsoAny(handle: Long): Long {
-            if (cancelled) return UsbNativeBridge.REAP_ERROR_FATAL.toLong()
+            streamingThread = Thread.currentThread()
+            if (cancelled || ++reaps > fatalAfterReaps) return UsbNativeBridge.REAP_ERROR_FATAL.toLong()
             Thread.sleep(1)
             return UsbNativeBridge.reapResult(handle, slot++ % UrbQueueShape.DEFAULT.numUrbs)
         }
@@ -140,7 +148,9 @@ class UsbAudioOutputActivationTest {
             cancelled = true
         }
 
-        override fun closeIsoStream(handle: Long) = Unit
+        override fun closeIsoStream(handle: Long) {
+            events += "closeIsoStream"
+        }
 
         override fun submitIsoRead(handle: Long, slot: Int, packetLengths: IntArray) = true
 
@@ -149,7 +159,7 @@ class UsbAudioOutputActivationTest {
         override fun getPacketErrorStats(handle: Long) = longArrayOf(0L, 0L)
     }
 
-    private fun newOutput(sampleRateHz: Int = 44100) =
+    private fun newOutput(sampleRateHz: Int = 44100, bridge: UsbNativeBridge = TickingBridge()) =
         UsbAudioOutput(
             session = session,
             format = format,
@@ -157,7 +167,7 @@ class UsbAudioOutputActivationTest {
             sampleRateHz = sampleRateHz,
             usbSettings = settings,
             usbAudioManager = manager,
-            nativeBridge = TickingBridge(),
+            nativeBridge = bridge,
         )
 
     private lateinit var output: UsbAudioOutput
@@ -291,5 +301,32 @@ class UsbAudioOutputActivationTest {
         assertEquals(listOf(44100, 48000), clockWrites.toList())
         output.release()
         next.release()
+    }
+
+    /**
+     * Regression shape for #145: the stream dies mid-play. The session teardown must not run on
+     * the streaming thread, and only after the engine has closed its native stream -- not with
+     * the stream still open on the fd the teardown closes.
+     */
+    @Test
+    fun `a fatal stream error tears the session down off the streaming thread, after the stream closes`() {
+        every { manager.requestClaim() } returns UsbAudioManager.ClaimOutcome.ALREADY_CLAIMED
+        every { manager.consumeHardwareReset() } returns false
+        val bridge = TickingBridge(fatalAfterReaps = 50)
+        var fatalThread: Thread? = null
+        every { manager.notifyStreamFatalError() } answers
+            {
+                fatalThread = Thread.currentThread()
+                bridge.events += "notifyStreamFatalError"
+            }
+        val dying = newOutput(bridge = bridge)
+
+        dying.play()
+
+        verify(timeout = 3000) { manager.notifyStreamFatalError() }
+        assertEquals(listOf("closeIsoStream", "notifyStreamFatalError"), bridge.events.toList())
+        assertTrue(fatalThread != null && fatalThread !== bridge.streamingThread, "torn down on the streaming thread")
+        verify { manager.notifyStreamingStopped() }
+        dying.release()
     }
 }

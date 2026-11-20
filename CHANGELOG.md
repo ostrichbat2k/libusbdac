@@ -59,6 +59,9 @@ Pin to an exact tag or commit rather than a version range.
 - Concurrent `ensureFormatActive()` calls (and an output's relock) can no
   longer leave the cached format out of step with the device's actual
   alt-setting (#146).
+- Overlapping DAC activations no longer leak a session, an activation
+  finishing after USB output was turned off no longer brings the session
+  back, and deactivating twice no longer closes the session twice (#144).
 - UAC1 devices that don't implement the Sampling Frequency control no
   longer fail activation (#128).
 - Honour the UAC2/3 Clock Source's `bmControls`: a read-only frequency is

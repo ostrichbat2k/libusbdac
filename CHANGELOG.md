@@ -49,6 +49,9 @@ Pin to an exact tag or commit rather than a version range.
   its native handles (#147).
 - A flush (seek) resets the playback position reliably and no longer
   credits URBs filled before it (#148).
+- A `play()` landing just as an activation declined by a pause was
+  finishing is no longer dropped; the activation starts again instead of
+  waiting for stall recovery (#149).
 - UAC1 devices that don't implement the Sampling Frequency control no
   longer fail activation (#128).
 - Honour the UAC2/3 Clock Source's `bmControls`: a read-only frequency is

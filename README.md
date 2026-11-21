@@ -306,6 +306,73 @@ xHCI trace recipe (root required).
 Needs the Android NDK (CMake 3.22.1+) on `PATH` or resolvable by the
 Android Gradle Plugin for the native isochronous transfer layer.
 
+## Credits
+
+libusbdac was extracted from the USB DAC work in
+[Auxio](https://github.com/OxygenCobalt/Auxio) (GPL-3.0). A 2026 survey of
+other open-source USB audio drivers shaped much of v0.3.0; the projects
+below are credited with what they contributed. Unless a project says
+otherwise, its code was studied and the behaviour re-implemented here, not
+copied.
+
+**Linux kernel, `snd-usb-audio`** ([sound/usb](https://github.com/torvalds/linux/tree/master/sound/usb),
+GPL-2.0-or-later; read at v7.3 and v7.4-rc3). The reference for most of the
+protocol behaviour: feedback decoding and the phase accumulator
+(`snd_usb_handle_sync_urb`, `synced_next_packet_size`), the UAC2
+alt 0, clock, alt N rate-change order (`snd_usb_endpoint_prepare`), clock
+source, selector and multiplier resolution (`__uac_clock_find_source`),
+clock-source `bmControls` handling, UAC1 sampling-frequency handling, the
+packet-size ceiling, and implicit-feedback detection. The built-in device
+quirk table (`UsbDeviceQuirkTable`) is generated from `quirk_flags_table`
+in `quirks.c`; those entries are other people's debugging work. The
+simulated Asynchronous DAC used in tests ports the feedback formula from
+`drivers/usb/gadget/function/u_audio.c` (GPL-2.0+). GPL-2.0-or-later is
+compatible with this project's GPL-3.0-or-later.
+
+**[Ma145/decent-player](https://github.com/Ma145/decent-player)** (MIT).
+Comparing against it exposed the per-frame feedback decode and the lossy
+scheduler accumulator (#119, #120), and its feedback servicing without
+per-packet allocation prompted #121. Its documented rate-change sequence,
+the queue-depth write-up, and the Cayin RU7 case (only the feedback endpoint
+showed the real rate) led to the clock-order change, the queue-margin
+metric and the feedback rate cross-check (#122, #123, #124). The captured
+feedback bytes in the tests come from its documentation, and the xHCI
+trace recipe and script in `docs/kernel-usb-diagnostics.md` and
+`docs/scripts/xhci-trace.sh` are adapted from its diagnostics reference
+(MIT, (c) 2026 Marcelo Silva).
+
+**[unom-io/usbfs-iso](https://github.com/unom-io/usbfs-iso)** (MIT OR
+Apache-2.0). Found and measured the UAC1 devices that do not implement the
+Sampling Frequency control (#128), does the `wMaxPacketSize` check up front
+(#130), measured a latency floor that informed the queue-depth work (#123),
+suggested the counting-allocator test idea (#121), and the idea of a
+hardware-free test rig (#126).
+
+**[yukaatsu/tsrossa](https://github.com/yukaatsu/tsrossa)** (Apache-2.0).
+Pre-roll silence lengths and the volume ramp (#127), the same clock-change
+order with measured delays (#122), setting the clock selector before the
+clock write (#129), and completion-interval jitter telemetry (#123).
+
+**[androidexpert35/Audiophile-Music-Player](https://github.com/androidexpert35/Audiophile-Music-Player)**
+(MIT). Clearing an endpoint halt before selecting alt 0 (#122), never
+addressing clock IDs a device did not declare (#129), and the note on
+control-pipe stalls not recovering on some firmware (#131).
+
+**[Averyy/esp-uac2-host](https://github.com/Averyy/esp-uac2-host)** (MIT).
+Its multi-clock notes informed the clock resolution work (#129).
+
+**[furyheimdall/jastreamer](https://github.com/furyheimdall/jastreamer)**
+(Apache-2.0) and **[EchoMusicApp/Echo-Music](https://github.com/EchoMusicApp/Echo-Music)**
+(GPL-3.0). Independent implementations that confirmed the feedback wire
+format and phase accumulation (#119, #120); jastreamer for scaling to the
+data endpoint's service interval, and Echo-Music's queue-depth presets for
+comparison (#123).
+
+**[sidhantjohnaind/android-usb-audio-driver](https://github.com/sidhantjohnaind/android-usb-audio-driver)**
+(no licence file). Ideas only, no code reused: skipping the rate write when
+the rate already matches, unmuting only after the first URBs complete, the
+warning about `USBDEVFS_RESET`, and queue-depth presets for comparison.
+
 ## License
 
 GNU General Public License v3.0 or later -- see individual file headers.

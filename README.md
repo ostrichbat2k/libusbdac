@@ -190,7 +190,7 @@ dependencyResolutionManagement {
 
 // build.gradle
 dependencies {
-    implementation 'com.github.ostrichbat2k:libusbdac:v0.1.0' // or any tag/commit
+    implementation 'com.github.ostrichbat2k:libusbdac:v0.3.0' // or any tag/commit
 }
 ```
 

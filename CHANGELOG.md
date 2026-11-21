@@ -8,6 +8,14 @@ Pin to an exact tag or commit rather than a version range.
 
 ## [Unreleased]
 
+## [v0.3.0] - 2026-11-21
+
+Hardware-tested on a Pixel 9 Pro XL with a UAC2 Adaptive DAC (steady
+streaming, format and rate changes, unplug/replug, rapid play/pause). The
+asynchronous-feedback fixes (#119, #120) are covered by the simulated
+Asynchronous DAC tests but have not yet been validated on a real
+Asynchronous DAC.
+
 ### Added
 - Added a user-configurable max-volume safety cap (#109).
 - Check each format's largest packet against the endpoint's

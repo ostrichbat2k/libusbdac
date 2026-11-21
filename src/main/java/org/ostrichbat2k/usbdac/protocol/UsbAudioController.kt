@@ -27,6 +27,9 @@ import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbInterface
 import android.hardware.usb.UsbManager
+import java.util.concurrent.locks.ReentrantLock
+import org.ostrichbat2k.usbdac.quirks.UsbDeviceQuirk
+import org.ostrichbat2k.usbdac.quirks.UsbDeviceQuirks
 import timber.log.Timber as L
 
 /** An activated USB connection to a UAC1/2/3 device: configuration selected, interfaces claimed. */
@@ -50,7 +53,20 @@ data class UsbAudioSession(
      * actually converted at the wrong rate (audibly: pitched up and sped up).
      */
     val clockSupportedRates: List<Pair<Int, Int>> = emptyList(),
-)
+    /** This device's [UsbDeviceQuirk]s, looked up once at activation (#132). */
+    val quirks: Set<UsbDeviceQuirk> = emptySet(),
+) {
+    /**
+     * Held across each multi-write device sequence an output runs -- a relock's mute, clock
+     * change and the settle/volume/unmute that follows it -- so two [UsbAudioOutput]s on this
+     * session (a track change: the old one's activation still finishing as the new one starts)
+     * never interleave them. Interleaved, the old output could unmute the DAC in the middle of the
+     * new one's clock change, or restore its own rate's state over the new one's (#143). Not part
+     * of equals/hashCode; a [copy] gets its own, which is fine since copies are only made while
+     * activating, before any output sees the session.
+     */
+    val deviceSequenceLock = ReentrantLock()
+}
 
 /**
  * Switches a UAC3 device into its playback configuration, claims the relevant interfaces, and
@@ -91,6 +107,9 @@ internal object UsbAudioController {
     private const val UAC1_REQUEST_GET_CUR = 0x81
     private const val CS_SAM_FREQ_CONTROL = 0x01
     private const val CS_CLOCK_VALID_CONTROL = 0x02
+
+    // UAC 2.0 Clock Selector control (CX_CLOCK_SELECTOR_CONTROL, A.17.8).
+    private const val CX_CLOCK_SELECTOR_CONTROL = 0x01
     // UAC3 request for a High Capability Descriptor -- unlike CUR/RANGE, wValue here is the
     // descriptor/cluster ID directly (not a (control<<8) selector), confirmed against the Linux
     // kernel's get_cluster_channels_v3() in sound/usb/mixer.c.
@@ -263,7 +282,13 @@ internal object UsbAudioController {
             }
         }
 
-        return UsbAudioSession(device, connection, topology, control, streamingAlts)
+        return UsbAudioSession(
+            device,
+            connection,
+            topology,
+            control,
+            streamingAlts,
+            quirks = UsbDeviceQuirks.quirksFor(device.vendorId, device.productId))
     }
 
     /**
@@ -415,7 +440,7 @@ internal object UsbAudioController {
         val wValue = CS_SAM_FREQ_CONTROL shl 8
         val wIndex = (session.topology.clockSourceId shl 8) or session.controlInterface.id
         val result =
-            session.connection.controlTransfer(
+            session.classControlTransfer(
                 REQ_TYPE_CLASS_INTERFACE_GET, UAC_REQUEST_CUR, wValue, wIndex, buffer, buffer.size, 1000)
         if (result != 4) {
             L.w("GET_CUR clock frequency failed: result=$result (wValue=$wValue wIndex=$wIndex)")
@@ -444,7 +469,7 @@ internal object UsbAudioController {
     fun getClusterChannelCount(session: UsbAudioSession, clusterId: Int): Int? {
         val buffer = ByteArray(7)
         val result =
-            session.connection.controlTransfer(
+            session.classControlTransfer(
                 REQ_TYPE_CLASS_INTERFACE_GET,
                 UAC3_CS_REQ_HIGH_CAPABILITY_DESCRIPTOR,
                 clusterId,
@@ -475,7 +500,7 @@ internal object UsbAudioController {
         val wValue = CS_SAM_FREQ_CONTROL shl 8
         val wIndex = (session.topology.clockSourceId shl 8) or session.controlInterface.id
         val result =
-            session.connection.controlTransfer(
+            session.classControlTransfer(
                 REQ_TYPE_CLASS_INTERFACE_GET, UAC_REQUEST_RANGE, wValue, wIndex, buffer, buffer.size, 1000)
         if (result < 2) {
             L.w("GET_RANGE clock frequency failed: result=$result (wValue=$wValue wIndex=$wIndex)")
@@ -504,7 +529,7 @@ internal object UsbAudioController {
         val wValue = CS_CLOCK_VALID_CONTROL shl 8
         val wIndex = (session.topology.clockSourceId shl 8) or session.controlInterface.id
         val result =
-            session.connection.controlTransfer(
+            session.classControlTransfer(
                 REQ_TYPE_CLASS_INTERFACE_GET, UAC_REQUEST_CUR, wValue, wIndex, buffer, buffer.size, 1000)
         if (result != 1) {
             L.w("GET_CUR clock valid failed: result=$result (wValue=$wValue wIndex=$wIndex)")
@@ -515,13 +540,46 @@ internal object UsbAudioController {
         return valid
     }
 
+    /**
+     * Puts the playback path's Clock Selector on [UacPlaybackTopology.clockSelectorPin] (#129),
+     * unless it is already there; nothing is sent when the path has no selector. Reads the
+     * current pin first so a device already on the right input gets no write at all.
+     */
+    fun selectClockInput(session: UsbAudioSession): ControlWriteOutcome {
+        val selectorId = session.topology.clockSelectorId
+        val pin = session.topology.clockSelectorPin
+        if (selectorId < 0 || pin <= 0) return ControlWriteOutcome.Unsupported
+        val wValue = CX_CLOCK_SELECTOR_CONTROL shl 8
+        val wIndex = (selectorId shl 8) or session.controlInterface.id
+        val current = ByteArray(1)
+        val read =
+            session.classControlTransfer(
+                REQ_TYPE_CLASS_INTERFACE_GET, UAC_REQUEST_CUR, wValue, wIndex, current, current.size, 1000)
+        val currentPin = if (read == 1) current[0].toInt() and 0xFF else null
+        val result =
+            if (currentPin == pin) {
+                0
+            } else {
+                val buffer = byteArrayOf(pin.toByte())
+                session
+                    .classControlTransfer(
+                        REQ_TYPE_CLASS_INTERFACE_SET, UAC_REQUEST_CUR, wValue, wIndex, buffer, buffer.size, 1000)
+                    .also {
+                        L.i(
+                            "SET_CUR clock selector $selectorId to pin $pin " +
+                                "(was ${currentPin ?: "unreadable"}): result=$it")
+                    }
+            }
+        return if (result >= 0) ControlWriteOutcome.Success else ControlWriteOutcome.TransferFailed
+    }
+
     /** Attempts to set the clock source sample rate in Hz, then reads it back to confirm. */
     fun setClockFrequency(session: UsbAudioSession, hz: Int): ClockWriteOutcome {
         val wValue = CS_SAM_FREQ_CONTROL shl 8
         val wIndex = (session.topology.clockSourceId shl 8) or session.controlInterface.id
         val buffer = leBytes(hz, 4)
         val result =
-            session.connection.controlTransfer(
+            session.classControlTransfer(
                 REQ_TYPE_CLASS_INTERFACE_SET, UAC_REQUEST_CUR, wValue, wIndex, buffer, buffer.size, 1000)
         if (result < 0) {
             L.w("SET_CUR clock frequency to $hz Hz failed: result=$result")
@@ -543,7 +601,7 @@ internal object UsbAudioController {
         val buffer = ByteArray(3)
         val wValue = CS_SAM_FREQ_CONTROL shl 8
         val result =
-            session.connection.controlTransfer(
+            session.classControlTransfer(
                 REQ_TYPE_CLASS_ENDPOINT_GET,
                 UAC1_REQUEST_GET_CUR,
                 wValue,
@@ -567,11 +625,18 @@ internal object UsbAudioController {
      * Source, this endpoint doesn't functionally exist (and this request isn't meaningful) until
      * that alternate setting is actually active.
      */
-    fun setUac1EndpointSampleRate(session: UsbAudioSession, endpointAddress: Int, hz: Int): ClockWriteOutcome {
+    fun setUac1EndpointSampleRate(
+        session: UsbAudioSession,
+        endpointAddress: Int,
+        hz: Int,
+        // False for a device with UsbDeviceQuirk.SKIP_SAMPLE_RATE_READBACK (#132): the write is
+        // reported as Mismatch(hz, null), "not read back", for the caller's UAC 1.0 tolerance.
+        readBack: Boolean = true,
+    ): ClockWriteOutcome {
         val wValue = CS_SAM_FREQ_CONTROL shl 8
         val buffer = leBytes(hz, 3)
         val result =
-            session.connection.controlTransfer(
+            session.classControlTransfer(
                 REQ_TYPE_CLASS_ENDPOINT_SET,
                 UAC_REQUEST_CUR, // SET_CUR is 0x01 in UAC1 too -- only GET_CUR differs (0x81)
                 wValue,
@@ -583,12 +648,12 @@ internal object UsbAudioController {
             L.w("SET_CUR UAC1 endpoint sample rate to $hz Hz failed: result=$result")
             return ClockWriteOutcome.TransferFailed
         }
-        val readBack = getUac1EndpointSampleRate(session, endpointAddress)
-        val ok = readBack == hz
+        val readBackHz = if (readBack) getUac1EndpointSampleRate(session, endpointAddress) else null
+        val ok = readBackHz == hz
         L.i(
             "SET_CUR UAC1 endpoint 0x${"%02x".format(endpointAddress)} sample rate to $hz Hz: " +
-                "write result=$result, readback=$readBack, match=$ok")
-        return if (ok) ClockWriteOutcome.Confirmed(hz) else ClockWriteOutcome.Mismatch(hz, readBack)
+                "write result=$result, readback=${if (readBack) readBackHz else "skipped (device quirk)"}, match=$ok")
+        return if (ok) ClockWriteOutcome.Confirmed(hz) else ClockWriteOutcome.Mismatch(hz, readBackHz)
     }
 
     /** Reads the Feature Unit's mute state for [channel] (0=master, 1=left, 2=right), or null. */
@@ -599,7 +664,7 @@ internal object UsbAudioController {
         val wValue = (FU_MUTE_CONTROL shl 8) or channel
         val wIndex = (unitId shl 8) or session.controlInterface.id
         val result =
-            session.connection.controlTransfer(
+            session.classControlTransfer(
                 REQ_TYPE_CLASS_INTERFACE_GET,
                 curRequest(session.topology, get = true),
                 wValue,
@@ -622,7 +687,7 @@ internal object UsbAudioController {
         val wIndex = (unitId shl 8) or session.controlInterface.id
         val buffer = byteArrayOf(if (muted) 1 else 0)
         val result =
-            session.connection.controlTransfer(
+            session.classControlTransfer(
                 REQ_TYPE_CLASS_INTERFACE_SET, UAC_REQUEST_CUR, wValue, wIndex, buffer, buffer.size, 1000)
         L.i("SET_CUR mute (unit=$unitId ch=$channel) to $muted: result=$result")
         return if (result >= 0) ControlWriteOutcome.Success else ControlWriteOutcome.TransferFailed
@@ -636,7 +701,7 @@ internal object UsbAudioController {
         val wValue = (FU_VOLUME_CONTROL shl 8) or channel
         val wIndex = (unitId shl 8) or session.controlInterface.id
         val result =
-            session.connection.controlTransfer(
+            session.classControlTransfer(
                 REQ_TYPE_CLASS_INTERFACE_GET,
                 curRequest(session.topology, get = true),
                 wValue,
@@ -667,7 +732,7 @@ internal object UsbAudioController {
         val wValue = (FU_VOLUME_CONTROL shl 8) or channel
         val wIndex = (unitId shl 8) or session.controlInterface.id
         val result =
-            session.connection.controlTransfer(
+            session.classControlTransfer(
                 REQ_TYPE_CLASS_INTERFACE_GET, UAC_REQUEST_RANGE, wValue, wIndex, buffer, buffer.size, 1000)
         if (result < 8) {
             L.w("GET_RANGE volume (unit=$unitId ch=$channel) failed: result=$result")
@@ -710,7 +775,7 @@ internal object UsbAudioController {
         val wIndex = (unitId shl 8) or session.controlInterface.id
         val buffer = byteArrayOf((value and 0xFF).toByte(), ((value shr 8) and 0xFF).toByte())
         val result =
-            session.connection.controlTransfer(
+            session.classControlTransfer(
                 REQ_TYPE_CLASS_INTERFACE_SET, UAC_REQUEST_CUR, wValue, wIndex, buffer, buffer.size, 1000)
         L.i("SET_CUR volume (unit=$unitId ch=$channel) to $value: result=$result")
         return if (result >= 0) ControlWriteOutcome.Success else ControlWriteOutcome.TransferFailed
@@ -729,7 +794,7 @@ internal object UsbAudioController {
         val wValue = (inputChannel shl 8) or outputChannel
         val wIndex = (mixerUnitId shl 8) or session.controlInterface.id
         val result =
-            session.connection.controlTransfer(
+            session.classControlTransfer(
                 REQ_TYPE_CLASS_INTERFACE_GET,
                 curRequest(session.topology, get = true),
                 wValue,
@@ -757,7 +822,7 @@ internal object UsbAudioController {
         val wValue = (inputChannel shl 8) or outputChannel
         val wIndex = (mixerUnitId shl 8) or session.controlInterface.id
         val result =
-            session.connection.controlTransfer(
+            session.classControlTransfer(
                 REQ_TYPE_CLASS_INTERFACE_GET, UAC_REQUEST_RANGE, wValue, wIndex, buffer, buffer.size, 1000)
         if (result < 8) {
             L.w(
@@ -785,7 +850,7 @@ internal object UsbAudioController {
         val wIndex = (mixerUnitId shl 8) or session.controlInterface.id
         val buffer = byteArrayOf((value and 0xFF).toByte(), ((value shr 8) and 0xFF).toByte())
         val result =
-            session.connection.controlTransfer(
+            session.classControlTransfer(
                 REQ_TYPE_CLASS_INTERFACE_SET, UAC_REQUEST_CUR, wValue, wIndex, buffer, buffer.size, 1000)
         L.i(
             "SET_CUR mixer gain (unit=$mixerUnitId in=$inputChannel out=$outputChannel) to " +
@@ -799,7 +864,7 @@ internal object UsbAudioController {
         val wValue = AC_POWER_DOMAIN_CONTROL shl 8
         val wIndex = (powerDomainId shl 8) or session.controlInterface.id
         val result =
-            session.connection.controlTransfer(
+            session.classControlTransfer(
                 REQ_TYPE_CLASS_INTERFACE_GET, UAC_REQUEST_CUR, wValue, wIndex, buffer, buffer.size, 1000)
         if (result != 1) {
             L.w("GET_CUR power domain state (id=$powerDomainId) failed: result=$result")
@@ -814,7 +879,7 @@ internal object UsbAudioController {
         val wIndex = (powerDomainId shl 8) or session.controlInterface.id
         val buffer = byteArrayOf(state.toByte())
         val result =
-            session.connection.controlTransfer(
+            session.classControlTransfer(
                 REQ_TYPE_CLASS_INTERFACE_SET, UAC_REQUEST_CUR, wValue, wIndex, buffer, buffer.size, 1000)
         L.i("SET_CUR power domain state (id=$powerDomainId) to $state: result=$result")
         return if (result >= 0) ControlWriteOutcome.Success else ControlWriteOutcome.TransferFailed
@@ -857,6 +922,57 @@ internal object UsbAudioController {
         }
     }
 
+    /**
+     * Switches the streaming interface to alternate setting 0, the zero-bandwidth setting with no
+     * streaming endpoint, so the clock can be changed with nothing streaming (#122).
+     */
+    fun selectZeroBandwidth(session: UsbAudioSession): ControlWriteOutcome {
+        val iface = session.streamingAltSettings[0]
+        if (iface == null) {
+            L.w("No interface for alternate setting 0")
+            return ControlWriteOutcome.Unsupported
+        }
+        val ok = session.setInterfaceWithQuirks(iface)
+        L.i("setInterface(alt=0): $ok")
+        return if (ok) ControlWriteOutcome.Success else ControlWriteOutcome.TransferFailed
+    }
+
+    /** How [UsbDeviceQuirk] delays wait; replaced in tests. */
+    internal var sleep: (Long) -> Unit = Thread::sleep
+
+    private const val CONTROL_DELAY_20MS = 20L
+    private const val CONTROL_DELAY_5MS = 5L
+    private const val CONTROL_DELAY_1MS = 1L
+    private const val INTERFACE_DELAY_MS = 50L
+
+    /**
+     * Every class-specific control request goes through here, so a device with one of the
+     * `CONTROL_DELAY_*` quirks gets its pause after each one, as Linux's `snd_usb_ctl_msg_quirk`
+     * does (#132).
+     */
+    @Suppress("LongParameterList") // Mirrors UsbDeviceConnection.controlTransfer's own parameters.
+    private fun UsbAudioSession.classControlTransfer(
+        requestType: Int,
+        request: Int,
+        value: Int,
+        index: Int,
+        buffer: ByteArray,
+        length: Int,
+        timeout: Int,
+    ): Int {
+        val result = connection.controlTransfer(requestType, request, value, index, buffer, length, timeout)
+        when {
+            UsbDeviceQuirk.CONTROL_DELAY_20MS in quirks -> sleep(CONTROL_DELAY_20MS)
+            UsbDeviceQuirk.CONTROL_DELAY_5MS in quirks -> sleep(CONTROL_DELAY_5MS)
+            UsbDeviceQuirk.CONTROL_DELAY_1MS in quirks -> sleep(CONTROL_DELAY_1MS)
+        }
+        return result
+    }
+
+    /** SET_INTERFACE, plus the pause a device with [UsbDeviceQuirk.INTERFACE_DELAY] needs after it (#132). */
+    private fun UsbAudioSession.setInterfaceWithQuirks(iface: UsbInterface): Boolean =
+        connection.setInterface(iface).also { if (UsbDeviceQuirk.INTERFACE_DELAY in quirks) sleep(INTERFACE_DELAY_MS) }
+
     /** Switches the streaming interface to the alternate setting for [format]. */
     fun selectFormat(session: UsbAudioSession, format: UacStreamFormat): ControlWriteOutcome {
         val iface = session.streamingAltSettings[format.alternateSetting]
@@ -864,7 +980,7 @@ internal object UsbAudioController {
             L.w("No interface for alternate setting ${format.alternateSetting}")
             return ControlWriteOutcome.Unsupported
         }
-        val ok = session.connection.setInterface(iface)
+        val ok = session.setInterfaceWithQuirks(iface)
         L.i("setInterface(alt=${format.alternateSetting}, ${format.bitResolution}-bit): $ok")
         return if (ok) ControlWriteOutcome.Success else ControlWriteOutcome.TransferFailed
     }

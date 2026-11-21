@@ -27,12 +27,14 @@ import org.ostrichbat2k.usbdac.protocol.SyncType
 import org.ostrichbat2k.usbdac.protocol.UacStreamFormat
 import org.ostrichbat2k.usbdac.protocol.UsbAudioController
 import org.ostrichbat2k.usbdac.protocol.UsbAudioSession
+import org.ostrichbat2k.usbdac.protocol.UsbSampleRateConfigurator
 import android.media.AudioDeviceInfo
 import androidx.media3.common.C
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.exoplayer.audio.AudioOutput
 import java.nio.ByteBuffer
 import java.util.concurrent.Executors
+import kotlin.concurrent.withLock
 import timber.log.Timber as L
 
 /**
@@ -81,6 +83,9 @@ class UsbAudioOutput(
     // this instance genuinely stops being used, and reclaim it when actually needed again --
     // see activateAndStream()/pause()'s doc comments.
     private val usbAudioManager: UsbAudioManager,
+    // The engine's native calls -- a seam so a test can run the real activation through phase 2
+    // (#143) without touching UsbNative; see UsbNativeBridge's doc comment.
+    nativeBridge: UsbNativeBridge = UsbNativeBridgeImpl,
 ) : AudioOutput {
 
     /** What [write]'s `buffer` holds, and therefore how it needs to be converted -- see [write]'s own doc comment. */
@@ -137,7 +142,10 @@ class UsbAudioOutput(
             ringBuffer = ringBuffer,
             paused = { paused },
             reportPipelineStats = usbAudioManager::reportPipelineStats,
-            onFatalStreamError = usbAudioManager::notifyStreamFatalError,
+            onFatalStreamError = ::onStreamFatalError,
+            urbQueue = usbSettings.urbQueueOverride?.coerced() ?: UrbQueueShape.DEFAULT,
+            onFeedbackRateMismatch = usbAudioManager::reportFeedbackRateMismatch,
+            nativeBridge = nativeBridge,
         )
 
     // The isochronous schedule can't actually stop (the USB clock must keep ticking), so "pause"
@@ -176,7 +184,9 @@ class UsbAudioOutput(
     @Volatile private var activating = false
     // Set by release() so a background activation that's still running when this instance is
     // abandoned (e.g. a track skip landing mid-relock) hands back whatever it (re)claimed instead
-    // of starting a stream nothing will ever read from -- see play()'s completion callback.
+    // of starting a stream nothing will ever read from -- see play()'s completion callback. Also
+    // set after a fatal stream error (see tearDownAfterFatalError): this instance's session is
+    // deactivated then, so it can never stream again either.
     @Volatile private var released = false
 
     // Serializes every place that decides whether to start/stop the native stream together with
@@ -222,6 +232,17 @@ class UsbAudioOutput(
     // AudioOutputProvider.InitializationException; now a first-play activation failure surfaces
     // the same graceful way a post-pause resume failure already did -- play() logs a warning and
     // leaves [isStalled] to notice, which DefaultAudioSink's own stall recovery already handles.
+
+    /**
+     * What [activateAndStream] left to do: nothing ([READY]), or phase 2 with the stream in
+     * pre-roll ([NEEDS_SETTLE], #127).
+     */
+    /** [RELEASED]: [release] landed mid-relock, so the attempt stopped writing to the device (#143). */
+    private enum class ActivationResult { FAILED, READY, NEEDS_SETTLE, RELEASED }
+
+    private companion object {
+        const val STREAM_ESTABLISH_POLL_MS = 5L
+    }
 
     /**
      * Claims the interface and starts the native streaming thread -- everything needed to go from
@@ -279,11 +300,11 @@ class UsbAudioOutput(
      * [activationExecutor] and decides, once it returns, whether this instance is still even
      * supposed to be playing by then -- see [play]'s own doc comment.
      */
-    private fun activateAndStream(): Boolean {
+    private fun activateAndStream(): ActivationResult {
         val claim = usbAudioManager.requestClaim()
         if (claim == UsbAudioManager.ClaimOutcome.FAILED) {
             L.w("UsbAudioOutput: could not claim USB interface for streaming")
-            return false
+            return ActivationResult.FAILED
         }
 
         // requestClaim() only re-claims the control interface and the streaming interface's
@@ -295,7 +316,7 @@ class UsbAudioOutput(
         // [format]'s alt-setting before opening the iso stream below.
         if (!usbAudioManager.ensureFormatActive(format, sampleRateHz)) {
             L.w("UsbAudioOutput: failed to select alt-setting for ${format.bitResolution}-bit")
-            return false
+            return ActivationResult.FAILED
         }
 
         // Always consumed, regardless of claim -- see this function's own doc comment.
@@ -320,8 +341,30 @@ class UsbAudioOutput(
             // function's own doc comment for the real bug it closes (a brand-new instance for a
             // new track also sees ALREADY_CLAIMED, every time, because of its own provider's
             // preparatory ensureFormatActive() call).
-            return true
+            return ActivationResult.READY
         }
+
+        return session.deviceSequenceLock.withLock { relockHardware() }
+    }
+
+    /**
+     * True, with a log line, once [release] has been called -- checked between [relockHardware]'s
+     * and [settleWhileStreaming]'s device writes, so a released instance stops writing to a device
+     * that the next output may be about to relock (#143). Stopping leaves the DAC muted, which is
+     * safe: the next output's own relock unmutes it, and a hand-off to Android unmutes it too
+     * (UsbVolumeController.prepareForHalHandoff).
+     */
+    private fun releasedMidSequence(step: String): Boolean {
+        if (released) L.i("UsbAudioOutput: released mid-relock -- stopping before $step")
+        return released
+    }
+
+    /**
+     * Phase 1's device writes -- mute, clock change, power-domain wake -- split out of
+     * [activateAndStream] so they run under [UsbAudioSession.deviceSequenceLock] (#143).
+     */
+    private fun relockHardware(): ActivationResult {
+        if (releasedMidSequence("muting")) return ActivationResult.RELEASED
 
         // Mute before touching the clock at all, not after -- a clock-frequency change makes the
         // DAC chip's PLL re-lock to a new rate, and many real DACs produce an audible transient
@@ -330,35 +373,35 @@ class UsbAudioOutput(
         // code only ever checked/corrected mute state *after* the clock change, at the single
         // worst possible time for that check to matter -- it could confirm the device was
         // unmuted, but only after any relock transient had already played out audibly. Left
-        // muted until right before startStreamingThread(), once the clock is confirmed locked.
+        // muted until settleWhileStreaming() has the clock confirmed locked, with the pre-roll
+        // stream already running (#127).
         UsbAudioController.setMute(session, muted = true)
+        if (releasedMidSequence("the clock change")) return ActivationResult.RELEASED
 
-        // UAC 1.0 has no Clock Source entity -- its rate lives on the streaming endpoint itself
-        // (see UsbAudioManager.activateDac's comment on the same split). Using
-        // setClockFrequency unconditionally here was the actual cause of a real, reproduced
-        // infinite playback-error loop against a UAC 1.0 device: every reconfigure failed this
-        // control transfer (wrong addressing entirely -- clockSourceId is always -1).
-        fun trySetClock(): UsbAudioController.ClockWriteOutcome =
-            if (session.topology.uacVersion == 1) {
-                UsbAudioController.setUac1EndpointSampleRate(session, format.endpointAddress, sampleRateHz)
-            } else {
-                UsbAudioController.setClockFrequency(session, sampleRateHz)
-            }
-        var clockResult = trySetClock()
-        var clockSetAttempt = 0
-        while (clockResult !is UsbAudioController.ClockWriteOutcome.Confirmed &&
-            clockSetAttempt < UsbAudioTuning.CLOCK_SET_MAX_RETRIES) {
-            Thread.sleep(UsbAudioTuning.DAC_SETTLE_DELAY_MS)
-            clockResult = trySetClock()
-            clockSetAttempt++
+        // UsbSampleRateConfigurator picks the UAC 1.0 endpoint request or the UAC 2.0/3.0 Clock
+        // Source request -- see writeSampleRate's doc comment for why that choice matters.
+        //
+        // ensureFormatActive() above has already selected the streaming alt-setting. For UAC
+        // 2.0/3.0 the clock is changed with the interface back on alt 0 and the streaming
+        // alt-setting selected again afterwards (#122), so the endpoint only goes live once the
+        // clock is at the new rate. UAC 1.0 sets the rate on that endpoint, so it stays as is.
+        val idleWrite =
+            UsbSampleRateConfigurator.writeSampleRateWithStreamIdle(
+                session, format, sampleRateHz, maxRetries = UsbAudioTuning.CLOCK_SET_MAX_RETRIES)
+        if (!idleWrite.altRestored) {
+            L.w("UsbAudioOutput: could not reselect alt-setting ${format.alternateSetting} after the clock change")
+            return ActivationResult.FAILED
         }
-        if (clockResult !is UsbAudioController.ClockWriteOutcome.Confirmed) {
+        val rateWrite = idleWrite.write
+        if (!rateWrite.accepted) {
             L.w(
-                "UsbAudioOutput: failed to set DAC clock to $sampleRateHz Hz after $clockSetAttempt " +
-                    "retry(s): $clockResult")
-            return false
-        } else if (clockSetAttempt > 0) {
-            L.i("UsbAudioOutput: set DAC clock to $sampleRateHz Hz after $clockSetAttempt retry(s)")
+                "UsbAudioOutput: failed to set DAC clock to $sampleRateHz Hz after ${rateWrite.retries} " +
+                    "retry(s): ${rateWrite.outcome}")
+            return ActivationResult.FAILED
+        } else if (rateWrite.retries > 0 || rateWrite.acceptedBecause != null) {
+            L.i(
+                "UsbAudioOutput: set DAC clock to $sampleRateHz Hz after ${rateWrite.retries} retry(s)" +
+                    (rateWrite.acceptedBecause?.let { " -- unconfirmed, accepted: $it" } ?: ""))
         }
 
         // See UsbAudioManager.activateDac's comment on wakePowerDomain for why: a clean,
@@ -375,13 +418,39 @@ class UsbAudioOutput(
                 session.topology.powerDomainD2RecoveryUs)
         }
 
-        // See UsbAudioTuning.DAC_SETTLE_DELAY_MS: give the clock change just above time to actually lock
-        // before the first packet goes out. Deliberately not calling reassertKernelEviction
+        // Phase 2 -- the settle wait, clock-valid poll, volume restore, safety check and unmute
+        // -- now runs in settleWhileStreaming(), with the stream already running and carrying
+        // pre-roll silence (#127).
+        return ActivationResult.NEEDS_SETTLE
+    }
+
+    /**
+     * Phase 2 of a full relock (#127), run by [play]'s background task once
+     * [onActivationAttemptFinished] has started the stream in pre-roll: the device gets this
+     * time with silence already flowing instead of with no stream at all. Waits for the first
+     * URBs to complete, then does what [activateAndStream] used to do after the clock change --
+     * settle delay and clock-valid poll, volume restore, the max-volume safety check, unmute --
+     * so the device is unmuted onto silence, and only then does [onSettleFinished] let real
+     * audio in, faded in.
+     *
+     * Throws [UsbVolumeSafetyException] exactly as that sequence always has. Runs under
+     * [UsbAudioSession.deviceSequenceLock], and returns false (not settled) without further
+     * device writes once [release] has been called (#143).
+     */
+    private fun settleWhileStreaming(): Boolean = session.deviceSequenceLock.withLock { settleLocked() }
+
+    /** [settleWhileStreaming]'s body; caller holds [UsbAudioSession.deviceSequenceLock]. */
+    private fun settleLocked(): Boolean {
+        awaitStreamEstablished()
+        if (releasedMidSequence("the clock-valid poll")) return false
+
+        // See UsbAudioTuning.DAC_SETTLE_DELAY_MS: give the clock change time to actually lock
+        // before real audio goes out -- pre-roll silence is flowing meanwhile (#127), so a device
+        // that only locks once data arrives gets that data. Deliberately not calling reassertKernelEviction
         // here -- see UsbAudioManager.activateDac's comment on that call: evicting a driver
         // after the alt-setting is already selected resets the interface back to alt 0 as a
         // side effect, which would undo the activation this sink depends on.
-        Thread.sleep(UsbAudioTuning.DAC_SETTLE_DELAY_MS)
-
+        //
         // Every per-track rate change used to never check this at all -- SET_CUR + a GET_CUR
         // readback both succeeding only proves the device's control-register accepted and
         // stored the new rate; it's a separate, real question whether the device's actual
@@ -392,15 +461,13 @@ class UsbAudioOutput(
         // rate: pitched-up, sped-up playback. Polling a few times (rather than one fixed wait)
         // covers devices whose relock is slower than UsbAudioTuning.DAC_SETTLE_DELAY_MS without always paying
         // that cost on devices that lock fast.
+        val settle =
+            UsbSampleRateConfigurator.awaitClockSettled(
+                session, maxValidRetries = UsbAudioTuning.CLOCK_VALID_MAX_RETRIES)
         if (session.topology.uacVersion != 1) {
-            var valid = UsbAudioController.getClockValid(session)
-            var attempt = 0
-            while (valid == false && attempt < UsbAudioTuning.CLOCK_VALID_MAX_RETRIES) {
-                Thread.sleep(UsbAudioTuning.DAC_SETTLE_DELAY_MS)
-                valid = UsbAudioController.getClockValid(session)
-                attempt++
-            }
-            L.i("UsbAudioOutput: clock valid at ${sampleRateHz}Hz after $attempt extra wait(s): $valid")
+            L.i(
+                "UsbAudioOutput: clock valid at ${sampleRateHz}Hz after ${settle.extraWaits} extra wait(s): " +
+                    "${settle.valid}")
         }
 
         // Re-apply volume after every clock change: unknown whether reconfiguring the clock
@@ -430,6 +497,7 @@ class UsbAudioOutput(
         // every HAL->DAC switch, which UsbVolumeProvider.applyRange() then read back as "the
         // current volume", computing every subsequent adjustment from a wrong (maxed) baseline.
         // Confirmed, reproduced: "switch to DAC, press volume down once, volume jumps to max".
+        if (releasedMidSequence("the volume restore")) return false
         restoreVolumeAfterRelock()
 
         // Last-instant safety read-back, right before this instance would otherwise unmute and
@@ -458,12 +526,34 @@ class UsbAudioOutput(
 
         // Only unmute now that the clock is confirmed (or assumed, if unreadable) locked, and the
         // volume reapply above has had a settled device to work with -- see the setMute(true)
-        // call above for why this has to bracket the whole relock sequence rather than just being
-        // corrected once, after the fact.
+        // call in activateAndStream() for why this has to bracket the whole relock sequence
+        // rather than just being corrected once, after the fact. The stream is still carrying
+        // pre-roll silence here, so the device is unmuted onto silence; onSettleFinished() lets
+        // the track in afterwards, faded in (#127).
+        if (releasedMidSequence("unmuting")) return false
         UsbAudioController.setMute(session, muted = false)
 
         hasConfiguredHardware = true
         return true
+    }
+
+    /**
+     * Waits until the first [UsbIsoStreamEngine.numUrbs] URBs of pre-roll have completed, so the
+     * device is unmuted onto a stream that's really running (#127). Gives up quietly after
+     * [UsbAudioTuning.STREAM_ESTABLISH_TIMEOUT_MS], or straight away if the stream has already
+     * stopped (a pause landed); [isStalled] covers a stream that never got going.
+     */
+    private fun awaitStreamEstablished() {
+        val deadline = System.currentTimeMillis() + UsbAudioTuning.STREAM_ESTABLISH_TIMEOUT_MS
+        while (streamEngine.streaming && streamEngine.urbsReaped < streamEngine.numUrbs) {
+            if (System.currentTimeMillis() >= deadline) {
+                L.w(
+                    "UsbAudioOutput: pre-roll stream not established after " +
+                        "${UsbAudioTuning.STREAM_ESTABLISH_TIMEOUT_MS}ms")
+                return
+            }
+            Thread.sleep(STREAM_ESTABLISH_POLL_MS)
+        }
     }
 
     /**
@@ -545,33 +635,69 @@ class UsbAudioOutput(
     override fun play() {
         L.i("UsbAudioOutput: play()")
         paused = false
-        if (!activated && !activating) {
-            activating = true
-            activationExecutor.execute {
-                // Brackets the whole attempt, not just requestClaim() itself -- see
-                // UsbClaimController.beginClaimAttempt's own doc comment for why
-                // notifyStreamingStarted() alone (only called below once this succeeds) isn't
-                // early enough a guard against a concurrent releaseClaim() mid-relock.
-                usbAudioManager.beginClaimAttempt()
-                try {
-                    val succeeded =
-                        try {
-                            activateAndStream()
-                        } catch (e: UsbVolumeSafetyException) {
-                            // See activateAndStream()'s own doc comment on this check -- surfaced
-                            // to the host app as a real, user-visible error (not just a log line)
-                            // rather than silently falling back to isStalled()'s generic stuck-
-                            // player detection, since this is specifically about not streaming
-                            // audio the user never had a chance to react to.
-                            L.e("UsbAudioOutput: aborting activation -- ${e.message}")
-                            usbAudioManager.reportVolumeSafetyViolation()
-                            false
-                        }
-                    onActivationAttemptFinished(succeeded)
-                } finally {
-                    usbAudioManager.endClaimAttempt()
+        // Check-and-set under activationLock: two play() calls (or one racing the end-of-attempt
+        // re-check below) must never both start an attempt -- the second would start the stream
+        // a second time over the first and count it twice (#149).
+        val startAttempt =
+            synchronized(activationLock) {
+                (!activated && !activating).also { if (it) activating = true }
+            }
+        if (startAttempt) activationExecutor.execute { runActivationAttempt() }
+    }
+
+    /** One background activation attempt, started by [play] -- see its doc comment. */
+    private fun runActivationAttempt() {
+        // Whether the hardware ended up ready -- the attempt itself didn't fail -- so that a
+        // play() it missed may simply try again (#149) without retrying a real failure forever.
+        var hardwareReady = false
+        // Brackets the whole attempt, not just requestClaim() itself -- see
+        // UsbClaimController.beginClaimAttempt's own doc comment for why
+        // notifyStreamingStarted() alone (only called below once this succeeds) isn't
+        // early enough a guard against a concurrent releaseClaim() mid-relock.
+        usbAudioManager.beginClaimAttempt()
+        try {
+            val result = activateAndStream()
+            hardwareReady = result == ActivationResult.READY
+            val needsSettle = result == ActivationResult.NEEDS_SETTLE
+            val started =
+                onActivationAttemptFinished(result != ActivationResult.FAILED, holdSilence = needsSettle)
+            if (needsSettle) {
+                // Paused before the stream could start: the hardware is configured up to the
+                // clock change, and a later play() redoes the relock from the start anyway.
+                hardwareReady = !started
+            }
+            if (needsSettle && started) {
+                val settled =
+                    try {
+                        settleWhileStreaming()
+                    } catch (e: UsbVolumeSafetyException) {
+                        // See settleWhileStreaming()'s safety check -- surfaced to the
+                        // host app as a real, user-visible error (not just a log line)
+                        // rather than silently falling back to isStalled()'s generic
+                        // stuck-player detection, since this is specifically about not
+                        // streaming audio the user never had a chance to react to.
+                        L.e("UsbAudioOutput: aborting activation -- ${e.message}")
+                        usbAudioManager.reportVolumeSafetyViolation()
+                        false
+                    }
+                hardwareReady = settled
+                onSettleFinished(settled)
+            }
+        } finally {
+            usbAudioManager.endClaimAttempt()
+            // A play() landing after this attempt decided "not wanted" (paused) but before
+            // activating was cleared saw activating == true and did nothing, leaving nothing
+            // streaming until isStalled() forced a full stall recovery (#149). Re-checked under
+            // the same lock play() now checks under, so exactly one of them starts the next
+            // attempt.
+            val playArrivedLate =
+                synchronized(activationLock) {
                     activating = false
+                    hardwareReady && !paused && !activated && !released
                 }
+            if (playArrivedLate) {
+                L.i("UsbAudioOutput: play() arrived as the activation finished -- activating again")
+                play()
             }
         }
     }
@@ -585,25 +711,61 @@ class UsbAudioOutput(
      *
      * internal, not private: see [restoreVolumeAfterRelock]'s own doc comment for why.
      */
-    internal fun onActivationAttemptFinished(succeeded: Boolean) {
+    internal fun onActivationAttemptFinished(succeeded: Boolean, holdSilence: Boolean = false): Boolean {
         if (!succeeded) {
             L.w("UsbAudioOutput: failed to resume streaming -- isStalled() will reflect this")
-            return
+            return false
         }
+        return synchronized(activationLock) {
+            val stillWanted = !paused && !released
+            when {
+                stillWanted -> startStreamLocked(holdSilence)
+                // Same release release() itself would have made, had a stream been running.
+                released -> usbAudioManager.releaseClaim(delayMs = 0)
+                // Same as pause(): in manual mode (#31) the claim stays with us.
+                !usbSettings.manualReleaseControl -> usbAudioManager.releaseClaim()
+            }
+            // Either release runs inside this attempt's own beginClaimAttempt bracket, so the
+            // claim controller holds it until the attempt ends and replays it then (#141).
+            stillWanted
+        }
+    }
+
+    /**
+     * Ends phase 2 (#127). Settled and still streaming: lets real audio in. Settled, but a
+     * [pause] stopped the pre-roll stream and a [play] has since asked for it again (that [play]
+     * found [activating] set and left it to this task): starts the stream, with no pre-roll,
+     * since the hardware is ready. Not settled: stops the pre-roll stream, leaving [isStalled]
+     * to report it, as a failed [activateAndStream] always has.
+     *
+     * internal, not private: see [restoreVolumeAfterRelock]'s own doc comment for why.
+     */
+    internal fun onSettleFinished(settled: Boolean) {
         synchronized(activationLock) {
-            if (!paused && !released) {
-                startStreamingThread()
-                activated = true
-                // Tells UsbAudioManager's Settings-screen mutators (setMuted/setVolume/
-                // setMixerGain) not to release the claim out from under this still-running
-                // stream just because their own one-off control write finished -- see
-                // notifyStreamingStarted's doc comment.
-                usbAudioManager.notifyStreamingStarted()
-                usbAudioManager.setDirectPlaybackActive(true)
-            } else {
-                usbAudioManager.releaseClaim()
+            when {
+                settled && activated -> streamEngine.openSilenceGate()
+                settled && !paused && !released -> startStreamLocked(holdSilence = false)
+                !settled && activated -> {
+                    L.w("UsbAudioOutput: settling after the clock change failed -- stopping the pre-roll stream")
+                    stopStreamingThread()
+                    activated = false
+                    usbAudioManager.notifyStreamingStopped()
+                    usbAudioManager.setDirectPlaybackActive(false)
+                }
             }
         }
+    }
+
+    /** Starts the stream and marks this instance active. Caller holds [activationLock]. */
+    private fun startStreamLocked(holdSilence: Boolean) {
+        startStreamingThread(holdSilence)
+        activated = true
+        // Tells UsbAudioManager's Settings-screen mutators (setMuted/setVolume/
+        // setMixerGain) not to release the claim out from under this still-running
+        // stream just because their own one-off control write finished -- see
+        // notifyStreamingStarted's doc comment.
+        usbAudioManager.notifyStreamingStarted()
+        usbAudioManager.setDirectPlaybackActive(true)
     }
 
     override fun pause() {
@@ -880,10 +1042,43 @@ class UsbAudioOutput(
     override fun setPreferredDevice(preferredDevice: AudioDeviceInfo?) {}
 
     /** See [UsbIsoStreamEngine.start] -- the native handle lifetime/URB loop/position tracking live there (#73). */
-    private fun startStreamingThread() = streamEngine.start()
+    private fun startStreamingThread(holdSilence: Boolean = false) = streamEngine.start(holdSilence)
 
     /** See [UsbIsoStreamEngine.stop] -- the native handle lifetime/URB loop/position tracking live there (#73). */
     private fun stopStreamingThread() = streamEngine.stop()
+
+    /**
+     * The engine's fatal-error callback. Runs on the streaming thread itself, which can't stop the
+     * engine (that joins this very thread) -- and the session must not be torn down until the
+     * engine has: deactivating closes the connection's fd while the native streams are still
+     * open, and a stop() after that ran DISCARDURB and the close drain against whatever connection
+     * got that fd number next, stealing its completions (#145). So this only hands off.
+     */
+    private fun onStreamFatalError() {
+        Thread(::tearDownAfterFatalError, "usbdac-fatal-teardown")
+            .apply {
+                isDaemon = true
+                start()
+            }
+    }
+
+    /**
+     * Stops and closes the engine, retires this instance -- its session is about to be
+     * deactivated, so it can never stream again, and a running activation must not restart the
+     * stream -- and only then has [UsbAudioManager.notifyStreamFatalError] tear the session down.
+     */
+    private fun tearDownAfterFatalError() {
+        synchronized(activationLock) {
+            released = true
+            stopStreamingThread()
+            if (activated) {
+                activated = false
+                usbAudioManager.notifyStreamingStopped()
+                usbAudioManager.setDirectPlaybackActive(false)
+            }
+        }
+        usbAudioManager.notifyStreamFatalError()
+    }
 
     /**
      * Whether [thread] is still running after [stopStreamingThread]'s join -- i.e.

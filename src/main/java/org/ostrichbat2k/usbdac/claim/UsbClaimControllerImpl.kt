@@ -130,6 +130,47 @@ internal class UsbClaimControllerImpl(
     // path, reintroducing the exact HAL-recognition bug this parameter exists to fix.
     @Volatile private var pendingDeactivateOnTimeout = false
 
+    /**
+     * A [releaseClaim] that lost to an in-flight claim attempt, to replay once it ends (#141). Its
+     * deactivateOnTimeout goes into pendingDeactivateOnTimeout instead, which outlives this.
+     */
+    private data class DeferredRelease(val delayMs: Long)
+
+    // Set when a release arrives while a claim attempt is in flight; taken by the endClaimAttempt
+    // that brings the count to 0. Without it the release was dropped on the assumption that the
+    // attempt's own stream would release later -- but the release very often comes *from* that
+    // attempt (paused before it could start streaming, or paused/released during its phase-2
+    // settle, #127), so nothing ever did and the interface stayed claimed with nothing streaming.
+    // Guarded by claimLock.
+    private var deferredRelease: DeferredRelease? = null
+
+    // The one lock every claim/release decision runs under (#142). This class is driven from the
+    // activation executor, the claim scheduler, the player thread and the volume/manual-claim
+    // executors, and each of its decisions is a check followed by an act -- "nothing streaming
+    // and no attempt in flight, so release", "not claimed, so reclaim", "read the flag, then
+    // clear it". Unlocked, a beginClaimAttempt()+requestClaim() could land between
+    // doReleaseClaim's check and its releaseToKernel, get ALREADY_CLAIMED (and so skip the
+    // relock), and stream on an interface that had just been handed to the kernel. The USB
+    // control transfers of a claim or release run under it, so the next decision sees their
+    // result; only the wait for Android to take the device over (up to
+    // AWAIT_TAKEOVER_TIMEOUT_MS) runs outside it. Nothing called under it takes a lock that is
+    // held while calling into this class.
+    private val claimLock = Any()
+
+    // Bumped (under claimLock) by everything that supersedes a scheduled release: a newer
+    // releaseClaim, requestClaim, a deactivation. A release only acts if its generation is still
+    // current when it runs -- ScheduledFuture.cancel() alone can't stop one that has already
+    // started and is waiting for claimLock, which then released right after the requestClaim
+    // that should have cancelled it (#142).
+    private var releaseGeneration = 0L
+
+    // Test-only (#142): runs inside doReleaseClaim's locked section, after its checks and before
+    // the hand-off, so a test can hold a release exactly there.
+    @Volatile internal var beforeHandoffForTest: () -> Unit = {}
+
+    // Test-only (#142): runs [block] holding claimLock, to hold a scheduled release off it.
+    internal fun <T> withClaimLockForTest(block: () -> T): T = synchronized(claimLock) { block() }
+
     // See UsbClaimController.consumeHardwareReset's own doc comment. Set wherever
     // volumeController.prepareForHalHandoff() runs (the only place this hardware's gain gets
     // forced to a HAL-handoff level outside of a user-initiated change) -- below, in
@@ -168,27 +209,63 @@ internal class UsbClaimControllerImpl(
 
     /** Called by [UsbAudioOutput] once it's actually claimed and streaming -- see [releaseClaim]. */
     override fun notifyStreamingStarted() {
-        activeStreamCount.incrementAndGet()
+        synchronized(claimLock) { activeStreamCount.incrementAndGet() }
     }
 
     /** The inverse of [notifyStreamingStarted] -- call before, not after, releasing anything. */
     override fun notifyStreamingStopped() {
-        activeStreamCount.updateAndGet { (it - 1).coerceAtLeast(0) }
+        synchronized(claimLock) { activeStreamCount.updateAndGet { (it - 1).coerceAtLeast(0) } }
     }
 
     override fun beginClaimAttempt() {
-        claimAttemptsInFlight.incrementAndGet()
+        synchronized(claimLock) { claimAttemptsInFlight.incrementAndGet() }
     }
 
+    /**
+     * Ends an attempt. When it was the last one, replays a release that arrived during it (#141)
+     * -- unless a stream started after all, whose own pause()/release() will release instead.
+     */
     override fun endClaimAttempt() {
-        claimAttemptsInFlight.updateAndGet { (it - 1).coerceAtLeast(0) }
+        val replay =
+            synchronized(claimLock) {
+                val remaining = claimAttemptsInFlight.updateAndGet { (it - 1).coerceAtLeast(0) }
+                if (remaining > 0) null else deferredRelease.also { deferredRelease = null }
+            }
+        when {
+            replay == null -> Unit
+            activeStreamCount.get() > 0 ->
+                L.i("UsbClaimController: dropping a release deferred during a claim attempt -- a stream started")
+            else -> {
+                L.i("UsbClaimController: claim attempt over -- replaying the release deferred during it")
+                // Never blocks: whoever asked to wait for Android's takeover returned long ago.
+                // Picks up an escalated deactivateOnTimeout from pendingDeactivateOnTimeout,
+                // latched on deferral.
+                releaseClaim(replay.delayMs, awaitAndroidTakeover = false)
+            }
+        }
     }
 
-    override fun consumeHardwareReset(): Boolean {
-        val was = hardwareForcedForHandoff
-        hardwareForcedForHandoff = false
-        return was
+    /**
+     * Records a release that lost to an in-flight attempt, merged with any already recorded (the
+     * sooner delay wins), and latches its deactivateOnTimeout (see pendingDeactivateOnTimeout).
+     * Returns false, recording nothing, once no attempt is in flight.
+     */
+    private fun deferReleaseIfAttemptInFlight(delayMs: Long, deactivateOnTimeout: Boolean): Boolean {
+        synchronized(claimLock) {
+            if (claimAttemptsInFlight.get() == 0) return false
+            val prev = deferredRelease
+            deferredRelease = DeferredRelease(if (prev == null) delayMs else minOf(prev.delayMs, delayMs))
+            pendingDeactivateOnTimeout = pendingDeactivateOnTimeout || deactivateOnTimeout
+            return true
+        }
     }
+
+    override fun consumeHardwareReset(): Boolean =
+        synchronized(claimLock) {
+            val was = hardwareForcedForHandoff
+            hardwareForcedForHandoff = false
+            was
+        }
 
     /** Whether we currently hold the raw interface claim -- see [claimedState]. */
     override fun isClaimed(): Boolean = _claimedState.value
@@ -200,30 +277,32 @@ internal class UsbClaimControllerImpl(
      * [releaseClaim]/[requestClaim] calls agree with reality.
      */
     override fun markAlreadyClaimed() {
-        _claimedState.value = true
+        synchronized(claimLock) { _claimedState.value = true }
     }
 
     /**
      * For [UsbAudioManager.deactivateDac], which does its own full session close (not just a
-     * hand-back to the kernel) and needs to mark the claim gone without going through the normal
-     * [releaseClaim] dance.
+     * hand-back to the kernel): cancels any pending or deferred release, forces the hardware to
+     * the HAL-handoff level if we still hold the claim (see
+     * [UsbVolumeController.prepareForHalHandoff]'s doc comment: without it, disabling USB DAC
+     * output while still claimed leaves the Feature Unit at whatever gain/mute bit-perfect mode
+     * last set, which Android's own volume can't see or change -- confirmed, reproduced: every
+     * fallback track afterward played silently), marks the claim gone, and records [session]'s
+     * device for [awaitAndroidOutputTakeover]. All in one step under the claim lock, so a release
+     * running on the claim scheduler can't interleave with it (#142).
      */
-    override fun markReleased() {
-        _claimedState.value = false
-    }
-
-    /** For [UsbAudioManager.deactivateDac], canceling any release scheduled before a teardown. */
-    override fun cancelPendingRelease() {
-        pendingRelease?.cancel(false)
-        pendingRelease = null
-    }
-
-    /**
-     * For [UsbAudioManager.deactivateDac] to record which device to wait for -- see
-     * [awaitAndroidOutputTakeover]'s own comment on why.
-     */
-    override fun recordDeactivatedDevice(device: UsbDevice?) {
-        lastDeactivatedDevice = device
+    override fun releaseForDeactivation(session: UsbAudioSession?) {
+        synchronized(claimLock) {
+            releaseGeneration++
+            pendingRelease?.cancel(false)
+            pendingRelease = null
+            deferredRelease = null
+            if (session != null && _claimedState.value) {
+                volumeController.prepareForHalHandoff(session, session.topology.channelCount)
+            }
+            _claimedState.value = false
+            lastDeactivatedDevice = session?.device
+        }
     }
 
     /**
@@ -240,9 +319,17 @@ internal class UsbClaimControllerImpl(
      * why that distinction, not just success/failure, decides whether a resume needs to redo its
      * whole clock/mute/volume relock dance.
      */
-    override fun requestClaim(session: UsbAudioSession?): UsbAudioManager.ClaimOutcome {
+    override fun requestClaim(session: UsbAudioSession?): UsbAudioManager.ClaimOutcome =
+        synchronized(claimLock) { requestClaimLocked(session) }
+
+    private fun requestClaimLocked(session: UsbAudioSession?): UsbAudioManager.ClaimOutcome {
+        // Supersedes any release not yet done, including one already running and waiting for
+        // claimLock (#142).
+        releaseGeneration++
         pendingRelease?.cancel(false)
         pendingRelease = null
+        // Someone needs the claim again, so a release still waiting on an attempt is stale (#141).
+        deferredRelease = null
         if (_claimedState.value) return UsbAudioManager.ClaimOutcome.ALREADY_CLAIMED
         session ?: return UsbAudioManager.ClaimOutcome.FAILED
         val ok = UsbAudioController.reclaimFromKernel(session)
@@ -296,65 +383,109 @@ internal class UsbClaimControllerImpl(
      * use the device via HAL at all.
      */
     override fun releaseClaim(delayMs: Long, awaitAndroidTakeover: Boolean, deactivateOnTimeout: Boolean) {
-        pendingRelease?.cancel(false)
-        if (activeStreamCount.get() > 0 || claimAttemptsInFlight.get() > 0) {
-            // Something is genuinely streaming right now (or an activation attempt is still
-            // claiming/relocking -- see beginClaimAttempt's own doc comment) and still needs the
-            // claim -- a caller here (a Settings-screen mutator, most likely) just wanted it
-            // briefly for its own one-off write and is in no position to know that. Not even
-            // worth scheduling: the active UsbAudioOutput's own pause()/release() -- or, for an
-            // in-flight attempt that fails outright, its next real activation/pause -- is what
-            // will actually call this once it's really done -- but see
-            // pendingDeactivateOnTimeout's own doc comment for why this caller's
-            // deactivateOnTimeout still has to be remembered rather than dropped.
-            pendingDeactivateOnTimeout = pendingDeactivateOnTimeout || deactivateOnTimeout
-            pendingRelease = null
-            return
-        }
-        val effectiveDeactivateOnTimeout = deactivateOnTimeout || pendingDeactivateOnTimeout
-        pendingDeactivateOnTimeout = false
-        pendingRelease =
-            if (delayMs <= 0) {
-                doReleaseClaim(awaitAndroidTakeover, effectiveDeactivateOnTimeout)
-                null
-            } else {
-                claimScheduler.schedule(
-                    { doReleaseClaim(awaitAndroidTakeover, effectiveDeactivateOnTimeout) }, delayMs, TimeUnit.MILLISECONDS)
-            }
+        // Bookkeeping under claimLock; the release itself (doReleaseClaim) takes it again, and
+        // re-checks, so the takeover wait it may block on stays outside the lock.
+        val runNow = synchronized(claimLock) { planReleaseLocked(delayMs, awaitAndroidTakeover, deactivateOnTimeout) }
+        runNow?.let { (generation, effective) -> doReleaseClaim(generation, awaitAndroidTakeover, effective) }
     }
 
-    private fun doReleaseClaim(awaitAndroidTakeover: Boolean, deactivateOnTimeout: Boolean) {
-        if (activeStreamCount.get() > 0 || claimAttemptsInFlight.get() > 0) {
-            // The race can still be lost a second time between releaseClaim scheduling this and
-            // it actually firing -- a new stream started, or a new activation attempt began
-            // claiming/relocking (see beginClaimAttempt's own doc comment for why that alone,
-            // before notifyStreamingStarted, already needs guarding) -- re-latch for the same
-            // reason releaseClaim's own early-return branch does, rather than silently dropping
-            // an already-escalated request here.
-            pendingDeactivateOnTimeout = pendingDeactivateOnTimeout || deactivateOnTimeout
-            return
+    /**
+     * [releaseClaim]'s decision, under claimLock: defer, drop, schedule, or -- returned as the
+     * (generation, deactivateOnTimeout) to run with -- release right now.
+     */
+    private fun planReleaseLocked(
+        delayMs: Long,
+        awaitAndroidTakeover: Boolean,
+        deactivateOnTimeout: Boolean,
+    ): Pair<Long, Boolean>? {
+        val generation = ++releaseGeneration
+        pendingRelease?.cancel(false)
+        pendingRelease = null
+        return when {
+            // An activation attempt is still claiming/relocking (see beginClaimAttempt's own doc
+            // comment): releasing now would pull the interface out from under it. Remembered and
+            // replayed when the attempt ends, if nothing is streaming by then (#141).
+            deferReleaseIfAttemptInFlight(delayMs, deactivateOnTimeout) -> null
+            activeStreamCount.get() > 0 -> {
+                // Something is genuinely streaming right now and still needs the claim -- a
+                // caller here (a Settings-screen mutator, most likely) just wanted it briefly for
+                // its own one-off write and is in no position to know that. Not even worth
+                // scheduling: the active UsbAudioOutput's own pause()/release() is what will
+                // actually call this once it's really done -- but see pendingDeactivateOnTimeout's
+                // own doc comment for why this caller's deactivateOnTimeout still has to be
+                // remembered rather than dropped.
+                pendingDeactivateOnTimeout = pendingDeactivateOnTimeout || deactivateOnTimeout
+                null
+            }
+            else -> {
+                val effective = deactivateOnTimeout || pendingDeactivateOnTimeout
+                pendingDeactivateOnTimeout = false
+                if (delayMs > 0) {
+                    pendingRelease =
+                        claimScheduler.schedule(
+                            { doReleaseClaim(generation, awaitAndroidTakeover, effective) },
+                            delayMs,
+                            TimeUnit.MILLISECONDS)
+                    null
+                } else {
+                    generation to effective
+                }
+            }
         }
+    }
+
+    private fun doReleaseClaim(generation: Long, awaitAndroidTakeover: Boolean, deactivateOnTimeout: Boolean) {
+        if (!synchronized(claimLock) { handOffLocked(generation, deactivateOnTimeout) }) return
+        // Outside claimLock: this can block for up to AWAIT_TAKEOVER_TIMEOUT_MS.
+        if (awaitAndroidTakeover) {
+            awaitAndroidOutputTakeover(deactivateOnTimeout)
+        } else {
+            // The caller doesn't need to block on this, but still deserves a definitive
+            // answer in the log instead of just trusting releaseToKernel's own ioctl-level
+            // success silently -- run the same check, just off this thread.
+            claimScheduler.execute { awaitAndroidOutputTakeover(deactivateOnTimeout) }
+        }
+    }
+
+    /**
+     * [doReleaseClaim]'s check and hand-off, under claimLock so no claim can land between them
+     * (#142). Returns whether the interface was handed to the kernel.
+     */
+    private fun handOffLocked(generation: Long, deactivateOnTimeout: Boolean): Boolean {
         // Resolved live, right now -- not a parameter frozen back when releaseClaim() was first
         // called -- since this can run after a real delay (see releaseClaim's own doc comment on
         // why that distinction matters).
         val session = getActiveSession()
-        if (session != null && _claimedState.value) {
-            // See UsbVolumeController.prepareForHalHandoff's doc comment for why this has to
-            // happen, and why it has to happen before releaseToKernel below, not after. Also see
-            // hardwareForcedForHandoff's own doc comment -- this is the one place that flag needs
-            // setting, regardless of whether the takeover below ends up succeeding or getting
-            // silently reclaimed back to us on a timeout.
-            hardwareForcedForHandoff = true
-            volumeController.prepareForHalHandoff(session, session.topology.channelCount)
-            UsbAudioController.releaseToKernel(session)
-            _claimedState.value = false
-            if (awaitAndroidTakeover) {
-                awaitAndroidOutputTakeover(deactivateOnTimeout)
-            } else {
-                // The caller doesn't need to block on this, but still deserves a definitive
-                // answer in the log instead of just trusting releaseToKernel's own ioctl-level
-                // success silently -- run the same check, just off this thread.
-                claimScheduler.execute { awaitAndroidOutputTakeover(deactivateOnTimeout) }
+        return when {
+            // Superseded by a later releaseClaim, requestClaim or deactivation since it was
+            // requested (#142).
+            generation != releaseGeneration -> false
+            // The race can still be lost a second time between releaseClaim scheduling this and
+            // it actually firing. A new activation attempt began claiming/relocking (see
+            // beginClaimAttempt's own doc comment for why that alone, before
+            // notifyStreamingStarted, already needs guarding): defer to its end, like releaseClaim
+            // does (#141) -- if that attempt never streams, this release is still owed.
+            deferReleaseIfAttemptInFlight(delayMs = 0, deactivateOnTimeout) -> false
+            activeStreamCount.get() > 0 -> {
+                // A new stream started: re-latch for the same reason releaseClaim's own
+                // early-return branch does, rather than silently dropping an already-escalated
+                // request here.
+                pendingDeactivateOnTimeout = pendingDeactivateOnTimeout || deactivateOnTimeout
+                false
+            }
+            session == null || !_claimedState.value -> false
+            else -> {
+                beforeHandoffForTest()
+                // See UsbVolumeController.prepareForHalHandoff's doc comment for why this has to
+                // happen, and why it has to happen before releaseToKernel below, not after. Also
+                // see hardwareForcedForHandoff's own doc comment -- this is the one place that
+                // flag needs setting, regardless of whether the takeover below ends up succeeding
+                // or getting silently reclaimed back to us on a timeout.
+                hardwareForcedForHandoff = true
+                volumeController.prepareForHalHandoff(session, session.topology.channelCount)
+                UsbAudioController.releaseToKernel(session)
+                _claimedState.value = false
+                true
             }
         }
     }
@@ -482,9 +613,15 @@ internal class UsbClaimControllerImpl(
                         onTakeoverTimeout()
                     }
                 } else {
-                    val current = getActiveSession()
-                    if (current?.device == device && requestClaim(current) != UsbAudioManager.ClaimOutcome.FAILED) {
-                        getActiveSession()?.let { volumeController.remuteForUnconfirmedHandoff(it) }
+                    // One locked step, so nothing claims or releases between the reclaim and
+                    // the re-mute (#142).
+                    synchronized(claimLock) {
+                        val current = getActiveSession()
+                        if (current?.device == device &&
+                            requestClaimLocked(current) != UsbAudioManager.ClaimOutcome.FAILED
+                        ) {
+                            volumeController.remuteForUnconfirmedHandoff(current)
+                        }
                     }
                 }
             }

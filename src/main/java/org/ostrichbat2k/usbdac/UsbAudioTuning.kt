@@ -66,6 +66,14 @@ internal object UsbAudioTuning {
     const val DAC_SETTLE_DELAY_MS = 600L
 
     /**
+     * How long phase 2 of a relock waits for the pre-roll stream's first [NUM_URBS] URBs to
+     * complete before going on regardless (#127). They take about 32 ms; this only bounds a
+     * stream that never gets going, which [org.ostrichbat2k.usbdac.streaming.UsbAudioOutput.isStalled]
+     * then reports.
+     */
+    const val STREAM_ESTABLISH_TIMEOUT_MS = 500L
+
+    /**
      * The real sample rate this library asks every UAC2/3 device's Clock Source for, and the
      * fallback used whenever a UAC1 device's own declared rates don't include it or 44.1kHz.
      * Also [UsbAudioManagerImpl]'s own `activeRateHz` fallback default for display when nothing
@@ -147,11 +155,11 @@ internal object UsbAudioTuning {
      * How long [UsbAudioOutput.stopStreamingThread] waits for the streaming thread to actually
      * exit after [org.ostrichbat2k.usbdac.streaming.UsbNative.cancelIso] before deciding it's
      * stuck. Generous relative to this class's own ~8ms URB pacing -- the thread should notice
-     * `cancelIso`'s unblocked `reapIso` within one loop iteration almost always. Not just a
+     * `cancelIso`'s unblocked `reapIsoAny` within one loop iteration almost always. Not just a
      * courtesy wait: [UsbAudioOutput.stopStreamingThread] must NOT free the native isochronous
      * stream ([org.ostrichbat2k.usbdac.streaming.UsbNative.closeIsoStream]) while the thread
      * might still be inside a blocked native call using it -- confirmed, reproduced as a real
-     * use-after-free risk when `cancelIso` fails to unblock a wedged `reapIso` (e.g. a vanished
+     * use-after-free risk when `cancelIso` fails to unblock a wedged `reapIsoAny` (e.g. a vanished
      * device) and this timeout is reached.
      */
     const val STREAM_THREAD_JOIN_TIMEOUT_MS = 2000L
@@ -169,12 +177,11 @@ internal object UsbAudioTuning {
     const val FEEDBACK_PACKETS_PER_URB = 1
 
     /**
-     * [org.ostrichbat2k.usbdac.streaming.FeedbackRateDecoder]'s sanity-check band: a decoded
-     * candidate rate is only trusted if it's within this fraction of the nominal negotiated rate.
-     * The on-wire feedback format is genuinely ambiguous (see that class's own doc comment) --
-     * this is deliberately generous (+-10%) since a real device's own clock drift should only
-     * ever be a tiny fraction of this, so the band exists to reject outright garbage/misdecodes,
-     * not to track genuine drift tightly.
+     * [org.ostrichbat2k.usbdac.streaming.FeedbackDecoder]'s acceptance band: a feedback value is
+     * only applied if it is within this fraction of the nominal negotiated rate. A real device's
+     * clock differs from nominal by a tiny fraction of this, so the band exists to reject
+     * garbage, not to track drift tightly. It also bounds how much larger than nominal a packet
+     * can get, which [org.ostrichbat2k.usbdac.streaming.UsbIsoStreamEngine] sizes its buffers by.
      */
     const val FEEDBACK_RATE_TOLERANCE_FRACTION = 0.1
 }

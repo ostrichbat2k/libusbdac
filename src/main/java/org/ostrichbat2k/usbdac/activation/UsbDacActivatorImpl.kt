@@ -19,6 +19,7 @@
 package org.ostrichbat2k.usbdac.activation
 
 import org.ostrichbat2k.usbdac.UsbAudioTuning
+import org.ostrichbat2k.usbdac.quirks.UsbDeviceQuirk
 import org.ostrichbat2k.usbdac.UsbDacPreferences
 import org.ostrichbat2k.usbdac.protocol.UacPlaybackTopology
 import org.ostrichbat2k.usbdac.protocol.UacStreamFormat
@@ -28,6 +29,7 @@ import org.ostrichbat2k.usbdac.protocol.UsbAudioDescriptorParserUac1
 import org.ostrichbat2k.usbdac.protocol.UsbAudioDescriptorParserUac2
 import org.ostrichbat2k.usbdac.protocol.UsbAudioDescriptorParserUac3
 import org.ostrichbat2k.usbdac.protocol.UsbAudioSession
+import org.ostrichbat2k.usbdac.protocol.UsbSampleRateConfigurator
 import org.ostrichbat2k.usbdac.protocol.UsbDeviceCapabilities
 import org.ostrichbat2k.usbdac.streaming.RoutingAudioSink
 import org.ostrichbat2k.usbdac.streaming.UsbAudioOutputProvider
@@ -200,15 +202,16 @@ internal class UsbDacActivatorImpl(
         // alternate setting ends up selected, so this can happen up front. UAC 1.0 has no Clock
         // Source at all -- its sample rate is a property of the streaming *endpoint* itself, set
         // further below, after selectFormat has made that endpoint active (see there for why).
-        val clockOk =
-            if (found.uacVersion != 1) {
-                val outcome =
-                    UsbAudioController.setClockFrequency(session, UsbAudioTuning.SUPPORTED_SAMPLE_RATE_HZ)
-                log("Clock set to ${UsbAudioTuning.SUPPORTED_SAMPLE_RATE_HZ} Hz: $outcome")
-                outcome is UsbAudioController.ClockWriteOutcome.Confirmed
-            } else {
-                true
-            }
+        // A device with SET_INTERFACE_FIRST (#132) gets its clock written after selectFormat
+        // below instead, like UAC 1.0.
+        val clockAfterInterface = UsbDeviceQuirk.SET_INTERFACE_FIRST in session.quirks
+        fun writeUac2Clock(): Boolean {
+            val write =
+                UsbSampleRateConfigurator.writeSampleRate(session, format, UsbAudioTuning.SUPPORTED_SAMPLE_RATE_HZ)
+            log("Clock set to ${UsbAudioTuning.SUPPORTED_SAMPLE_RATE_HZ} Hz: ${write.outcome}")
+            return write.accepted
+        }
+        var clockOk = if (found.uacVersion != 1 && !clockAfterInterface) writeUac2Clock() else true
         val muted = UsbAudioController.getMute(session)
         if (muted != false) UsbAudioController.setMute(session, muted = false)
         // Was hardcoded 0..2 (master + stereo) -- the Feature Unit has one volume control per
@@ -276,6 +279,7 @@ internal class UsbDacActivatorImpl(
         val formatOk =
             UsbAudioController.selectFormat(session, format) == UsbAudioController.ControlWriteOutcome.Success
         log("Alt-setting ${format.alternateSetting} (${format.bitResolution}-bit) selected: ok=$formatOk")
+        if (found.uacVersion != 1 && clockAfterInterface) clockOk = writeUac2Clock()
 
         // UAC 1.0's Sampling Frequency Control lives on the streaming endpoint itself, which
         // doesn't functionally exist until selectFormat (just above) has made its alternate
@@ -297,10 +301,11 @@ internal class UsbDacActivatorImpl(
                     log("Format alt=${format.alternateSetting} declares no sample rate")
                     false
                 } else {
-                    val outcome =
-                        UsbAudioController.setUac1EndpointSampleRate(session, format.endpointAddress, rateHz)
-                    log("UAC1 endpoint sample rate set to $rateHz Hz: $outcome")
-                    outcome is UsbAudioController.ClockWriteOutcome.Confirmed
+                    val write = UsbSampleRateConfigurator.writeSampleRate(session, format, rateHz)
+                    log(
+                        "UAC1 endpoint sample rate set to $rateHz Hz: ${write.outcome}" +
+                            (write.acceptedBecause?.let { " (unconfirmed, accepted: $it)" } ?: ""))
+                    write.accepted
                 }
             } else {
                 clockOk
@@ -325,10 +330,10 @@ internal class UsbDacActivatorImpl(
         // finishes, exactly what was observed (tracks playing through the tablet speaker). The
         // settings screen's "Retry activation" + its live controls now cover manual diagnosis
         // instead.
-        Thread.sleep(UsbAudioTuning.DAC_SETTLE_DELAY_MS)
+        val settle = UsbSampleRateConfigurator.awaitClockSettled(session)
         // No Clock Source entity exists to query on UAC 1.0.
         if (found.uacVersion != 1) {
-            log("Clock valid: ${UsbAudioController.getClockValid(session)}")
+            log("Clock valid: ${settle.valid}")
         }
 
         return UsbDacActivator.Result(session, format, rateHz ?: UsbAudioTuning.SUPPORTED_SAMPLE_RATE_HZ)

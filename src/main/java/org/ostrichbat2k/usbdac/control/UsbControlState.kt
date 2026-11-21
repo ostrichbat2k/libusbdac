@@ -47,4 +47,10 @@ data class UsbControlState(
      * means "couldn't ask", not "supports nothing".
      */
     val clockSupportedRates: List<Pair<Int, Int>>,
+    /**
+     * Set when an Asynchronous device's feedback says it is running at this standard rate rather
+     * than [sampleRateHz] (#124) -- see [org.ostrichbat2k.usbdac.UsbAudioManager.reportFeedbackRateMismatch].
+     * Null otherwise; cleared whenever the state is rebuilt for a new format or rate.
+     */
+    val feedbackRateMismatchHz: Int? = null,
 )

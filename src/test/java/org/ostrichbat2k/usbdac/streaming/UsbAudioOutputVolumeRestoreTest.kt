@@ -208,10 +208,59 @@ class UsbAudioOutputVolumeRestoreTest {
         // ever got back to onActivationAttemptFinished.
         val output = output(session, fakeUsbSettings(-2000), usbAudioManager)
 
-        output.onActivationAttemptFinished(succeeded = true)
+        assertFalse(output.onActivationAttemptFinished(succeeded = true))
 
         verify { usbAudioManager.releaseClaim() }
         verify(exactly = 0) { usbAudioManager.notifyStreamingStarted() }
+    }
+
+    /** #141: a release() during activation hands the claim back immediately, as release() itself does. */
+    @Test
+    fun `onActivationAttemptFinished releases immediately when the instance was released during activation`() {
+        val session = sessionWith(FakeFeatureUnit(unitId = 7, controlInterfaceId = 0))
+        val usbAudioManager = mockk<UsbAudioManager>(relaxed = true)
+        val output = output(session, fakeUsbSettings(-2000), usbAudioManager)
+        output.release()
+
+        assertFalse(output.onActivationAttemptFinished(succeeded = true))
+
+        verify { usbAudioManager.releaseClaim(delayMs = 0) }
+        verify(exactly = 0) { usbAudioManager.notifyStreamingStarted() }
+    }
+
+    /** #141/#31: paused during activation in manual mode keeps the claim, as pause() does. */
+    @Test
+    fun `onActivationAttemptFinished keeps the claim when paused in manual release mode`() {
+        val session = sessionWith(FakeFeatureUnit(unitId = 7, controlInterfaceId = 0))
+        val usbAudioManager = mockk<UsbAudioManager>(relaxed = true)
+        val settings = fakeUsbSettings(-2000)
+        every { settings.manualReleaseControl } returns true
+        val output = output(session, settings, usbAudioManager)
+
+        assertFalse(output.onActivationAttemptFinished(succeeded = true))
+
+        verify(exactly = 0) { usbAudioManager.releaseClaim(any(), any(), any()) }
+        verify(exactly = 0) { usbAudioManager.notifyStreamingStarted() }
+    }
+
+    /**
+     * #127: phase 2 of a relock runs with the stream already going in pre-roll; a [pause] in the
+     * meantime stops that stream, so when phase 2 finishes there's nothing to open and nothing
+     * to stop. (The branches that do start or open a stream reach [UsbNative], see above.)
+     */
+    @Test
+    fun `onSettleFinished leaves a paused instance alone, settled or not`() {
+        val featureUnit = FakeFeatureUnit(unitId = 7, controlInterfaceId = 0)
+        val session = sessionWith(featureUnit)
+        val usbAudioManager = mockk<UsbAudioManager>(relaxed = true)
+        val output = output(session, fakeUsbSettings(-2000), usbAudioManager)
+
+        output.onSettleFinished(settled = true)
+        output.onSettleFinished(settled = false)
+
+        verify(exactly = 0) { usbAudioManager.notifyStreamingStarted() }
+        verify(exactly = 0) { usbAudioManager.notifyStreamingStopped() }
+        verify(exactly = 0) { usbAudioManager.setDirectPlaybackActive(any()) }
     }
 
     @Test
@@ -266,7 +315,7 @@ class UsbAudioOutputVolumeRestoreTest {
      * Regression coverage for #68: [UsbAudioOutput.stopStreamingThread] must not free the native
      * isochronous stream while the streaming thread might still be inside a blocked native call
      * using it (a confirmed, reproduced use-after-free risk when `cancelIso()` fails to unblock a
-     * wedged `reapIso()` in time -- see [org.ostrichbat2k.usbdac.UsbAudioTuning.
+     * wedged `reapIsoAny()` in time -- see [org.ostrichbat2k.usbdac.UsbAudioTuning.
      * STREAM_THREAD_JOIN_TIMEOUT_MS]'s doc comment). [UsbAudioOutput.isStreamThreadStuck] is the
      * exact decision [stopStreamingThread] gates on; tested directly, not through
      * `stopStreamingThread()` itself, since any real path through that function where

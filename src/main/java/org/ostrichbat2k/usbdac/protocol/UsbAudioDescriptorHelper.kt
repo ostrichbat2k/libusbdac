@@ -36,6 +36,7 @@ internal object UsbAudioDescriptorHelper {
     const val DESC_TYPE_INTERFACE = 0x04
     const val DESC_TYPE_ENDPOINT = 0x05
     const val DESC_TYPE_CS_INTERFACE = 0x24
+    const val DESC_TYPE_CS_ENDPOINT = 0x25
 
     const val AC_SUBCLASS = 1
     const val AS_SUBCLASS = 2
@@ -61,6 +62,28 @@ internal object UsbAudioDescriptorHelper {
     const val AC2_SELECTOR_UNIT = 0x05
     const val AC2_FEATURE_UNIT = 0x06
     const val AC2_CLOCK_SOURCE = 0x0A
+    const val AC2_CLOCK_SELECTOR = 0x0B
+    const val AC2_CLOCK_MULTIPLIER = 0x0C
+
+    // Clock Source descriptor, same layout up to here in UAC 2.0 and 3.0: bLength, bDescriptorType,
+    // bDescriptorSubtype, bClockID, bmAttributes, bmControls. bmControls holds two bits per
+    // control (0b00 absent, 0b01 read-only, 0b11 read/write): frequency in bits 1:0, validity in 3:2.
+    private const val CLOCK_SOURCE_BMCONTROLS_OFFSET = 5
+    private const val CONTROL_READ_WRITE = 0b11
+    private const val CONTROL_READABLE_BIT = 0b01
+    private const val CLOCK_VALIDITY_SHIFT = 2
+
+    /** Null when [clockSource] is too short to carry bmControls -- callers then assume "yes". */
+    private fun clockControls(clockSource: ByteArray): Int? =
+        if (clockSource.size > CLOCK_SOURCE_BMCONTROLS_OFFSET) clockSource.u8(CLOCK_SOURCE_BMCONTROLS_OFFSET) else null
+
+    /** See [UacPlaybackTopology.clockFrequencyWritable]. */
+    fun clockFrequencyWritable(clockSource: ByteArray): Boolean =
+        clockControls(clockSource)?.let { it and CONTROL_READ_WRITE == CONTROL_READ_WRITE } ?: true
+
+    /** See [UacPlaybackTopology.clockValidityReadable]. */
+    fun clockValidityReadable(clockSource: ByteArray): Boolean =
+        clockControls(clockSource)?.let { (it shr CLOCK_VALIDITY_SHIFT) and CONTROL_READABLE_BIT != 0 } ?: true
 
     // AudioStreaming class-specific interface descriptor subtype, same number across all three
     // UAC versions. UAC 3.0 folds format info directly into AS_GENERAL rather than a separate

@@ -19,57 +19,70 @@
 package org.ostrichbat2k.usbdac.streaming
 
 /**
- * Distributes whole-number sample counts across isochronous packets for sample rates that don't
- * divide evenly into one packet's worth of time -- 44100 Hz is 44.1 samples per 1ms packet, not a
- * whole number. Uses a running-remainder (Bresenham-style) distribution: exact over any window,
- * and degenerates to a fixed sample count per packet when the rate does divide evenly (e.g.
- * 48000 Hz at 1 packet/ms -> always exactly 48).
+ * Decides how many samples each isochronous packet carries, for rates that are not a whole number
+ * of samples per packet -- 44100 Hz is 44.1 samples per 1 ms packet. A running phase accumulator
+ * (the same idea as Linux's `synced_next_packet_size`, sound/usb/endpoint.c): every packet adds
+ * the current rate to the phase, sends the whole samples that have accumulated, and carries the
+ * fraction over. Exact over any window for the nominal rate, and a fixed count per packet when the
+ * rate divides evenly (48000 Hz at 1 packet/ms is always 48).
  *
- * [packetsPerSecond] is how many isochronous packets make up one second of real bus time -- 1000
- * for a full-speed device (one packet per 1ms frame), 8000 for high-speed (one packet per 125us
- * *microframe* instead -- see [UsbNative.getUsbSpeed]'s doc comment for why this distinction is
- * essential, not cosmetic: assuming 1000 unconditionally on a high-speed device packs 8x too many
- * samples into each packet slot relative to how much real bus time it actually occupies).
+ * [packetsPerSecond] is how many isochronous packets make up one second of bus time -- 1000 for a
+ * full-speed device (one packet per 1 ms frame), 8000 for high speed with bInterval 1 (one per
+ * 125 us microframe). See [IsoPacing.forSpeed].
  *
- * Single-writer-assumed until #25: only the main streaming thread ever touched this class, so
- * [nextPacketSampleCount]/[reset] were safe unsynchronized. An Asynchronous device's feedback
- * thread now calls [updateRate] concurrently with the main thread's own [nextPacketSampleCount]
- * calls, so every mutable field is guarded by [lock] -- real correctness, not a nice-to-have.
+ * An Asynchronous device's feedback changes the rate between the packet sizes the streaming thread
+ * asks for. A rate change replaces the step only. The phase is deliberately kept: feedback
+ * arrives about once per millisecond, and clearing the phase that often throws away the fraction
+ * every time, which pins the delivered rate to a multiple of the update frequency no matter what
+ * the device asked for (#120).
+ *
+ * [maxSamplesPerPacket] is a hard ceiling on a single packet (what fits the endpoint's
+ * wMaxPacketSize and the caller's buffer). Samples that would exceed it are dropped from the
+ * phase, not deferred, so a nonsensical rate cannot build up a backlog.
  */
-class IsoPacketScheduler(sampleRateHz: Int, private val packetsPerSecond: Int = 1000) {
+class IsoPacketScheduler(
+    sampleRateHz: Int,
+    private val packetsPerSecond: Int = 1000,
+    private val maxSamplesPerPacket: Int = Int.MAX_VALUE,
+) {
+    private companion object {
+        const val Q16_ONE = 1L shl 16
+    }
+
     private val lock = Any()
-    private var baseSamplesPerPacket = sampleRateHz / packetsPerSecond
-    private var remainderPerPacket = sampleRateHz % packetsPerSecond
-    private var accumulator = 0
+
+    // Everything is kept in units of 1 / (packetsPerSecond * 65536) of a sample. In that unit a
+    // rate in Hz is `hz * 65536` per packet and a feedback value (Q16.16 samples per packet) is
+    // `value * packetsPerSecond` per packet -- both exact integers, so neither the nominal rate
+    // nor a device-reported one picks up a rounding error.
+    private val oneSample = packetsPerSecond * Q16_ONE
+    private var stepPerPacket = sampleRateHz * Q16_ONE
+    private var phase = 0L
 
     /** Returns the number of samples the next packet should carry. */
     fun nextPacketSampleCount(): Int =
         synchronized(lock) {
-            accumulator += remainderPerPacket
-            if (accumulator >= packetsPerSecond) {
-                accumulator -= packetsPerSecond
-                baseSamplesPerPacket + 1
-            } else {
-                baseSamplesPerPacket
-            }
+            phase += stepPerPacket
+            val whole = phase / oneSample
+            phase -= whole * oneSample
+            if (whole > maxSamplesPerPacket) maxSamplesPerPacket else whole.toInt()
         }
 
     fun reset() {
-        synchronized(lock) { accumulator = 0 }
+        synchronized(lock) { phase = 0L }
+    }
+
+    /** Sets the rate in Hz. Keeps the phase -- see this class's own doc comment. */
+    fun updateRate(sampleRateHz: Int) {
+        synchronized(lock) { stepPerPacket = sampleRateHz * Q16_ONE }
     }
 
     /**
-     * Re-derives the per-packet sample distribution for a feedback-reported real rate (#25) --
-     * called from the feedback thread, never the main streaming thread. Resets [accumulator] too:
-     * an old accumulator value computed against the previous rate's [remainderPerPacket] has no
-     * meaning against the new one.
+     * Sets the rate from an Asynchronous device's feedback, as Q16.16 samples per packet -- the
+     * unit [FeedbackDecoder] produces. Called from the streaming thread (#139). Keeps the phase.
      */
-    fun updateRate(sampleRateHz: Int) {
-        synchronized(lock) {
-            baseSamplesPerPacket = sampleRateHz / packetsPerSecond
-            remainderPerPacket = sampleRateHz % packetsPerSecond
-            accumulator = 0
-        }
+    fun updateSamplesPerPacketQ16(samplesPerPacketQ16: Long) {
+        synchronized(lock) { stepPerPacket = samplesPerPacketQ16 * packetsPerSecond }
     }
 }
 

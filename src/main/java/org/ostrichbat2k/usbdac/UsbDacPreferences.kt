@@ -19,6 +19,7 @@
 package org.ostrichbat2k.usbdac
 
 import org.ostrichbat2k.usbdac.streaming.RoutingAudioSink
+import org.ostrichbat2k.usbdac.streaming.UrbQueueShape
 import org.ostrichbat2k.usbdac.streaming.UsbAudioOutput
 /**
  * User configuration specific to direct USB DAC output. The host app provides its own
@@ -105,6 +106,14 @@ interface UsbDacPreferences {
      * what the *next* [UsbAudioOutput.pause] call does.
      */
     val manualReleaseControl: Boolean
+
+    /**
+     * Experiment only (#123): a different URB queue shape for the stream, in place of
+     * [UrbQueueShape.DEFAULT]. Null, the default, keeps the default; a host app only overrides
+     * this in a build made to compare queue depths. Read when a stream starts.
+     */
+    val urbQueueOverride: UrbQueueShape?
+        get() = null
 
     /**
      * Add a listener to be notified of settings changes.

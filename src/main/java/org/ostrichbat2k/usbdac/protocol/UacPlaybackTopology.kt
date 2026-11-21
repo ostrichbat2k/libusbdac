@@ -46,7 +46,7 @@ enum class SyncType {
  * An Asynchronous device's dedicated feedback endpoint (UAC 5.12.4.2) -- a second, IN-direction
  * isochronous endpoint in the same alt setting as the main OUT data endpoint, over which the
  * device periodically reports its own real sample-consumption rate as a fixed-point value (see
- * [org.ostrichbat2k.usbdac.streaming.FeedbackRateDecoder]). Only ever populated when the
+ * [org.ostrichbat2k.usbdac.streaming.FeedbackDecoder]). Only ever populated when the
  * descriptor walk actually found a second, IN-direction endpoint in this alt setting --
  * independent of [UacStreamFormat.syncType] saying [SyncType.ASYNC], since a confused or
  * malformed device could decode either without the other; [UsbAudioOutput] is the one place
@@ -82,7 +82,26 @@ data class UacStreamFormat(
     val bInterval: Int = 1,
     /** See [UacFeedbackEndpoint]. Null unless the descriptor walk found one (#25). */
     val feedbackEndpoint: UacFeedbackEndpoint? = null,
-)
+    /**
+     * UAC 1.0 only: whether the streaming endpoint implements the Sampling Frequency control --
+     * bit 0 of bmAttributes in its class-specific endpoint descriptor (UAC 1.0 4.6.1.2). The
+     * control is optional, and a device with one fixed rate commonly leaves it out and STALLs the
+     * request (#128). False only when the descriptor was present and said so; true when it said
+     * yes, when there was no such descriptor to read, and for UAC 2.0/3.0, where the rate belongs
+     * to the Clock Source and this is not consulted.
+     */
+    val hasSamplingFrequencyControl: Boolean = true,
+) {
+    /**
+     * True for an Asynchronous endpoint with no feedback endpoint (#133). Such a device expects
+     * the host to take the rate from its own capture stream ("implicit feedback", Linux
+     * `sound/usb/implicit.c`), which this library does not do: it streams at the nominal rate,
+     * so the device's clock and ours drift apart until its buffer over- or underruns, heard as a
+     * periodic click. Surfaced so such a report can be recognised; nothing corrects it yet.
+     */
+    val needsImplicitFeedback: Boolean
+        get() = syncType == SyncType.ASYNC && feedbackEndpoint == null
+}
 
 /**
  * A non-PCM alt setting found on the streaming interface (e.g. raw DSD) -- excluded from
@@ -156,6 +175,25 @@ data class UacPlaybackTopology(
     val formats: List<UacStreamFormat>,
     /** See [UacNonPcmFormat]. Always empty on UAC 1.0, which has no bmFormats bitmap to exclude by. */
     val nonPcmFormats: List<UacNonPcmFormat> = emptyList(),
+    /**
+     * UAC 2.0/3.0: whether the Clock Source's Sampling Frequency control can be written -- bits
+     * 1:0 of its descriptor's bmControls equal to 0b11 (UAC 2.0 4.7.2.1). False for a fixed-clock
+     * device, which must not be sent a SET_CUR it has said it does not support (#131). True when
+     * the descriptor says so or is too short to say, and for UAC 1.0, where it is not consulted.
+     */
+    val clockFrequencyWritable: Boolean = true,
+    /**
+     * UAC 2.0/3.0: whether the Clock Source's Clock Validity control can be read -- bits 3:2 of
+     * bmControls non-zero. When it cannot, the clock is assumed valid without asking.
+     */
+    val clockValidityReadable: Boolean = true,
+    /**
+     * UAC 2.0: the Clock Selector on the playback path's clock, -1 if there is none (#129) --
+     * see [Uac2ClockPath]. [clockSelectorPin] (1-based) is the input leading to [clockSourceId];
+     * it is selected before the rate is written.
+     */
+    val clockSelectorId: Int = -1,
+    val clockSelectorPin: Int = 0,
 )
 
 /**

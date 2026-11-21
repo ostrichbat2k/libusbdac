@@ -110,6 +110,10 @@ internal class UsbDacDescriptorCacheImpl(context: Context) : UsbDacDescriptorCac
                     powerDomainD2RecoveryUs = topology.powerDomainD2RecoveryUs,
                     channelCount = topology.channelCount,
                     clockSupportedRatesEncoded = clockSupportedRates.encodeRanges(),
+                    clockFrequencyWritable = topology.clockFrequencyWritable,
+                    clockValidityReadable = topology.clockValidityReadable,
+                    clockSelectorId = topology.clockSelectorId,
+                    clockSelectorPin = topology.clockSelectorPin,
                 ),
                 topology.formats.map { it.toEntity(key) },
             )
@@ -149,6 +153,10 @@ private fun CachedUacTopology.toDomain(formats: List<UacStreamFormat>) =
         powerDomainD2RecoveryUs = powerDomainD2RecoveryUs,
         channelCount = channelCount,
         formats = formats,
+        clockFrequencyWritable = clockFrequencyWritable,
+        clockValidityReadable = clockValidityReadable,
+        clockSelectorId = clockSelectorId,
+        clockSelectorPin = clockSelectorPin,
     )
 
 private fun CachedUacFormat.toDomain() =
@@ -162,6 +170,7 @@ private fun CachedUacFormat.toDomain() =
         syncType = SyncType.entries[syncType],
         sampleRates = sampleRatesEncoded.decodeInts(),
         bInterval = bInterval,
+        hasSamplingFrequencyControl = hasSamplingFrequencyControl,
         feedbackEndpoint =
             if (feedbackEndpointAddress >= 0) {
                 UacFeedbackEndpoint(
@@ -186,7 +195,8 @@ private fun UacStreamFormat.toEntity(deviceKey: String) =
         bInterval = bInterval,
         feedbackEndpointAddress = feedbackEndpoint?.address ?: -1,
         feedbackMaxPacketSize = feedbackEndpoint?.maxPacketSize ?: -1,
-        feedbackBInterval = feedbackEndpoint?.bInterval ?: -1)
+        feedbackBInterval = feedbackEndpoint?.bInterval ?: -1,
+        hasSamplingFrequencyControl = hasSamplingFrequencyControl)
 
 @Entity(tableName = "usb_dac_topology")
 internal data class CachedUacTopology(
@@ -206,6 +216,13 @@ internal data class CachedUacTopology(
     val powerDomainD2RecoveryUs: Int,
     val channelCount: Int,
     val clockSupportedRatesEncoded: String,
+    /** See [UacPlaybackTopology.clockFrequencyWritable]. */
+    val clockFrequencyWritable: Boolean = true,
+    /** See [UacPlaybackTopology.clockValidityReadable]. */
+    val clockValidityReadable: Boolean = true,
+    /** See [UacPlaybackTopology.clockSelectorId] (#129). */
+    val clockSelectorId: Int = -1,
+    val clockSelectorPin: Int = 0,
 )
 
 @Entity(tableName = "usb_dac_format", primaryKeys = ["deviceKey", "alternateSetting"])
@@ -228,6 +245,8 @@ internal data class CachedUacFormat(
     val feedbackEndpointAddress: Int = -1,
     val feedbackMaxPacketSize: Int = -1,
     val feedbackBInterval: Int = -1,
+    /** See [UacStreamFormat.hasSamplingFrequencyControl]. */
+    val hasSamplingFrequencyControl: Boolean = true,
 )
 
 @Dao
@@ -254,11 +273,13 @@ internal interface DescriptorCacheDao {
 }
 
 // Bumped to 2 for #61's new CachedUacFormat.bInterval column, then to 3 for #25's isAsync ->
-// syncType rename plus the three new feedbackEndpoint* columns -- fallbackToDestructiveMigration
+// syncType rename plus the three new feedbackEndpoint* columns, then to 4 for #128's
+// hasSamplingFrequencyControl column, then to 5 for #131's two
+// clock-control columns, then to 6 for #129's two clock-selector columns -- fallbackToDestructiveMigration
 // above means this just wipes and recreates the cache on next open rather than needing an
 // explicit Migration, acceptable for a pure performance cache (see this class's own doc comment
 // on why a stale/missing entry is a one-tap-equivalent cost, not a correctness risk).
-@Database(entities = [CachedUacTopology::class, CachedUacFormat::class], version = 3, exportSchema = false)
+@Database(entities = [CachedUacTopology::class, CachedUacFormat::class], version = 6, exportSchema = false)
 internal abstract class DescriptorCacheDatabase : RoomDatabase() {
     abstract fun dao(): DescriptorCacheDao
 }

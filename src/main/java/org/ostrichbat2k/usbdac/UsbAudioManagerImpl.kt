@@ -44,10 +44,12 @@ import org.ostrichbat2k.usbdac.protocol.UacStreamFormat
 import org.ostrichbat2k.usbdac.protocol.UsbAudioController
 import org.ostrichbat2k.usbdac.protocol.UsbAudioSession
 import org.ostrichbat2k.usbdac.protocol.UsbDeviceCapabilities
+import org.ostrichbat2k.usbdac.quirks.UsbDeviceQuirks
 import org.ostrichbat2k.usbdac.streaming.IsoPacketScheduler
 import org.ostrichbat2k.usbdac.streaming.RoutingAudioSink
 import org.ostrichbat2k.usbdac.streaming.UsbAudioOutput
 import org.ostrichbat2k.usbdac.streaming.UsbAudioOutputProvider
+import org.ostrichbat2k.usbdac.streaming.UsbNativeBridgeImpl
 import org.ostrichbat2k.usbdac.streaming.UsbPipelineStats
 import android.content.BroadcastReceiver
 import android.content.Context
@@ -73,8 +75,10 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlin.concurrent.withLock
 import timber.log.Timber as L
 
 /**
@@ -495,12 +499,16 @@ class UsbAudioManagerImpl(
      * through [AtomicReference.updateAndGet]'s CAS retry loop instead, so a losing attempt
      * reapplies its own transform against the winner's result rather than being discarded.
      */
+    //
+    // Transitions between states are tied to the activation that makes them (#144): each
+    // [runActivation] publishes its own [SessionState.Activating] instance with compareAndSet
+    // from Idle, and only that same instance (compared by identity -- it's a data class, so two
+    // activations for one device are equal but not the same) may move on to Active or back to
+    // Idle. [deactivateDac] takes whatever is there with getAndSet. So there's no setter: every
+    // transition is one of those.
     private val sessionStateRef = AtomicReference<SessionState>(SessionState.Idle)
-    private var sessionState: SessionState
+    private val sessionState: SessionState
         get() = sessionStateRef.get()
-        set(value) {
-            sessionStateRef.set(value)
-        }
 
     /**
      * Atomically applies [transform] to the current state iff it's currently
@@ -525,7 +533,11 @@ class UsbAudioManagerImpl(
     // Set/cleared only in runActivation's own background thread, bracketing the *entire*
     // activateDac() call (see its own finally block) rather than just the part of it that happens
     // to run before sessionState's own transition.
-    @Volatile private var pendingActivationSettled: CompletableDeferred<Unit>? = null
+    // An AtomicReference so an activation clears only its own (#144): a superseded activation
+    // still finishing must not clear the one a newer runActivation has set.
+    private val pendingActivationSettledRef = AtomicReference<CompletableDeferred<Unit>?>(null)
+    private val pendingActivationSettled: CompletableDeferred<Unit>?
+        get() = pendingActivationSettledRef.get()
 
     private val activeSession: UsbAudioSession?
         get() = (sessionState as? SessionState.Active)?.session
@@ -614,19 +626,27 @@ class UsbAudioManagerImpl(
      * claimed it would.
      */
     private fun runActivation(device: UsbDevice) {
+        val activating = SessionState.Activating(device)
+        // Only from Idle: two callers (the player thread's resolveActiveSink/triggerActivation
+        // and discovery on the main thread) racing past ensureActivated's Idle check, or a
+        // retryActivation landing while an activation is already running, must not each start
+        // one -- the loser's session would never be closed (#144).
+        if (!sessionStateRef.compareAndSet(SessionState.Idle, activating)) {
+            L.i("runActivation: an activation is already running or a session is active -- not starting another")
+            return
+        }
         activationAttemptedFor = device.deviceName
         val deferred = CompletableDeferred<Unit>()
-        pendingActivationSettled = deferred
-        sessionState = SessionState.Activating(device)
+        pendingActivationSettledRef.set(deferred)
         updateBlockPlayback()
         activationThread =
             Thread {
                     try {
-                        activateDac(device)
+                        activateDac(device, activating)
                     } finally {
-                        settleActivation()
+                        settleActivation(activating)
                         deferred.complete(Unit)
-                        pendingActivationSettled = null
+                        pendingActivationSettledRef.compareAndSet(deferred, null)
                     }
                 }
                 .apply {
@@ -648,15 +668,19 @@ class UsbAudioManagerImpl(
         activationThread?.join(timeoutMs)
     }
 
+    internal fun activationThreadForTest(): Thread? = activationThread
+
+    internal fun activeSessionForTest(): UsbAudioSession? = activeSession
+
     /**
-     * Called when a background [activateDac] call returns, success or failure. If it already
-     * transitioned [sessionState] to [SessionState.Active], leave it alone -- this only has to
-     * recover from the failure case (still [SessionState.Activating]) or a concurrent
-     * [deactivateDac] that already reset to [SessionState.Idle] in the meantime (checking first
-     * avoids implying this call is what decided we're idle, when it wasn't).
+     * Called when a background [activateDac] call returns, success or failure. Moves back to
+     * Idle only if the state is still this activation's own [activating] -- the failure case.
+     * Anything else (it reached Active, a [deactivateDac] already took it, or a newer activation
+     * has started since) is left alone; before #144 this cleared any Activating, a newer
+     * activation's included.
      */
-    private fun settleActivation() {
-        if (sessionState is SessionState.Activating) sessionState = SessionState.Idle
+    private fun settleActivation(activating: SessionState.Activating) {
+        sessionStateRef.compareAndSet(activating, SessionState.Idle)
         updateBlockPlayback()
     }
 
@@ -830,7 +854,8 @@ class UsbAudioManagerImpl(
         if (!bitPerfectWanted || !isBitPerfectCapable()) return null
         val session = activeSession ?: return null
         return DefaultAudioSink.Builder(context)
-            .setAudioOutputProvider(UsbAudioOutputProvider(this, session, usbSettings, realBitsPerSample))
+            .setAudioOutputProvider(
+                UsbAudioOutputProvider(this, session, usbSettings, realBitsPerSample, usbSpeedOf(session)))
             // Off by default in DefaultAudioSink -- without this, getFormatSupport() silently
             // rewrites every float-PCM query back down to 16-bit before UsbAudioOutputProvider
             // ever sees it, which is exactly what made every decoder's own float-vs-16-bit
@@ -845,6 +870,35 @@ class UsbAudioManagerImpl(
             .build()
             .also { sink -> updateActiveSessionState { it.copy(sink = sink) } }
     }
+
+    /** See [UsbAudioManager.reportFeedbackRateMismatch] (#124). */
+    override fun reportFeedbackRateMismatch(requestedHz: Int, observedHz: Int) {
+        diagnosticLogger.log(
+            "Warning: feedback says the device runs at $observedHz Hz, not the requested $requestedHz Hz " +
+                "-- the clock change may not have taken effect")
+        _controlState.update { it?.copy(feedbackRateMismatchHz = observedHz) }
+    }
+
+    /** See [UacStreamFormat.needsImplicitFeedback] (#133). */
+    private fun logIfImplicitFeedback(format: UacStreamFormat) {
+        if (!format.needsImplicitFeedback) return
+        val message =
+            "alt=${format.alternateSetting} is Asynchronous with no feedback endpoint (implicit feedback, " +
+                "not supported): streaming at the nominal rate, so periodic clicks from clock drift are possible"
+        L.w("UsbAudioManager: $message")
+        diagnosticLogger.log("Warning: $message")
+    }
+
+    /**
+     * [session]'s negotiated USB speed, for [UsbAudioOutputProvider]'s packet-size check (#130).
+     * Null when it can't be read -- including when the native library isn't loaded, as in JVM
+     * unit tests -- which makes the provider skip that check rather than reject formats on a
+     * guess.
+     */
+    private fun usbSpeedOf(session: UsbAudioSession): Int? =
+        runCatching { UsbNativeBridgeImpl.getUsbSpeed(session.connection.fileDescriptor) }
+            .onFailure { L.w(it, "UsbAudioManager: couldn't read USB speed; skipping packet-size checks") }
+            .getOrNull()
 
     /**
      * Switches the DAC's active alt-setting to [format] if it isn't already, and records
@@ -868,41 +922,52 @@ class UsbAudioManagerImpl(
         // UsbAudioOutput's own construction (right after this returns) needs it held too, so
         // this must succeed before selectFormat, not be left for later.
         if (requestClaim() == ClaimOutcome.FAILED) return false
-        val previousConfig = activeFormat?.let { ActiveStreamConfig(it, activeRateHz) }
-        val newConfig = ActiveStreamConfig(format, sampleRateHz)
-        val configChanged = previousConfig != newConfig
-        var ok = true
-        if (configChanged) {
-            // Re-selecting the alt-setting -- even to the *same* alternateSetting value when
-            // only the sample rate changed, not the bit depth -- always issues a real
-            // SET_INTERFACE request (UsbDeviceConnection.setInterface never short-circuits a
-            // same-value call), which resets the device's endpoint, flushing whatever's still
-            // sitting in its internal FIFO from the previous rate. Without this, a same-alt
-            // rate-only change (e.g. 24-bit 44.1kHz -> 24-bit 96kHz) never touched the
-            // interface at all, since the old condition only re-selected on a genuine bit-depth
-            // change -- confirmed, reproduced: exactly that rate-only case (not a bit-depth
-            // change, which already re-selected and so was never affected) produced an audible
-            // crackle right as streaming resumed, consistent with leftover samples from the old
-            // rate getting flushed out of the device's FIFO at the new rate's timing instead of
-            // discarded cleanly beforehand.
-            //
-            // Same reasoning as the identical call in activateDac(): Android's own ALSA driver
-            // can race to re-claim the interface, and evicting it again right before
-            // selectFormat is safe/cheap insurance against that.
-            UsbAudioController.reassertKernelEviction(session)
-            ok = UsbAudioController.selectFormat(session, format) == UsbAudioController.ControlWriteOutcome.Success
-            if (ok) {
-                updateActiveSessionState { it.copy(format = format) }
-                diagnosticLogger.log("Switched to ${format.bitResolution}-bit (alt=${format.alternateSetting}) for upcoming track")
-            } else {
-                diagnosticLogger.log("Failed to switch to ${format.bitResolution}-bit (alt=${format.alternateSetting}) for upcoming track")
+        // Compare, select and record as one step: two callers (a track change -- the old
+        // output's activation and the new output's provider) interleaving here could leave the
+        // cached format recording one alt-setting while the device is on the other, and the next
+        // call would then skip selectFormat() and stream on the wrong one (#146). The session's
+        // device-sequence lock rather than one of our own, because an output's relock also moves
+        // the alt-setting (to alt 0 and back to its own format, around the clock change) and
+        // holds that lock while it does (#143). The cost: a new track's getAudioOutput() can wait
+        // for an old output's relock to finish.
+        return session.deviceSequenceLock.withLock {
+            val previousConfig = activeFormat?.let { ActiveStreamConfig(it, activeRateHz) }
+            val newConfig = ActiveStreamConfig(format, sampleRateHz)
+            val configChanged = previousConfig != newConfig
+            var ok = true
+            if (configChanged) {
+                // Re-selecting the alt-setting -- even to the *same* alternateSetting value when
+                // only the sample rate changed, not the bit depth -- always issues a real
+                // SET_INTERFACE request (UsbDeviceConnection.setInterface never short-circuits a
+                // same-value call), which resets the device's endpoint, flushing whatever's still
+                // sitting in its internal FIFO from the previous rate. Without this, a same-alt
+                // rate-only change (e.g. 24-bit 44.1kHz -> 24-bit 96kHz) never touched the
+                // interface at all, since the old condition only re-selected on a genuine bit-depth
+                // change -- confirmed, reproduced: exactly that rate-only case (not a bit-depth
+                // change, which already re-selected and so was never affected) produced an audible
+                // crackle right as streaming resumed, consistent with leftover samples from the old
+                // rate getting flushed out of the device's FIFO at the new rate's timing instead of
+                // discarded cleanly beforehand.
+                //
+                // Same reasoning as the identical call in activateDac(): Android's own ALSA driver
+                // can race to re-claim the interface, and evicting it again right before
+                // selectFormat is safe/cheap insurance against that.
+                UsbAudioController.reassertKernelEviction(session)
+                ok = UsbAudioController.selectFormat(session, format) == UsbAudioController.ControlWriteOutcome.Success
+                if (ok) {
+                    updateActiveSessionState { it.copy(format = format) }
+                    diagnosticLogger.log("Switched to ${format.bitResolution}-bit (alt=${format.alternateSetting}) for upcoming track")
+                    logIfImplicitFeedback(format)
+                } else {
+                    diagnosticLogger.log("Failed to switch to ${format.bitResolution}-bit (alt=${format.alternateSetting}) for upcoming track")
+                }
             }
+            if (configChanged) {
+                updateActiveSessionState { it.copy(rateHz = sampleRateHz) }
+                controlWriter.refreshControlState(session, activeFormat ?: format, session.device.productName ?: session.device.deviceName)
+            }
+            ok
         }
-        if (configChanged) {
-            updateActiveSessionState { it.copy(rateHz = sampleRateHz) }
-            controlWriter.refreshControlState(session, activeFormat ?: format, session.device.productName ?: session.device.deviceName)
-        }
-        return ok
     }
 
     /**
@@ -948,11 +1013,28 @@ class UsbAudioManagerImpl(
      * activation that still belongs here rather than in [UsbDacActivator], since it's what
      * actually adopts a freshly-activated session into this class's own state machine.
      */
-    private fun activateDac(device: UsbDevice) {
+    private fun activateDac(device: UsbDevice, activating: SessionState.Activating) {
         val result = dacActivator.activate(device) ?: return
-        sessionState = SessionState.Active(result.session, result.format, result.rateHz)
+        // Marked claimed before the session is published, not after (where the tail below used
+        // to do it): a deactivateDac() landing after publication then sees the claim and hands
+        // the hardware off properly, instead of this marking a closed session claimed afterwards.
+        claimController.markAlreadyClaimed()
+        val active = SessionState.Active(result.session, result.format, result.rateHz)
+        if (!sessionStateRef.compareAndSet(activating, active)) {
+            // Deactivated (USB output turned off, a retryActivation, the device detached) while
+            // this activation ran. Publishing the session anyway would bring a deactivated session
+            // back, or leak this one's claimed interfaces when another activation's won (#144).
+            L.w("activateDac: deactivated while activating -- closing the new session")
+            closeSession(result.session)
+            return
+        }
         controlWriter.refreshControlState(result.session, result.format, device.productName ?: device.deviceName)
         diagnosticLogger.log("DAC session ready: ${result.format} at ${result.rateHz} Hz")
+        logIfImplicitFeedback(result.format)
+        val (quirks, quirkSource) = UsbDeviceQuirks.resolve(device.vendorId, device.productId)
+        if (quirks.isNotEmpty()) {
+            diagnosticLogger.log("Device quirks in effect: ${quirks.joinToString()} ($quirkSource)")
+        }
 
         // UsbAudioController.activate() (and selectFormat, inside dacActivator) claimed the
         // interface to do this one-time discovery/setup, but nothing's actually playing yet --
@@ -969,8 +1051,7 @@ class UsbAudioManagerImpl(
         // before Android's own UsbAlsaManager catches up to the just-released device silently
         // succeeds routed to the speaker instead, and Android never revisits that choice for it
         // -- confirmed, reproduced: opening another app's player right after granting permission,
-        // before ever pressing play in this app at all.
-        claimController.markAlreadyClaimed()
+        // before ever pressing play in this app at all. (The claim was marked as ours above.)
         releaseClaim(delayMs = 0, awaitAndroidTakeover = true, deactivateOnTimeout = false)
     }
 
@@ -995,27 +1076,13 @@ class UsbAudioManagerImpl(
      * redundant and removed, since every caller gets the correct behavior from here instead.
      */
     private fun deactivateDac() {
-        claimController.cancelPendingRelease()
-        val session = activeSession
-        if (session != null && claimController.isClaimed()) {
-            // Mirrors UsbClaimController's own UsbVolumeController.prepareForHalHandoff call
-            // (see its doc comment on why this has to happen before the interface is released,
-            // not after) -- without it, disabling USB DAC output while still claimed (e.g.
-            // mid-track, not between tracks where that path already did this) leaves the
-            // device's hardware Feature Unit at whatever gain/mute bit-perfect mode last set it
-            // to. Android's own STREAM_MUSIC volume has no visibility into or control over that
-            // -- confirmed, reproduced: every fallback track afterward showed the correct route,
-            // correct Android-side volume, and played silently, until the device was unplugged
-            // or USB DAC output was re-enabled.
-            volumeController.prepareForHalHandoff(session, session.topology.channelCount)
-        }
-        claimController.markReleased()
-        // Captured before clearing activeSession below -- see UsbClaimController's
-        // awaitAndroidOutputTakeover()'s fallback use of this, needed when this function is the
-        // one that triggered the switch to fallback rather than a per-track liveness check.
-        claimController.recordDeactivatedDevice(session?.device)
-        session?.let { UsbAudioController.release(it) }
-        sessionState = SessionState.Idle
+        // Takes the state in one step, so two concurrent calls (a settings change and a fatal
+        // stream error) can't both close the same session; the second finds Idle (#144). An
+        // Activating taken here has no session yet -- its activation sees it's gone and closes
+        // its own session when it finishes (see activateDac).
+        val session = (sessionStateRef.getAndSet(SessionState.Idle) as? SessionState.Active)?.session
+        closeSession(session)
+        updateBlockPlayback()
         _controlState.value = null
         _capabilities.value = null
         // The whole session is genuinely done (device unplugged, or USB DAC output turned off)
@@ -1026,6 +1093,18 @@ class UsbAudioManagerImpl(
             directPlaybackTrack?.release()
             directPlaybackTrack = null
         }
+    }
+
+    /**
+     * Closes [session] (or, with null, just resets the claim state). Cancels pending releases,
+     * forces the hardware to the HAL-handoff level if still claimed (see that function's doc
+     * comment for the silent-fallback bug that prevents), marks the claim gone and records the
+     * device for the takeover wait -- under the claim controller's lock, so a release on its
+     * scheduler can't interleave (#142) -- then releases the interfaces and the connection.
+     */
+    private fun closeSession(session: UsbAudioSession?) {
+        claimController.releaseForDeactivation(session)
+        session?.let { UsbAudioController.release(it) }
     }
 
     /**

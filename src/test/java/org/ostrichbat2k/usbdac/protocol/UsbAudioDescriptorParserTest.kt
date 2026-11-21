@@ -19,6 +19,7 @@
 package org.ostrichbat2k.usbdac.protocol
 
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
@@ -135,6 +136,35 @@ private object D {
         }
 
     fun uac2ClockSource(id: Int) = cs(4, 0x0A) { setU8(3, id) }
+
+    /** A full-length (17-byte) UAC2 Input Terminal, carrying bCSourceID at offset 7 (#129). */
+    fun uac2InputTerminalWithClock(id: Int, terminalType: Int, channelCount: Int, clockId: Int) =
+        cs(17, 0x02) {
+            setU8(3, id)
+            setU16(4, terminalType)
+            setU8(7, clockId)
+            setU8(8, channelCount)
+        }
+
+    fun uac2ClockSelector(id: Int, inputs: List<Int>) =
+        cs(7 + inputs.size, 0x0B) {
+            setU8(3, id)
+            setU8(4, inputs.size)
+            inputs.forEachIndexed { i, input -> setU8(5 + i, input) }
+        }
+
+    fun uac2ClockMultiplier(id: Int, sourceId: Int) =
+        cs(7, 0x0C) {
+            setU8(3, id)
+            setU8(4, sourceId)
+        }
+
+    /** A full-length UAC2 Clock Source descriptor (8 bytes) carrying [bmControls] at offset 5. */
+    fun uac2ClockSourceWithControls(id: Int, bmControls: Int) =
+        cs(8, 0x0A) {
+            setU8(3, id)
+            setU8(5, bmControls)
+        }
 
     fun uac2MixerUnit(id: Int, sources: List<Int>) =
         cs(5 + sources.size, 0x04) {
@@ -332,11 +362,20 @@ class UsbAudioDescriptorParserUac3Test {
 }
 
 class UsbAudioDescriptorParserUac2Test {
-    private fun fiioLikeConfig(channelCount: Int = 2, withClock: Boolean = true): ByteArray {
+    private fun fiioLikeConfig(
+        channelCount: Int = 2,
+        withClock: Boolean = true,
+        clockControls: Int? = null,
+    ): ByteArray {
         val config = D.configuration(1)
         val acIface = D.iface(0, 0, 1, 1, 0x20)
         val input = D.uac2InputTerminal(id = 1, terminalType = 0x0101, channelCount = channelCount)
-        val clock = if (withClock) D.uac2ClockSource(id = 10) else byteArrayOf()
+        val clock =
+            when {
+                !withClock -> byteArrayOf()
+                clockControls != null -> D.uac2ClockSourceWithControls(id = 10, bmControls = clockControls)
+                else -> D.uac2ClockSource(id = 10)
+            }
         val output = D.outputTerminal(terminalType = 0x0301, sourceId = 15)
         val asIface = D.iface(1, 1, 1, 2, 0x20)
         val asGeneral = D.uac2AsGeneral(terminalLink = 1)
@@ -345,6 +384,32 @@ class UsbAudioDescriptorParserUac2Test {
         // non-default value is used here.
         val endpoint = D.endpoint(address = 0x07, attributes = 0x05, maxPacketSize = 196, bInterval = 4)
         return config + acIface + input + clock + output + asIface + asGeneral + formatType + endpoint
+    }
+
+    @Test
+    fun `clock source bmControls decides whether the frequency is writable and validity readable`() {
+        fun parsed(controls: Int?) =
+            UsbAudioDescriptorParserUac2.parseUac2Playback(fiioLikeConfig(clockControls = controls))!!
+        // frequency read/write (0b11), validity read-only (0b01 << 2): the usual DAC.
+        parsed(0b0111).let {
+            assertTrue(it.clockFrequencyWritable)
+            assertTrue(it.clockValidityReadable)
+        }
+        // frequency read-only, no validity control: a fixed-clock device.
+        parsed(0b0001).let {
+            assertEquals(false, it.clockFrequencyWritable)
+            assertEquals(false, it.clockValidityReadable)
+        }
+        // no controls at all.
+        parsed(0b0000).let {
+            assertEquals(false, it.clockFrequencyWritable)
+            assertEquals(false, it.clockValidityReadable)
+        }
+        // a descriptor too short to carry bmControls: assume both, as before this was parsed.
+        parsed(null).let {
+            assertTrue(it.clockFrequencyWritable)
+            assertTrue(it.clockValidityReadable)
+        }
     }
 
     @Test
@@ -363,6 +428,77 @@ class UsbAudioDescriptorParserUac2Test {
         assertEquals(-1, format.clusterDescriptorId) // UAC2 never sets this -- UAC3-only concept
         assertTrue(format.sampleRates.isEmpty()) // UAC2 negotiates rate via the Clock Source
         assertEquals(4, format.bInterval)
+    }
+
+    @Test
+    fun `an Asynchronous endpoint with no feedback endpoint is flagged as needing implicit feedback`() {
+        // fiioLikeConfig's data endpoint is Asynchronous (attributes 0x05) and has no feedback endpoint.
+        val format = UsbAudioDescriptorParserUac2.parseUac2Playback(fiioLikeConfig())!!.formats.single()
+        assertEquals(SyncType.ASYNC, format.syncType)
+        assertNull(format.feedbackEndpoint)
+        assertTrue(format.needsImplicitFeedback)
+    }
+
+    @Test
+    fun `an Asynchronous endpoint with a feedback endpoint, or a Synchronous one, is not flagged`() {
+        val feedback = D.endpoint(address = 0x87, attributes = 0x11, maxPacketSize = 4, bInterval = 4)
+        val withFeedback =
+            UsbAudioDescriptorParserUac2.parseUac2Playback(fiioLikeConfig() + feedback)!!.formats.single()
+        assertNotNull(withFeedback.feedbackEndpoint)
+        assertFalse(withFeedback.needsImplicitFeedback)
+        assertFalse(withFeedback.copy(syncType = SyncType.SYNCHRONOUS, feedbackEndpoint = null).needsImplicitFeedback)
+    }
+
+    // ---- #129: the playback path's clock, followed from the terminal's bCSourceID ----
+
+    private fun multiClockConfig(terminalClockId: Int, clockEntities: ByteArray): ByteArray {
+        val config = D.configuration(1)
+        val acIface = D.iface(0, 0, 1, 1, 0x20)
+        val input =
+            D.uac2InputTerminalWithClock(id = 1, terminalType = 0x0101, channelCount = 2, clockId = terminalClockId)
+        val output = D.outputTerminal(terminalType = 0x0301, sourceId = 15)
+        val asIface = D.iface(1, 1, 1, 2, 0x20)
+        val asGeneral = D.uac2AsGeneral(terminalLink = 1)
+        val formatType = D.uac2FormatType(subslotSize = 2, bitResolution = 16)
+        val endpoint = D.endpoint(address = 0x07, attributes = 0x05, maxPacketSize = 196, bInterval = 4)
+        return config + acIface + input + clockEntities + output + asIface + asGeneral + formatType + endpoint
+    }
+
+    @Test
+    fun `the clock named by bCSourceID is used, not the first one declared`() {
+        // S/PDIF clock (11) declared first; the terminal is clocked by the internal one (10).
+        val clocks =
+            D.uac2ClockSourceWithControls(id = 11, bmControls = 0b0001) + D.uac2ClockSourceWithControls(10, 0b0111)
+        val topology = UsbAudioDescriptorParserUac2.parseUac2Playback(multiClockConfig(10, clocks))!!
+        assertEquals(10, topology.clockSourceId)
+        assertTrue(topology.clockFrequencyWritable) // clock 10's controls, not clock 11's read-only ones
+        assertEquals(-1, topology.clockSelectorId)
+    }
+
+    @Test
+    fun `a clock selector is resolved through its first input that leads to a source`() {
+        // Pin 1 names an entity that doesn't exist; pin 2 leads to clock 10.
+        val clocks =
+            D.uac2ClockSource(11) + D.uac2ClockSource(10) + D.uac2ClockSelector(id = 20, inputs = listOf(99, 10))
+        val topology = UsbAudioDescriptorParserUac2.parseUac2Playback(multiClockConfig(20, clocks))!!
+        assertEquals(10, topology.clockSourceId)
+        assertEquals(20, topology.clockSelectorId)
+        assertEquals(2, topology.clockSelectorPin)
+    }
+
+    @Test
+    fun `a clock multiplier is followed to its source`() {
+        val clocks = D.uac2ClockSource(11) + D.uac2ClockSource(10) + D.uac2ClockMultiplier(id = 30, sourceId = 10)
+        val topology = UsbAudioDescriptorParserUac2.parseUac2Playback(multiClockConfig(30, clocks))!!
+        assertEquals(10, topology.clockSourceId)
+        assertEquals(-1, topology.clockSelectorId)
+    }
+
+    @Test
+    fun `a bCSourceID that leads nowhere falls back to the first clock source`() {
+        val clocks = D.uac2ClockSource(11) + D.uac2ClockSource(10)
+        val topology = UsbAudioDescriptorParserUac2.parseUac2Playback(multiClockConfig(42, clocks))!!
+        assertEquals(11, topology.clockSourceId)
     }
 
     @Test
@@ -410,7 +546,13 @@ class UsbAudioDescriptorParserUac2Test {
 }
 
 class UsbAudioDescriptorParserUac1Test {
-    private fun ab13xLikeConfig(sampleRates: List<Int> = listOf(8000, 48000)): ByteArray {
+    /** Class-specific endpoint descriptor (EP_GENERAL, type 0x25) with the given bmAttributes. */
+    private fun csEndpoint(attributes: Int) = byteArrayOf(7, 0x25, 0x01, attributes.toByte(), 0, 0, 0)
+
+    private fun ab13xLikeConfig(
+        sampleRates: List<Int> = listOf(8000, 48000),
+        afterEndpoint: ByteArray = ByteArray(0),
+    ): ByteArray {
         val config = D.configuration(1)
         val acIface = D.iface(0, 0, 1, 1, 0x00)
         val input = D.uac1InputTerminal(id = 1, terminalType = 0x0101, channelCount = 2)
@@ -421,7 +563,30 @@ class UsbAudioDescriptorParserUac1Test {
         // bInterval=4: see UsbAudioDescriptorParserUac3Test's earPodsLikeConfig for why a
         // non-default value is used here.
         val endpoint = D.endpoint(address = 0x01, attributes = 0x05, maxPacketSize = 192, bInterval = 4)
-        return config + acIface + input + output + asIface + asGeneral + formatType + endpoint
+        return config + acIface + input + output + asIface + asGeneral + formatType + endpoint + afterEndpoint
+    }
+
+    @Test
+    fun `sampling frequency control bit of the class-specific endpoint descriptor is read`() {
+        fun parsed(after: ByteArray) =
+            UsbAudioDescriptorParserUac1.parseUac1Playback(ab13xLikeConfig(afterEndpoint = after))!!.formats.single()
+        assertEquals(true, parsed(csEndpoint(0x01)).hasSamplingFrequencyControl)
+        assertEquals(true, parsed(csEndpoint(0x81)).hasSamplingFrequencyControl, "other attribute bits ignored")
+        assertEquals(false, parsed(csEndpoint(0x00)).hasSamplingFrequencyControl)
+        assertEquals(false, parsed(csEndpoint(0x80)).hasSamplingFrequencyControl)
+        // No class-specific endpoint descriptor at all: unknown, so the request is still tried.
+        assertEquals(true, parsed(ByteArray(0)).hasSamplingFrequencyControl)
+    }
+
+    @Test
+    fun `a feedback endpoint's class-specific descriptor does not decide the data endpoint's control`() {
+        val feedback = D.endpoint(address = 0x81, attributes = 0x11, maxPacketSize = 3, bInterval = 1)
+        val format =
+            UsbAudioDescriptorParserUac1.parseUac1Playback(
+                    ab13xLikeConfig(afterEndpoint = csEndpoint(0x01) + feedback + csEndpoint(0x00)))!!
+                .formats
+                .single()
+        assertEquals(true, format.hasSamplingFrequencyControl)
     }
 
     @Test

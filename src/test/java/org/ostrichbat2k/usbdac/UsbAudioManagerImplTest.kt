@@ -30,6 +30,8 @@ import io.mockk.mockk
 import io.mockk.mockkObject
 import io.mockk.unmockkObject
 import io.mockk.verify
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.runBlocking
 import org.junit.jupiter.api.AfterEach
@@ -769,5 +771,81 @@ class UsbAudioManagerImplTest {
         assertNull(manager.abxGroundTruth.value)
         assertNull(manager.abxPendingGuess.value)
         assertNotNull(manager.abxStats.value)
+    }
+
+    // ---- #156: prewarmOutput / outputWarmState ----
+
+    @Test
+    fun `prewarmOutput does nothing without a registered output`() {
+        manager.reportPlaybackRoute(
+            UsbAudioManager.PlaybackRoute.Direct(bitDepth = 24, sampleRateHz = 44100, channels = 2))
+
+        assertFalse(manager.prewarmOutput())
+    }
+
+    @Test
+    fun `prewarmOutput runs the registered output's prewarm for a track routed to USB`() {
+        var warmed = 0
+        manager.registerOutputPrewarm(this) { warmed++ }
+        manager.reportPlaybackRoute(
+            UsbAudioManager.PlaybackRoute.Direct(bitDepth = 24, sampleRateHz = 44100, channels = 2))
+
+        assertTrue(manager.prewarmOutput())
+        assertEquals(1, warmed)
+    }
+
+    @Test
+    fun `prewarmOutput leaves a leftover output alone when the track is on the fallback`() {
+        // The player keeps an output around after a track moves to the HAL; warming it would
+        // take the device away from the very path the track is playing on.
+        var warmed = 0
+        manager.registerOutputPrewarm(this) { warmed++ }
+        manager.reportPlaybackRoute(
+            UsbAudioManager.PlaybackRoute.Fallback(bitDepth = 16, sampleRateHz = 44100, channels = 2))
+
+        assertFalse(manager.prewarmOutput())
+        assertEquals(0, warmed)
+    }
+
+    @Test
+    fun `the old output's release does not unregister the newer output`() {
+        val older = Any()
+        val newer = Any()
+        var warmedNewer = 0
+        manager.registerOutputPrewarm(older) {}
+        manager.registerOutputPrewarm(newer) { warmedNewer++ }
+        manager.unregisterOutputPrewarm(older)
+        manager.reportPlaybackRoute(
+            UsbAudioManager.PlaybackRoute.Direct(bitDepth = 24, sampleRateHz = 44100, channels = 2))
+
+        assertTrue(manager.prewarmOutput())
+        assertEquals(1, warmedNewer)
+
+        manager.unregisterOutputPrewarm(newer)
+        assertFalse(manager.prewarmOutput())
+    }
+
+    @Test
+    fun `awaitOutputWarm returns as soon as the warm-up settles, and reports where it ended`() = runBlocking {
+        manager.reportOutputWarmState(UsbAudioManager.OutputWarmState.Warming)
+        val waiter = async(Dispatchers.Default) { manager.awaitOutputWarm(5000L) }
+        Thread.sleep(50)
+        assertFalse(waiter.isCompleted)
+
+        manager.reportOutputWarmState(UsbAudioManager.OutputWarmState.Ready)
+
+        assertEquals(UsbAudioManager.OutputWarmState.Ready, waiter.await())
+    }
+
+    @Test
+    fun `awaitOutputWarm gives up after its bound and still says Warming`() = runBlocking {
+        manager.reportOutputWarmState(UsbAudioManager.OutputWarmState.Warming)
+
+        assertEquals(UsbAudioManager.OutputWarmState.Warming, manager.awaitOutputWarm(50L))
+    }
+
+    @Test
+    fun `awaitOutputWarm returns immediately when nothing is warming`() = runBlocking {
+        assertEquals(UsbAudioManager.OutputWarmState.Idle, manager.awaitOutputWarm(5000L))
     }
 }

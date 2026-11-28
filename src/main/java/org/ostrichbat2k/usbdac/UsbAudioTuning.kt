@@ -35,6 +35,17 @@ import org.ostrichbat2k.usbdac.streaming.UsbAudioOutput
  */
 internal object UsbAudioTuning {
     /**
+     * How long a pre-warmed output ([UsbAudioManager.prewarmOutput]) keeps the device claimed and
+     * streaming silence while waiting for playback to actually start, before handing it back. The
+     * host normally starts playback the moment the warm-up finishes; this only covers the case
+     * where it never does (the user cancelled in between).
+     */
+    const val PREWARM_HOLD_MS = 10_000L
+
+    /** Default bound for [UsbAudioManager.awaitOutputWarm]: longer than the slowest observed relock (2.9 s). */
+    const val PREWARM_AWAIT_MS = 6_000L
+
+    /**
      * Default grace period before [UsbAudioManager.releaseClaim] actually hands the interface
      * back to the kernel -- long enough that a quick pause/resume never pays the real hand-off
      * cost, short enough that genuinely idle playback frees the device for every other app

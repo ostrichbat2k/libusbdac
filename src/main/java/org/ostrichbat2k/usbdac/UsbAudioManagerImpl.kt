@@ -75,6 +75,7 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
@@ -296,6 +297,39 @@ class UsbAudioManagerImpl(
     override val abxStats: StateFlow<AbxStats> = abxTester.stats
     override fun rollAbxTrial() = abxTester.rollTrial()
     override fun submitAbxGuess(guessedBitPerfect: Boolean): Boolean? = abxTester.submitGuess(guessedBitPerfect)
+
+    private val _outputWarmState = MutableStateFlow(UsbAudioManager.OutputWarmState.Idle)
+    override val outputWarmState: StateFlow<UsbAudioManager.OutputWarmState> = _outputWarmState.asStateFlow()
+
+    private class PrewarmRegistration(val owner: Any, val prewarm: () -> Unit)
+
+    @Volatile private var prewarmRegistration: PrewarmRegistration? = null
+
+    override fun reportOutputWarmState(state: UsbAudioManager.OutputWarmState) {
+        _outputWarmState.value = state
+    }
+
+    override fun registerOutputPrewarm(owner: Any, prewarm: () -> Unit) {
+        prewarmRegistration = PrewarmRegistration(owner, prewarm)
+    }
+
+    override fun unregisterOutputPrewarm(owner: Any) {
+        if (prewarmRegistration?.owner === owner) prewarmRegistration = null
+    }
+
+    override fun prewarmOutput(): Boolean {
+        // Only for a track that is actually routed to the direct output. A registration can
+        // outlive its track's route (the player keeps an output around after a track moves to
+        // the fallback), and warming it then would take the device away from the HAL.
+        val registration = prewarmRegistration?.takeIf { _playbackRoute.value is PlaybackRoute.Direct }
+        registration?.prewarm()
+        return registration != null
+    }
+
+    override suspend fun awaitOutputWarm(timeoutMs: Long): UsbAudioManager.OutputWarmState =
+        withTimeoutOrNull(timeoutMs) {
+            outputWarmState.first { it != UsbAudioManager.OutputWarmState.Warming }
+        } ?: _outputWarmState.value
 
     /** Called by [UsbAudioOutput] once it's actually claimed and streaming -- see [releaseClaim]. */
     override fun notifyStreamingStarted() = claimController.notifyStreamingStarted()
@@ -1085,6 +1119,7 @@ class UsbAudioManagerImpl(
         updateBlockPlayback()
         _controlState.value = null
         _capabilities.value = null
+        _outputWarmState.value = UsbAudioManager.OutputWarmState.Idle
         // The whole session is genuinely done (device unplugged, or USB DAC output turned off)
         // -- UsbAudioOutput.pause()/release() already toggle this track off during ordinary
         // pause/track-skip, but this is the one path that also needs to free its native

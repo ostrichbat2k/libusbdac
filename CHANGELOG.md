@@ -8,6 +8,12 @@ Pin to an exact tag or commit rather than a version range.
 
 ## [Unreleased]
 
+### Added
+- `UsbAudioManager.prewarmOutput()`, `outputWarmState` and `awaitOutputWarm()`:
+  a host can do the reclaim and clock relock while still paused and start
+  playback only once the DAC is ready, instead of reporting "playing" through
+  the 1.6-2.9 s switch (#156).
+
 ## [v0.3.0] - 2026-11-21
 
 Hardware-tested on a Pixel 9 Pro XL with a UAC2 Adaptive DAC (steady

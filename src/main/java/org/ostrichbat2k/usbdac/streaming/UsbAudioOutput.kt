@@ -34,6 +34,9 @@ import androidx.media3.common.PlaybackParameters
 import androidx.media3.exoplayer.audio.AudioOutput
 import java.nio.ByteBuffer
 import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.ScheduledThreadPoolExecutor
+import java.util.concurrent.TimeUnit
 import kotlin.concurrent.withLock
 import timber.log.Timber as L
 
@@ -188,6 +191,16 @@ class UsbAudioOutput(
     // set after a fatal stream error (see tearDownAfterFatalError): this instance's session is
     // deactivated then, so it can never stream again either.
     @Volatile private var released = false
+    // Set by prewarm() (#156): the activation that is running, or has finished, is meant to leave
+    // this instance claimed, relocked and streaming silence while [paused] is still true, ready for
+    // play() to make audible with no relock of its own. Cleared by play(), pause() and release().
+    @Volatile private var prewarmRequested = false
+    private var prewarmExpiry: ScheduledFuture<*>? = null
+    private val prewarmExpirySchedulerLazy = lazy {
+        ScheduledThreadPoolExecutor(1) { r -> Thread(r, "UsbAudioOutput-PrewarmExpiry").apply { isDaemon = true } }
+            .apply { removeOnCancelPolicy = true }
+    }
+    private val prewarmExpiryScheduler by prewarmExpirySchedulerLazy
 
     // Serializes every place that decides whether to start/stop the native stream together with
     // flipping [activated] -- onActivationAttemptFinished() (on activationExecutor's thread) and
@@ -209,6 +222,13 @@ class UsbAudioOutput(
         Executors.newSingleThreadExecutor { r ->
             Thread(r, "UsbAudioOutput-Activation").apply { isDaemon = true }
         }
+
+    init {
+        // The newest output is the one a host's UsbAudioManager.prewarmOutput() should warm; the
+        // player builds the next track's output before it releases this one, so release() only
+        // unregisters if this is still the registered owner (#156).
+        usbAudioManager.registerOutputPrewarm(this, ::prewarm)
+    }
 
     // Deliberately no init{} block here anymore. This used to call activateAndStream()
     // unconditionally at construction -- claiming the raw USB interface and starting the native
@@ -640,13 +660,57 @@ class UsbAudioOutput(
         // a second time over the first and count it twice (#149).
         val startAttempt =
             synchronized(activationLock) {
+                clearPrewarmLocked()
                 (!activated && !activating).also { if (it) activating = true }
             }
         if (startAttempt) activationExecutor.execute { runActivationAttempt() }
     }
 
-    /** One background activation attempt, started by [play] -- see its doc comment. */
+    /**
+     * Does [play]'s reclaim, alt-setting and clock relock now, while this output is still paused,
+     * so a host can wait for it and only then start playback (#156, Auxio#62). The stream starts
+     * as pre-roll silence exactly as in [play]; because [paused] is still true, nothing real is
+     * audible, and a later [play] just flips [paused] -- [activated] is already true, so it has
+     * nothing left to relock. [UsbAudioManager.outputWarmState] reports progress.
+     *
+     * Hands everything back by itself after [UsbAudioTuning.PREWARM_HOLD_MS] if [play] never
+     * follows, and on [pause]/[release] like any activation. A no-op once playing, or released.
+     */
+    fun prewarm() {
+        var alreadyReady = false
+        val startAttempt =
+            synchronized(activationLock) {
+                if (released || !paused) return
+                L.i("UsbAudioOutput: prewarm()")
+                prewarmRequested = true
+                prewarmExpiry?.cancel(false)
+                prewarmExpiry =
+                    prewarmExpiryScheduler.schedule(
+                        ::expirePrewarm, UsbAudioTuning.PREWARM_HOLD_MS, TimeUnit.MILLISECONDS)
+                alreadyReady = activated
+                (!activated && !activating).also { if (it) activating = true }
+            }
+        if (alreadyReady) usbAudioManager.reportOutputWarmState(UsbAudioManager.OutputWarmState.Ready)
+        if (startAttempt) activationExecutor.execute { runActivationAttempt() }
+    }
+
+    private fun expirePrewarm() {
+        if (!prewarmRequested) return
+        L.i("UsbAudioOutput: pre-warmed but never played -- handing the device back")
+        pause()
+    }
+
+    /** Caller holds [activationLock]. */
+    private fun clearPrewarmLocked() {
+        prewarmRequested = false
+        prewarmExpiry?.cancel(false)
+        prewarmExpiry = null
+    }
+
+    /** One background activation attempt, started by [play] or [prewarm] -- see their doc comments. */
     private fun runActivationAttempt() {
+        var streamReady = false
+        usbAudioManager.reportOutputWarmState(UsbAudioManager.OutputWarmState.Warming)
         // Whether the hardware ended up ready -- the attempt itself didn't fail -- so that a
         // play() it missed may simply try again (#149) without retrying a real failure forever.
         var hardwareReady = false
@@ -666,6 +730,7 @@ class UsbAudioOutput(
                 // clock change, and a later play() redoes the relock from the start anyway.
                 hardwareReady = !started
             }
+            streamReady = started && !needsSettle
             if (needsSettle && started) {
                 val settled =
                     try {
@@ -681,10 +746,12 @@ class UsbAudioOutput(
                         false
                     }
                 hardwareReady = settled
+                streamReady = settled
                 onSettleFinished(settled)
             }
         } finally {
             usbAudioManager.endClaimAttempt()
+            reportWarmOutcome(streamReady)
             // A play() landing after this attempt decided "not wanted" (paused) but before
             // activating was cleared saw activating == true and did nothing, leaving nothing
             // streaming until isStalled() forced a full stall recovery (#149). Re-checked under
@@ -703,6 +770,20 @@ class UsbAudioOutput(
     }
 
     /**
+     * Ready only if the stream really is up (and, for a full relock, settled) and this instance has
+     * not been paused or released since; a cancelled attempt reports Idle, not Failed.
+     */
+    private fun reportWarmOutcome(streamReady: Boolean) {
+        val state =
+            when {
+                streamReady && activated -> UsbAudioManager.OutputWarmState.Ready
+                released || (paused && !prewarmRequested) -> UsbAudioManager.OutputWarmState.Idle
+                else -> UsbAudioManager.OutputWarmState.Failed
+            }
+        usbAudioManager.reportOutputWarmState(state)
+    }
+
+    /**
      * Decides what to do once a background [activateAndStream] attempt from [play] finishes --
      * pulled out of [play] itself purely so a test can drive this one decision directly, the same
      * seam pattern [restoreVolumeAfterRelock] already uses to stay reachable without ever
@@ -717,7 +798,7 @@ class UsbAudioOutput(
             return false
         }
         return synchronized(activationLock) {
-            val stillWanted = !paused && !released
+            val stillWanted = (!paused || prewarmRequested) && !released
             when {
                 stillWanted -> startStreamLocked(holdSilence)
                 // Same release release() itself would have made, had a stream been running.
@@ -774,6 +855,8 @@ class UsbAudioOutput(
         L.i("UsbAudioOutput: pause()")
         paused = true
         synchronized(activationLock) {
+            clearPrewarmLocked()
+            usbAudioManager.reportOutputWarmState(UsbAudioManager.OutputWarmState.Idle)
             if (activated) {
                 stopStreamingThread()
                 activated = false
@@ -942,7 +1025,9 @@ class UsbAudioOutput(
         // instance (a track skip landing mid-relock) hand back its claim instead of starting a
         // stream nothing will ever read from.
         released = true
+        usbAudioManager.unregisterOutputPrewarm(this)
         synchronized(activationLock) {
+            clearPrewarmLocked()
             stopStreamingThread()
             if (activated) {
                 activated = false
@@ -960,6 +1045,7 @@ class UsbAudioOutput(
         // once it does, since one instance is constructed per sample rate and a long session can
         // accumulate many.
         activationExecutor.shutdown()
+        if (prewarmExpirySchedulerLazy.isInitialized()) prewarmExpiryScheduler.shutdown()
     }
 
     override fun setVolume(volume: Float) {

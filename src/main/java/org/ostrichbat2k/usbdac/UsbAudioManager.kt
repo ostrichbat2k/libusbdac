@@ -279,6 +279,61 @@ interface UsbAudioManager : UsbDacPreferences.Listener {
      */
     val blockPlayback: StateFlow<Boolean>
 
+    /**
+     * Where the direct USB output is in getting ready to stream, for a host that wants to start
+     * playback only once the HAL-to-USB switch is complete (Auxio#62). See [prewarmOutput].
+     */
+    enum class OutputWarmState {
+        /** Nothing running: no output, or it is idle with the claim handed back. */
+        Idle,
+
+        /** The claim, alt-setting and clock relock are in progress. Not yet safe to call it playing. */
+        Warming,
+
+        /** The device is claimed, relocked and streaming silence; real audio starts the moment the output plays. */
+        Ready,
+
+        /** The last attempt to get ready failed. Starting playback anyway behaves as it did before [prewarmOutput]. */
+        Failed,
+    }
+
+    /** See [OutputWarmState]. */
+    val outputWarmState: StateFlow<OutputWarmState>
+
+    /**
+     * Starts the HAL-to-USB switch for the output the current track is routed to, *without*
+     * starting playback: [OutputWarmState.Warming] while it runs, then [OutputWarmState.Ready] (or
+     * [OutputWarmState.Failed]). A host calls this when the user asks to play, waits on
+     * [awaitOutputWarm], and only then lets its player start -- so nothing reports "playing" while
+     * the 1.6-2.9 s reclaim and clock relock are still running. If playback never follows, the
+     * output hands the claim back on its own after [UsbAudioTuning.PREWARM_HOLD_MS].
+     *
+     * Returns false, and does nothing, when there is nothing to warm: the current track is not
+     * routed to the direct USB output, or that output has not been built yet (the player builds it
+     * on the first buffer of a prepared track). The caller then just starts playback as before.
+     */
+    fun prewarmOutput(): Boolean
+
+    /**
+     * Suspends until [outputWarmState] is no longer [OutputWarmState.Warming], bounded by
+     * [timeoutMs], and returns where it ended up ([OutputWarmState.Warming] means it timed out).
+     */
+    suspend fun awaitOutputWarm(timeoutMs: Long = UsbAudioTuning.PREWARM_AWAIT_MS): OutputWarmState
+
+    /** For [org.ostrichbat2k.usbdac.streaming.UsbAudioOutput] only: reports [outputWarmState]. */
+    fun reportOutputWarmState(state: OutputWarmState)
+
+    /**
+     * For [org.ostrichbat2k.usbdac.streaming.UsbAudioOutput] only: makes [prewarm] what
+     * [prewarmOutput] runs while [owner] is the live output. [unregisterOutputPrewarm] only
+     * clears it for the same [owner], since the player builds the next track's output before it
+     * releases the previous one.
+     */
+    fun registerOutputPrewarm(owner: Any, prewarm: () -> Unit)
+
+    /** See [registerOutputPrewarm]. */
+    fun unregisterOutputPrewarm(owner: Any)
+
     /** Begins listening for USB device attach/detach/permission events. Call once at startup. */
     fun start()
 
